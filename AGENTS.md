@@ -6,9 +6,9 @@
 
 ## 项目结构与模块组织
 
-项目使用 Python 3.12 和 FastAPI。`app/main.py` 负责应用装配；`app/api/` 仅处理 HTTP 参数和响应；`app/service/` 编排行情获取及标准化；`app/providers/` 隔离外部数据源；`app/models/` 保存领域模型；配置、日志、异常和统一响应位于 `app/core/`。测试放在顶层 `tests/` 并与生产结构对应。
+项目使用 Python 3.12 和 FastAPI。`app/main.py` 负责应用装配；`app/api/` 仅处理 HTTP 参数和响应；`app/service/` 编排行情获取及标准化；`app/providers/baidu_finance/` 隔离百度请求和字段处理，`app/providers/eastmoney_symbol/` 只负责名称解析；`app/models/` 保存领域模型；配置、日志、异常和统一响应位于 `app/core/`。测试放在 `tests/`，Postman 样例放在 `postman/`。
 
-新增真实数据源时实现 `MarketDataProvider`，并在 Provider 工厂注册。不要让第三方字段或异常直接进入 API 层。
+新增真实数据源时实现 `MarketDataProvider`，并在 Provider 工厂注册。不要让第三方字段、Cookie 或异常直接进入 API 层。
 
 ## 构建、测试与开发命令
 
@@ -26,6 +26,10 @@
 ## 测试规范
 
 统一使用 `pytest`，文件命名为 `test_<module>.py`，测试函数命名为 `test_<behavior>`。新增功能需覆盖成功、空结果、参数非法、Provider 故障和边界日期。外部行情源必须使用 fake、fixture 或 mock 隔离；测试不得依赖网络。修复缺陷时必须增加回归测试。
+
+## 安全与外部数据源
+
+`BAIDU_AB_SR` 等秘密只能通过环境变量注入，不得提交真实值或写入日志、Postman 和测试数据。公开网页接口可能变化；客户端必须设置超时、有限重试并将故障统一映射为 502。名称解析与行情请求使用独立会话，禁止跨数据源转发 Cookie。
 
 ## 提交与 Pull Request 规范
 

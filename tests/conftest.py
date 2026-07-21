@@ -14,6 +14,7 @@ def settings() -> Settings:
         service_port=8000,
         service_log_level="debug",
         data_provider="mock",
+        symbol_resolver="mock",
     )
 
 

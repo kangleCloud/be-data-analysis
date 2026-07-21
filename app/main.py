@@ -10,7 +10,7 @@ from app.core import msg
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError
 from app.core.logging_config import configure_logging
-from app.providers.factory import create_provider
+from app.providers.factory import create_provider, create_symbol_resolver
 from app.service.market_data import MarketDataService
 
 LOGGER = logging.getLogger(__name__)
@@ -20,14 +20,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """创建并配置完整的 FastAPI 应用。"""
     resolved_settings = settings or get_settings()
     configure_logging(resolved_settings.service_log_level)
-    provider = create_provider(resolved_settings.data_provider)
+    provider = create_provider(resolved_settings)
+    symbol_resolver = create_symbol_resolver(resolved_settings)
 
     application = FastAPI(
         title="be-data-analysis",
         description="面向中国 A 股与场内 ETF 的行情数据获取和标准化服务。",
-        version="0.1.0",
+        version="0.2.0",
     )
-    application.state.market_data_service = MarketDataService(provider)
+    application.state.market_data_service = MarketDataService(provider, symbol_resolver)
     application.include_router(router)
 
     @application.exception_handler(AppError)

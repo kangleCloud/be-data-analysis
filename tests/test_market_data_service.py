@@ -24,7 +24,7 @@ class _UnorderedProvider:
     is_mock = False
 
     def fetch_history(self, asset_type, symbol, start_date, end_date):
-        return [_bar(4), _bar(1), _bar(3), _bar(2)]
+        return [_bar(4), _bar(1), _bar(3), _bar(2), _bar(3)]
 
 
 def test_service_filters_and_sorts_provider_results():
