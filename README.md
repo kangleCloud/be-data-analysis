@@ -1,80 +1,35 @@
 # be-data-analysis
 
-基于 FastAPI 的中国 A 股与场内 ETF 数据获取和标准化服务。默认通过百度财经公开接口获取历史日 K，并使用独立名称解析器将股票全名转换为六位代码。所有接口统一返回 `code/msg/data`。
+AKShare 市场数据采集程序。每次运行采集行业、概念板块及资金流，写入 Redis DB 2，供 `be-vita` 读取。前端不直接调用本程序。旧股票和 ETF 日 K 查询接口已退出。
 
-## 项目结构
+## 环境
 
-```text
-app/
-├── api/                         # HTTP 路由及 Pydantic 模型
-├── core/                        # 配置、日志、异常和统一响应
-├── models/                      # 数据源无关的领域模型
-├── providers/
-│   ├── baidu_finance/           # 百度客户端、Provider 和 processing
-│   └── eastmoney_symbol/        # A 股名称精确解析
-├── service/                     # 查询编排、过滤、排序和异常映射
-└── main.py                      # FastAPI 应用工厂
-postman/                         # 可导入的 Postman Collection
-tests/                           # 无网络依赖的 pytest 测试
-```
-
-## 本地运行
-
-项目使用 Python 3.12：
+- Python 3.12
+- Redis，需与 `be-vita` 连接同一个实例和 DB 2
+- `pip install -r requirements.txt`
+- 配置参考 `.env.example`，生产连接地址和密码仅通过环境变量注入
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-set -a
-source .env.example
-set +a
-python -m app
+python -m app collect
 ```
 
-服务默认监听 `8000` 端口，中文 OpenAPI 文档位于 `http://127.0.0.1:8000/docs`。
+命令在交易日 09:30–11:30、13:00–16:00（北京时间）采集一次并退出。外部调度器在盘中每五分钟触发，收盘后至 16:00 再补采；午休、周末和非交易日自动跳过。手工补采可使用 `python -m app collect --force`，它允许在时段外采集，板块数据的交易日期取最近交易日历日期。
 
-## API 示例
+重叠运行由 Redis 锁阻止；锁占用时命令返回非零状态。任一模块失败时仍发布保留旧数据的快照，但命令返回非零状态，供调度器告警。运行日志不包含 Redis 凭据。
 
-按名称查询四方科技（`603339`）历史日 K：
+可选的健康接口使用 `python -m app serve` 启动，只提供 `GET /health`。它不执行采集。
 
-```bash
-curl -X POST 'http://127.0.0.1:8000/api/v1/stocks/history' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"四方科技","start_date":"2026-07-01","end_date":"2026-07-20"}'
-```
+交易时段可运行 `python -m app probe` 只读检查大盘资金流最新行的实际日期；命令不连接 Redis，也不写入快照。`sameCalendarDay=false` 时，后续页面须按 `latestTradeDate` 展示，不得称为当日实时资金流。
 
-查询最近交易日日线：
+## Redis 契约
 
-```bash
-curl -X POST 'http://127.0.0.1:8000/api/v1/stocks/latest' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"四方科技"}'
-```
+快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON，单次 `SET` 原子发布，不设 TTL。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market-snapshot-v1.md)。
 
-现有按代码接口继续可用：
-
-```bash
-curl 'http://127.0.0.1:8000/api/v1/stocks/603339/history?start_date=2026-07-01&end_date=2026-07-20'
-curl 'http://127.0.0.1:8000/api/v1/stocks/603339/latest'
-curl 'http://127.0.0.1:8000/api/v1/funds/510300/history?start_date=2026-07-01&end_date=2026-07-20'
-```
-
-Postman 可直接导入 `postman/Baidu_Finance_API.postman_collection.json`。请求体中的 `name` 和 `symbol` 必须且只能提供一个；名称使用 A 股全名精确匹配。历史区间无数据时成功返回空列表，最新日线无数据时返回 404。
-
-## 配置与安全
-
-默认 `DATA_PROVIDER=baidu_finance`、`SYMBOL_RESOLVER=eastmoney`。如需完全离线联调，可同时设置为 `mock`。超时、重试和缓存配置见 `.env.example`。
-
-`BAIDU_AB_SR` 是可选秘密配置。公开日 K 不依赖它；设置后只会写入发往 `finance.pae.baidu.com` 的 Cookie Jar。不要把真实值写入 `.env.example`、日志、Postman 或版本库。服务不生成 `ab_sr`、`acs-token`，也不提供受保护的盘中实时行情。
-
-上述接口是网页使用的公开但非正式 API，可能变更。部署时应控制请求频率，并遵守数据提供方的使用条款和隐私政策。
-
-## 开发检查
+## 验证
 
 ```bash
 python -m compileall app
 python -m pytest
 ```
 
-外部数据源测试必须使用 fake 或 mock，不得访问网络。新增 Provider 应实现 `MarketDataProvider`，并将第三方字段转换限制在 Provider 的处理包内。
+测试使用固定 DataFrame 和假 Redis，不依赖行情源或真实 Redis。AKShare 公开接口可能变化，部署前应运行一次受控联调，检查实际字段、最新交易日期及源站频率限制。

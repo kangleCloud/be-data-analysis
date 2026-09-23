@@ -1,4 +1,4 @@
-"""支持通过 ``python -m app`` 启动服务。"""
+"""支持通过 ``python -m app collect`` 单次采集。"""
 
 from app.cli import main
 

@@ -1,28 +1,42 @@
-"""pytest 公共 fixture。"""
+"""采集测试的固定源数据。"""
 
+from datetime import date
+
+import pandas as pd
 import pytest
-from fastapi.testclient import TestClient
-
-from app.core.config import Settings
-from app.main import create_app
 
 
 @pytest.fixture
-def settings() -> Settings:
-    return Settings(
-        service_host="127.0.0.1",
-        service_port=8000,
-        service_log_level="debug",
-        data_provider="mock",
-        symbol_resolver="mock",
-    )
+def sector_rows():
+    return pd.DataFrame([
+        {"板块代码": "BK1", "板块名称": "半导体", "涨跌幅": 3.5, "总市值": 1000000000,
+         "换手率": 2.5, "上涨家数": 10, "下跌家数": 2, "领涨股票": "甲股票"},
+        {"板块代码": "BK2", "板块名称": "银行", "涨跌幅": -2.1, "总市值": 2000000000,
+         "换手率": 0.8, "上涨家数": 1, "下跌家数": 20, "领涨股票": "乙股票"},
+    ])
 
 
 @pytest.fixture
-def test_app(settings):
-    return create_app(settings)
+def flow_rows():
+    return pd.DataFrame([
+        {"名称": "半导体", "今日主力净流入-净额": 150000000,
+         "今日主力净流入-净占比": 2.1},
+        {"名称": "银行", "今日主力净流入-净额": -200000000,
+         "今日主力净流入-净占比": -1.7},
+    ])
 
 
 @pytest.fixture
-def client(test_app):
-    return TestClient(test_app)
+def market_rows():
+    return pd.DataFrame([
+        {"日期": date(2026, 9, 22), "主力净流入-净额": -300000000,
+         "主力净流入-净占比": -1.0, "超大单净流入-净额": 100000000,
+         "大单净流入-净额": -400000000, "中单净流入-净额": 20000000,
+         "小单净流入-净额": 280000000, "上证-收盘价": 3200,
+         "上证-涨跌幅": -0.2, "深证-收盘价": 11000, "深证-涨跌幅": 0.1},
+        {"日期": date(2026, 9, 23), "主力净流入-净额": 500000000,
+         "主力净流入-净占比": 1.2, "超大单净流入-净额": 300000000,
+         "大单净流入-净额": 200000000, "中单净流入-净额": -100000000,
+         "小单净流入-净额": -400000000, "上证-收盘价": 3220,
+         "上证-涨跌幅": 0.6, "深证-收盘价": 11100, "深证-涨跌幅": 0.9},
+    ])
