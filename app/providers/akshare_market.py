@@ -72,12 +72,12 @@ class AkShareMarketProvider:
         return self._call(function)
 
     def sector_fund_flow(self, sector_type: str) -> Any:
-        source_type = "行业资金流" if sector_type == "industry" else "概念资金流"
-        return self._call(
-            self._akshare.stock_sector_fund_flow_rank,
-            indicator="今日",
-            sector_type=source_type,
+        function = (
+            self._akshare.stock_fund_flow_industry
+            if sector_type == "industry"
+            else self._akshare.stock_fund_flow_concept
         )
+        return self._call(function, symbol="即时")
 
     def market_fund_flow(self) -> Any:
         return self._call(self._akshare.stock_market_fund_flow)

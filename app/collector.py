@@ -76,7 +76,7 @@ class MarketCollector:
                             "data": None,
                         }
                 self._store.save({
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "provider": "akshare",
                     "generatedAt": timestamp,
                     "modules": modules,
@@ -139,25 +139,20 @@ class MarketCollector:
 
             day = trading_date.isoformat()
             for sector_type in ("industry", "concept"):
-                quotes = update(
+                update(
                     f"{sector_type}Heatmap",
                     lambda kind=sector_type: normalize_sectors(
                         self._provider.sector_quotes(kind), kind
                     ),
                     source_date=day,
                 )
-                flow_result: Any | None = None
-                try:
-                    flow_result = self._provider.sector_fund_flow(sector_type)
-                except Exception as exc:
-                    LOGGER.warning("%s 资金流获取失败: %s", sector_type, type(exc).__name__)
-
-                def build_top5() -> dict[str, Any]:
-                    if quotes is None or flow_result is None:
-                        raise ValueError("板块行情或资金流不可用")
-                    return normalize_top5(flow_result, quotes)
-
-                update(f"{sector_type}Top5", build_top5, source_date=day)
+                update(
+                    f"{sector_type}Top5",
+                    lambda kind=sector_type: normalize_top5(
+                        self._provider.sector_fund_flow(kind), kind
+                    ),
+                    source_date=day,
+                )
 
             update(
                 "marketFundFlow",
@@ -165,7 +160,7 @@ class MarketCollector:
                 source_date_basis="SOURCE",
             )
             self._store.save({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "provider": "akshare",
                 "generatedAt": timestamp,
                 "modules": modules,

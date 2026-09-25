@@ -22,7 +22,8 @@ def test_adapter_uses_expected_akshare_functions():
         tool_trade_date_hist_sina=capture("calendar"),
         stock_board_industry_name_em=capture("industry"),
         stock_board_concept_name_em=capture("concept"),
-        stock_sector_fund_flow_rank=capture("flow"),
+        stock_fund_flow_industry=capture("ths_industry"),
+        stock_fund_flow_concept=capture("ths_concept"),
         stock_market_fund_flow=capture("market"),
     )
     assert provider.latest_trading_date(date(2026, 9, 23)) == date(2026, 9, 23)
@@ -35,7 +36,7 @@ def test_adapter_uses_expected_akshare_functions():
         ("calendar", {}),
         ("industry", {}),
         ("concept", {}),
-        ("flow", {"indicator": "今日", "sector_type": "行业资金流"}),
-        ("flow", {"indicator": "今日", "sector_type": "概念资金流"}),
+        ("ths_industry", {"symbol": "即时"}),
+        ("ths_concept", {"symbol": "即时"}),
         ("market", {}),
     ]

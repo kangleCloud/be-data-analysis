@@ -7,15 +7,16 @@ AKShare 市场数据采集程序。每次运行采集行业、概念板块及资
 - Python 3.12
 - Redis，需与 `be-vita` 连接同一个实例和 DB 2
 - `pip install -r requirements.txt`
-- 配置参考 `.env.example`，生产连接地址和密码仅通过环境变量注入
+- 配置参考 `.env.example`。本地可在被 Git 忽略的 `.env` 中分别设置 `REDIS_URL`、`REDIS_PASSWORD`、`REDIS_PORT` 和 `REDIS_DB`；生产连接参数通过运行环境注入
 
 ```bash
-python -m app collect
+set -a && source .env && set +a
+python -m app collect --force
 ```
 
-命令在交易日 09:30–11:30、13:00–16:00（北京时间）采集一次并退出。外部调度器在盘中每五分钟触发，收盘后至 16:00 再补采；午休、周末和非交易日自动跳过。手工补采可使用 `python -m app collect --force`，它允许在时段外采集，板块数据的交易日期取最近交易日历日期。
+只允许操作者手动执行上述单次采集命令，不安装自动调度。`--force` 允许在交易时段外采集，板块数据的交易日期取最近交易日历日期。
 
-重叠运行由 Redis 锁阻止；锁占用时命令返回非零状态。任一模块失败时仍发布保留旧数据的快照，但命令返回非零状态，供调度器告警。运行日志不包含 Redis 凭据。
+重叠运行由 Redis 锁阻止；锁占用时命令返回非零状态。任一模块失败时仍发布保留旧数据的快照，但命令返回非零状态，需人工检查日志。运行日志不包含 Redis 凭据。
 
 可选的健康接口使用 `python -m app serve` 启动，只提供 `GET /health`。它不执行采集。
 
@@ -23,7 +24,7 @@ python -m app collect
 
 ## Redis 契约
 
-快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON，单次 `SET` 原子发布，不设 TTL。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market-snapshot-v1.md)。
+快照键是 `stock:market:v2:snapshot`，值为普通 UTF-8 JSON，单次 `SET` 原子发布，不设 TTL；写入成功后向 `stock:market:v2:updates` 发送更新通知。锁键是 `stock:market:v2:lock`。字段、单位和状态说明见 [V2 快照契约](docs/market-snapshot-v2.md)。
 
 ## 验证
 

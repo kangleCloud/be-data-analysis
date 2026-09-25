@@ -44,13 +44,6 @@ def _text(raw: Any) -> str:
     return "" if value.lower() in {"nan", "nat", "<na>", "none"} else value
 
 
-def _column(row: dict[str, Any], *names: str) -> Any:
-    for name in names:
-        if name in row:
-            return row[name]
-    return None
-
-
 def normalize_sectors(frame: Any, sector_type: str) -> list[dict[str, Any]]:
     """板块面积采用源站总市值，不能从其他字段估算成交额。"""
     rows = _rows(frame)
@@ -82,75 +75,51 @@ def normalize_sectors(frame: Any, sector_type: str) -> list[dict[str, Any]]:
     return sectors
 
 
-def normalize_top5(
-    frame: Any, sectors: list[dict[str, Any]]
-) -> dict[str, Any]:
-    """按唯一板块名称匹配资金流；歧义项不得落入榜单。"""
+def normalize_top5(frame: Any, sector_type: str) -> dict[str, Any]:
+    """从同花顺即时板块资金流独立生成涨跌与净额榜。"""
     rows = _rows(frame)
-    _require(rows, "名称")
-    if not any("主力净流入-净额" in key for key in rows[0]):
-        raise SourceDataError("缺少主力净流入字段")
-    names: dict[str, list[dict[str, Any]]] = {}
-    for sector in sectors:
-        names.setdefault(sector["sectorName"], []).append(sector)
+    _require(rows, "行业", "行业-涨跌幅", "净额")
+    name_counts: dict[str, int] = {}
+    for row in rows:
+        name = _text(row["行业"])
+        name_counts[name] = name_counts.get(name, 0) + 1
 
-    inflow_candidates = []
-    unmatched = 0
-    flow_name_counts: dict[str, int] = {}
+    items = []
     for row in rows:
-        name = _text(row["名称"])
-        flow_name_counts[name] = flow_name_counts.get(name, 0) + 1
-    for row in rows:
-        flow_name = _text(row["名称"])
-        matches = names.get(flow_name, [])
-        if len(matches) != 1 or flow_name_counts[flow_name] != 1:
-            unmatched += 1
+        name = _text(row["行业"])
+        change = _number(row["行业-涨跌幅"])
+        net_amount = _number(row["净额"])
+        if not name or name_counts[name] != 1 or change is None or net_amount is None:
             continue
-        amount = _number(_column(row, "今日主力净流入-净额", "主力净流入-净额"))
-        if amount is None:
-            continue
-        sector = matches[0]
-        inflow_candidates.append({
-            "sectorCode": sector["sectorCode"],
-            "sectorName": sector["sectorName"],
-            "sectorType": sector["sectorType"],
-            "changePercent": sector["changePercent"],
-            "mainNetInflow": amount,
-            "mainNetInflowRatio": _number(
-                _column(row, "今日主力净流入-净占比", "主力净流入-净占比")
-            ),
+        items.append({
+            "sectorName": name,
+            "sectorType": sector_type,
+            "changePercent": change,
+            "netFlowAmount": net_amount * 100_000_000,
         })
 
-    if not inflow_candidates:
-        raise SourceDataError("没有可匹配的板块资金流")
+    if not items:
+        raise SourceDataError("无有效同花顺板块资金流数据")
 
-    by_change = [
-        {
-            "sectorCode": item["sectorCode"],
-            "sectorName": item["sectorName"],
-            "sectorType": item["sectorType"],
-            "changePercent": item["changePercent"],
-        }
-        for item in sectors
-    ]
     return {
+        "source": "THS",
+        "period": "INTRADAY",
         "topRise": sorted(
-            (item for item in by_change if item["changePercent"] > 0),
-            key=lambda item: (-item["changePercent"], item["sectorCode"]),
+            (item for item in items if item["changePercent"] > 0),
+            key=lambda item: (-item["changePercent"], item["sectorName"]),
         )[:5],
         "topFall": sorted(
-            (item for item in by_change if item["changePercent"] < 0),
-            key=lambda item: (item["changePercent"], item["sectorCode"]),
+            (item for item in items if item["changePercent"] < 0),
+            key=lambda item: (item["changePercent"], item["sectorName"]),
         )[:5],
         "topInflow": sorted(
-            (item for item in inflow_candidates if item["mainNetInflow"] > 0),
-            key=lambda item: (-item["mainNetInflow"], item["sectorCode"]),
+            (item for item in items if item["netFlowAmount"] > 0),
+            key=lambda item: (-item["netFlowAmount"], item["sectorName"]),
         )[:5],
         "topOutflow": sorted(
-            (item for item in inflow_candidates if item["mainNetInflow"] < 0),
-            key=lambda item: (item["mainNetInflow"], item["sectorCode"]),
+            (item for item in items if item["netFlowAmount"] < 0),
+            key=lambda item: (item["netFlowAmount"], item["sectorName"]),
         )[:5],
-        "unmatchedFundRows": unmatched,
     }
 
 

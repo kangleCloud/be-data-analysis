@@ -1,11 +1,14 @@
 """跨语言 Redis JSON 快照存储。"""
 
 import json
+import logging
 from typing import Any, Protocol
 from uuid import uuid4
 
-SNAPSHOT_KEY = "stock:market:v1:snapshot"
-LOCK_KEY = "stock:market:v1:lock"
+SNAPSHOT_KEY = "stock:market:v2:snapshot"
+UPDATES_CHANNEL = "stock:market:v2:updates"
+LOCK_KEY = "stock:market:v2:lock"
+LOGGER = logging.getLogger(__name__)
 RELEASE_LOCK_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
   return redis.call('del', KEYS[1])
@@ -44,10 +47,28 @@ class RedisSnapshotStore:
         if raw is None:
             return None
         snapshot = json.loads(raw)
-        if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 1:
+        if not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 2:
             raise ValueError("Redis 快照版本不受支持")
         return snapshot
 
     def save(self, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("schemaVersion") != 2 or not isinstance(
+            snapshot.get("generatedAt"), str
+        ):
+            raise ValueError("Redis 快照通知字段无效")
         payload = json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        self._client.set(SNAPSHOT_KEY, payload)
+        notice = json.dumps(
+            {
+                "schemaVersion": snapshot["schemaVersion"],
+                "generatedAt": snapshot["generatedAt"],
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        if not self._client.set(SNAPSHOT_KEY, payload):
+            raise RuntimeError("Redis 快照写入失败")
+        try:
+            self._client.publish(UPDATES_CHANNEL, notice)
+        except Exception:
+            LOGGER.exception("Redis 快照已写入，但更新通知发送失败")

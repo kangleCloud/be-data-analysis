@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Mapping
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from pydantic import SecretStr
 
@@ -36,10 +36,27 @@ def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """从环境变量加载配置。"""
     values = os.environ if environ is None else environ
-    redis_url = values.get("REDIS_URL", "redis://localhost:6379/2").strip()
-    parsed = urlparse(redis_url)
-    if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname or parsed.path != "/2":
-        raise ValueError("REDIS_URL 必须是指向 Redis DB 2 的 redis(s) URL")
+    parsed = urlparse(values.get("REDIS_URL", "redis://localhost").strip())
+    redis_port = values.get("REDIS_PORT")
+    if redis_port is None:
+        redis_port = str(parsed.port or 6379)
+    redis_db = values.get("REDIS_DB", parsed.path.removeprefix("/") or "2")
+    password = values.get("REDIS_PASSWORD", unquote(parsed.password or ""))
+    username = unquote(parsed.username or "")
+    credentials = ""
+    if username or password:
+        credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+    hostname = parsed.hostname or parsed.path or "localhost"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    redis_url = urlunparse((
+        parsed.scheme or "redis",
+        f"{credentials}{hostname}:{redis_port}",
+        f"/{redis_db}",
+        "",
+        parsed.query,
+        "",
+    ))
     port = _integer(values, "SERVICE_PORT", 8000)
     if port > 65535:
         raise ValueError("SERVICE_PORT 必须在 1-65535 范围内")
@@ -47,10 +64,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     if level not in {"critical", "error", "warning", "info", "debug"}:
         raise ValueError("SERVICE_LOG_LEVEL 不受支持")
     source_timeout = _integer(values, "SOURCE_TIMEOUT_SECONDS", 15)
-    lock_seconds = _integer(values, "REDIS_LOCK_SECONDS", 240)
-    # 六个源调用（含交易日历）最多各尝试两次，锁必须覆盖整轮调用。
-    if lock_seconds <= 12 * source_timeout + 30:
-        raise ValueError("REDIS_LOCK_SECONDS 必须覆盖采集最大执行时间")
+    lock_seconds = int(values.get("REDIS_LOCK_SECONDS", "240"))
     return Settings(
         service_host=values.get("SERVICE_HOST", "0.0.0.0"),
         service_port=port,
