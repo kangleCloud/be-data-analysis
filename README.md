@@ -17,6 +17,21 @@ python -m app serve
 
 `serve` 启动健康接口与内置调度：北京时间工作日 09:40、10:10、10:40、11:10、13:10、13:40、14:10、14:40、15:30 分别通过独立子进程采集一次；已错过的时段不补跑，非交易日由交易日历跳过。`collect --force` 可在时段外手动采集，但仍受 Redis 时段占位、全局 20 分钟最小间隔及源冷却限制。
 
+## 服务器容器部署
+
+在服务器的 `be-data-analysis` 目录准备 `.env`（参考 `.env.example`），其中 `REDIS_URL` 必须是容器可访问的地址；宿主机 Redis 可使用 `redis://host.docker.internal`，并通过 `REDIS_PORT`、`REDIS_DB` 指定端口和库。然后执行：
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 0755 /data/logs/be-data-analysis
+docker compose up -d --build
+curl -f http://127.0.0.1:8000/health
+tail -f /data/logs/be-data-analysis/service.log
+```
+
+`compose.yaml` 将宿主机 `/data/logs/be-data-analysis/` 挂载到容器 `/app/logs/`。服务与定时采集子进程的标准输出、错误和 Uvicorn 日志都写入 `service.log`。容器以 UID/GID 10001 运行，因此宿主机日志目录须对该用户可写。应用端口默认映射到宿主机 8000，可在 `.env` 中设置 `SERVICE_PORT` 更改宿主机端口；容器内固定监听 8000。查看服务状态用 `docker compose ps`，重启用 `docker compose restart`。
+
+日志轮转配置见 `deploy/logrotate.conf`，可复制到服务器 `/etc/logrotate.d/be-data-analysis`。配置使用 `copytruncate`，无需重启服务即可轮转正在写入的文件。
+
 重叠运行由 Redis 锁阻止。源被限流、断连或超时后冷却两小时；同花顺分页请求至少间隔一秒。任一模块失败时仍发布保留旧成功数据的快照，但命令返回非零状态，需检查日志。日志记录接口、模块和总耗时以及异常类型，不包含 Redis 凭据。
 
 健康接口为 `GET /health`；采集由服务内调度启动的一次性子进程执行。另有两个仅供 Spring 使用、需 `X-Internal-Token` 鉴权的个股监控内部接口。

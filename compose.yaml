@@ -1,0 +1,20 @@
+services:
+  be-data-analysis:
+    build: .
+    image: be-data-analysis:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: 8000
+    ports:
+      - "${SERVICE_PORT:-8001}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /data/logs/be-data-analysis:/app/logs
+    command:
+      - sh
+      - -c
+      - exec python -m app serve >> /app/logs/service.log 2>&1
