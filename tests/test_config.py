@@ -37,6 +37,20 @@ def test_redis_values_are_not_validated():
     assert settings.redis_lock_seconds == 100
 
 
+def test_stock_monitor_is_disabled_by_default_and_tokens_are_secret():
+    defaults = load_settings({})
+    assert not defaults.stock_monitor_xq_enabled
+    settings = load_settings({
+        "STOCK_MONITOR_XQ_ENABLED": "true",
+        "XUEQIU_TOKEN": "private-xq-token",
+        "STOCK_MONITOR_INTERNAL_TOKEN": "private-service-token",
+    })
+    assert settings.stock_monitor_xq_enabled
+    assert settings.xueqiu_token.get_secret_value() == "private-xq-token"
+    assert "private-xq-token" not in repr(settings)
+    assert "private-service-token" not in repr(settings)
+
+
 @pytest.mark.parametrize("key,value", [
     ("SOURCE_TIMEOUT_SECONDS", "0"),
     ("SERVICE_PORT", "65536"),

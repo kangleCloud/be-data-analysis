@@ -1,0 +1,259 @@
+"""个股监控 V1 的纯转换、Redis 存储与盘中采样。"""
+
+import json
+import logging
+import math
+import re
+import time
+from datetime import date, datetime, time as day_time
+from typing import Any, Protocol
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from app.providers.xueqiu import XueqiuSourceError
+
+
+LOGGER = logging.getLogger(__name__)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+ENABLED_KEY = "stock:monitor:v1:enabled"
+QUOTE_PREFIX = "stock:monitor:v1:quote:"
+SERIES_PREFIX = "stock:monitor:v1:series:"
+LAST_TRADE_DATE_KEY = "stock:monitor:v1:lastTradeDate"
+SAMPLE_LOCK_KEY = "stock:monitor:v1:sample:lock"
+XQ_COOLDOWN_KEY = "stock:monitor:v1:xq:cooldown"
+LOCK_SECONDS = 240
+COOLDOWN_SECONDS = 2 * 60 * 60
+SYMBOL_RE = re.compile(r"^(SH|SZ|BJ)[0-9]{6}$")
+RELEASE_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def valid_symbol(symbol: Any) -> bool:
+    return isinstance(symbol, str) and SYMBOL_RE.fullmatch(symbol) is not None
+
+
+def _number(raw: Any) -> float | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _source_time(raw: Any) -> datetime | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            value = datetime.fromtimestamp(raw / 1000, SHANGHAI)
+        else:
+            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            value = value.replace(tzinfo=SHANGHAI) if value.tzinfo is None else value.astimezone(SHANGHAI)
+        return value.replace(microsecond=0)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def normalize_quote(symbol: str, raw: dict[str, Any], collected_at: datetime) -> dict[str, Any]:
+    if not valid_symbol(symbol) or not isinstance(raw, dict):
+        raise ValueError("雪球报价格式不正确")
+    source_time = _source_time(raw.get("time") or raw.get("timestamp"))
+    if source_time is None:
+        raise ValueError("雪球报价缺少有效源时间")
+    price = _number(raw.get("current"))
+    change = _number(raw.get("percent"))
+    amount = _number(raw.get("amount"))
+    if price is None and change is None and amount is None:
+        raise ValueError("雪球报价缺少有效数值")
+    return {
+        "schemaVersion": 1,
+        "symbol": symbol,
+        "source": "XQ",
+        "sourceTime": source_time.isoformat(timespec="seconds"),
+        "collectedAt": collected_at.astimezone(SHANGHAI).isoformat(timespec="seconds"),
+        "tradeDate": source_time.date().isoformat(),
+        "price": price,
+        "changePercent": change,
+        "amount": amount,
+        "status": "FRESH",
+    }
+
+
+def normalize_profile(symbol: str, raw: dict[str, Any], quote: dict[str, Any] | None,
+                      updated_at: datetime) -> dict[str, Any]:
+    if not valid_symbol(symbol) or not isinstance(raw, dict):
+        raise ValueError("雪球个股资料格式不正确")
+    industry = raw.get("industry") or raw.get("industry_name") or raw.get("所属行业")
+    industry = str(industry).strip() if industry is not None else None
+    listing = raw.get("list_date") or raw.get("listing_date") or raw.get("上市日期")
+    listing_date: str | None = None
+    if isinstance(listing, str):
+        try:
+            listing_date = date.fromisoformat(listing[:10]).isoformat()
+        except ValueError:
+            pass
+    elif isinstance(listing, (int, float)):
+        parsed = _source_time(listing)
+        listing_date = parsed.date().isoformat() if parsed else None
+    capital = _number(raw.get("market_capital"))
+    if capital is None and quote is not None:
+        capital = _number(quote.get("market_capital"))
+    return {
+        "symbol": symbol,
+        "industry": industry or None,
+        "listingDate": listing_date,
+        "marketCap": capital,
+        "updatedAt": updated_at.astimezone(SHANGHAI).isoformat(timespec="seconds"),
+    }
+
+
+class MonitorStore:
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def enabled(self) -> list[dict[str, str]]:
+        raw = self.client.get(ENABLED_KEY)
+        if raw is None:
+            return []
+        stocks = json.loads(raw)
+        if not isinstance(stocks, list) or len(stocks) > 10:
+            raise ValueError("已监控股票清单格式不正确")
+        seen: set[str] = set()
+        for stock in stocks:
+            if not isinstance(stock, dict) or not valid_symbol(stock.get("symbol")):
+                raise ValueError("已监控股票代码不正确")
+            symbol = stock["symbol"]
+            if symbol in seen or stock.get("code") != symbol[2:] or stock.get("market") != symbol[:2]:
+                raise ValueError("已监控股票清单重复或字段不一致")
+            seen.add(symbol)
+        return stocks
+
+    def acquire(self, lock_seconds: int = LOCK_SECONDS) -> str | None:
+        token = uuid4().hex
+        return token if self.client.set(SAMPLE_LOCK_KEY, token, nx=True, ex=lock_seconds) else None
+
+    def release(self, token: str) -> None:
+        self.client.eval(RELEASE_SCRIPT, 1, SAMPLE_LOCK_KEY, token)
+
+    def cooldown_active(self) -> bool:
+        return bool(self.client.exists(XQ_COOLDOWN_KEY))
+
+    def start_cooldown(self) -> None:
+        self.client.set(XQ_COOLDOWN_KEY, "1", ex=COOLDOWN_SECONDS)
+
+    def quote(self, symbol: str) -> dict[str, Any] | None:
+        raw = self.client.get(f"{QUOTE_PREFIX}{symbol}")
+        return json.loads(raw) if raw else None
+
+    def prepare_trade_date(self, trade_date: str) -> None:
+        old_date = self.client.get(LAST_TRADE_DATE_KEY)
+        if old_date == trade_date:
+            return
+        for key in self.client.scan_iter(match=f"{SERIES_PREFIX}*"):
+            if not key.startswith(f"{SERIES_PREFIX}{trade_date}:"):
+                self.client.delete(key)
+        self.client.set(LAST_TRADE_DATE_KEY, trade_date)
+
+    def write_quote(self, quote: dict[str, Any], *, append_point: bool) -> None:
+        symbol, trade_date = quote["symbol"], quote["tradeDate"]
+        pipe = self.client.pipeline(transaction=True)
+        pipe.set(f"{QUOTE_PREFIX}{symbol}", json.dumps(quote, ensure_ascii=False, allow_nan=False))
+        if append_point and quote["price"] is not None:
+            key = f"{SERIES_PREFIX}{trade_date}:{symbol}"
+            raw = self.client.get(key)
+            points = json.loads(raw) if raw else []
+            points = [point for point in points if point.get("time") != quote["sourceTime"]]
+            points.append({"time": quote["sourceTime"], "price": quote["price"]})
+            points.sort(key=lambda point: point["time"])
+            pipe.set(key, json.dumps(points, ensure_ascii=False, allow_nan=False))
+        pipe.execute()
+
+
+class QuoteSource(Protocol):
+    def quote(self, symbol: str) -> dict[str, Any]: ...
+
+
+class TradingCalendar(Protocol):
+    def latest_trading_date(self, today: date) -> date | None: ...
+
+
+class StockMonitorSampler:
+    def __init__(self, store: MonitorStore, source: QuoteSource, calendar: TradingCalendar,
+                 *, xq_enabled: bool = False, request_interval_seconds: float = 1.0) -> None:
+        self.store, self.source, self.calendar = store, source, calendar
+        self.xq_enabled = xq_enabled
+        self.request_interval_seconds = request_interval_seconds
+
+    def sample(self, at: datetime) -> str:
+        if not self.xq_enabled:
+            return "disabled"
+        local = at.astimezone(SHANGHAI)
+        if local.weekday() >= 5 or not (
+            day_time(9, 30) <= local.time() <= day_time(11, 30)
+            or day_time(13) <= local.time() <= day_time(15)
+        ):
+            return "skipped"
+        token = self.store.acquire()
+        if token is None:
+            return "locked"
+        try:
+            if self.calendar.latest_trading_date(local.date()) != local.date():
+                return "skipped"
+            stocks = self.store.enabled()
+            self.store.prepare_trade_date(local.date().isoformat())
+            if self.store.cooldown_active():
+                return "cooldown"
+            failures = 0
+            last_request: float | None = None
+            for index, stock in enumerate(stocks):
+                symbol = stock["symbol"]
+                if last_request is not None:
+                    remaining = self.request_interval_seconds - (time.monotonic() - last_request)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                last_request = time.monotonic()
+                try:
+                    quote = normalize_quote(symbol, self.source.quote(symbol), local)
+                    if quote["tradeDate"] != local.date().isoformat():
+                        raise ValueError("雪球报价源日期不是当前交易日")
+                    previous = self.store.quote(symbol)
+                    previous_time = previous.get("sourceTime") if previous else None
+                    if previous_time and previous_time > quote["sourceTime"]:
+                        raise ValueError("雪球报价源时间早于已保存报价")
+                    if previous_time == quote["sourceTime"]:
+                        if previous.get("status") != "FRESH":
+                            self.store.write_quote(quote, append_point=False)
+                        continue
+                    self.store.write_quote(quote, append_point=True)
+                except Exception as exc:
+                    failures += 1
+                    LOGGER.warning("雪球报价 %s 失败，异常 %s", symbol, type(exc).__name__)
+                    self._mark_failed(symbol, local)
+                    if isinstance(exc, XueqiuSourceError) and exc.cooldown:
+                        self.store.start_cooldown()
+                        for pending in stocks[index + 1:]:
+                            self._mark_failed(pending["symbol"], local)
+                        break
+            return "partial" if failures else "published"
+        finally:
+            self.store.release(token)
+
+    def _mark_failed(self, symbol: str, at: datetime) -> None:
+        previous = self.store.quote(symbol)
+        if previous and previous.get("sourceTime") and previous.get("price") is not None:
+            previous["status"] = "STALE"
+            self.store.write_quote(previous, append_point=False)
+        else:
+            self.store.write_quote({
+                "schemaVersion": 1, "symbol": symbol, "source": "XQ",
+                "sourceTime": None,
+                "collectedAt": at.isoformat(timespec="seconds"),
+                "tradeDate": None, "price": None,
+                "changePercent": None, "amount": None, "status": "ERROR",
+            }, append_point=False)

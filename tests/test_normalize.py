@@ -8,16 +8,12 @@ import pytest
 from app.normalize import (
     SourceDataError,
     normalize_market_fund_flow,
-    normalize_sectors,
     normalize_top5,
 )
 
 
-def test_sector_and_top5_units_and_signs(sector_rows, flow_rows):
-    sectors = normalize_sectors(sector_rows, "industry")
+def test_top5_units_and_signs(flow_rows):
     top5 = normalize_top5(flow_rows, "industry")
-    assert sectors[0]["marketCap"] == 1_000_000_000
-    assert sectors[0]["changePercent"] == 3.5
     assert set(top5) == {"source", "period", "topRise", "topFall", "topInflow", "topOutflow"}
     assert (top5["source"], top5["period"]) == ("THS", "INTRADAY")
     assert top5["topRise"][0] == {
@@ -29,12 +25,7 @@ def test_sector_and_top5_units_and_signs(sector_rows, flow_rows):
     assert top5["topOutflow"][0]["netFlowAmount"] == -200_000_000
 
 
-def test_invalid_values_are_null_or_excluded(sector_rows, flow_rows):
-    sector_rows.loc[0, "换手率"] = float("nan")
-    sector_rows.loc[1, "总市值"] = -1
-    sectors = normalize_sectors(sector_rows, "industry")
-    assert len(sectors) == 1
-    assert sectors[0]["turnoverRate"] is None
+def test_invalid_values_are_excluded(flow_rows):
     flow_rows["净额"] = flow_rows["净额"].astype(object)
     flow_rows.loc[0, "净额"] = "-"
     top5 = normalize_top5(flow_rows, "concept")
@@ -53,9 +44,7 @@ def test_duplicate_and_empty_names_are_excluded(flow_rows):
     assert [item["sectorName"] for item in top5["topOutflow"]] == ["银行"]
 
 
-def test_missing_columns_and_empty_are_errors(sector_rows, flow_rows):
-    with pytest.raises(SourceDataError):
-        normalize_sectors(sector_rows.drop(columns="总市值"), "industry")
+def test_missing_columns_and_empty_are_errors(flow_rows):
     with pytest.raises(SourceDataError):
         normalize_top5(flow_rows.iloc[0:0], "industry")
     with pytest.raises(SourceDataError):

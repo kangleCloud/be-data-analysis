@@ -34,45 +34,9 @@ def _number(raw: Any) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _integer(raw: Any) -> int | None:
-    value = _number(raw)
-    return int(value) if value is not None else None
-
-
 def _text(raw: Any) -> str:
     value = str(raw).strip() if raw is not None else ""
     return "" if value.lower() in {"nan", "nat", "<na>", "none"} else value
-
-
-def normalize_sectors(frame: Any, sector_type: str) -> list[dict[str, Any]]:
-    """板块面积采用源站总市值，不能从其他字段估算成交额。"""
-    rows = _rows(frame)
-    _require(rows, "板块代码", "板块名称", "涨跌幅", "总市值")
-    sectors = []
-    seen_codes = set()
-    for row in rows:
-        code, name = _text(row["板块代码"]), _text(row["板块名称"])
-        cap = _number(row["总市值"])
-        change = _number(row["涨跌幅"])
-        if not code or not name or cap is None or cap <= 0 or change is None:
-            continue
-        if code in seen_codes:
-            raise SourceDataError("板块代码重复")
-        seen_codes.add(code)
-        sectors.append({
-            "sectorCode": code,
-            "sectorName": name,
-            "sectorType": sector_type,
-            "marketCap": cap,
-            "changePercent": change,
-            "turnoverRate": _number(row.get("换手率")),
-            "riseCount": _integer(row.get("上涨家数")),
-            "fallCount": _integer(row.get("下跌家数")),
-            "leadingStockName": _text(row.get("领涨股票")) or None,
-        })
-    if not sectors:
-        raise SourceDataError("无有效板块数据")
-    return sectors
 
 
 def normalize_top5(frame: Any, sector_type: str) -> dict[str, Any]:
