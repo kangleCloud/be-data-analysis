@@ -21,6 +21,11 @@ class Settings:
     )
     source_timeout_seconds: int = 15
     redis_lock_seconds: int = 240
+    stock_monitor_xq_enabled: bool = False
+    xueqiu_token: SecretStr = field(default_factory=lambda: SecretStr(""), repr=False)
+    stock_monitor_internal_token: SecretStr = field(
+        default_factory=lambda: SecretStr(""), repr=False
+    )
 
 
 def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
@@ -65,6 +70,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise ValueError("SERVICE_LOG_LEVEL 不受支持")
     source_timeout = _integer(values, "SOURCE_TIMEOUT_SECONDS", 15)
     lock_seconds = int(values.get("REDIS_LOCK_SECONDS", "240"))
+    xq_flag = values.get("STOCK_MONITOR_XQ_ENABLED", "false").strip().lower()
+    if xq_flag not in {"true", "false", "1", "0"}:
+        raise ValueError("STOCK_MONITOR_XQ_ENABLED 必须为 true 或 false")
     return Settings(
         service_host=values.get("SERVICE_HOST", "0.0.0.0"),
         service_port=port,
@@ -72,6 +80,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         redis_url=SecretStr(redis_url),
         source_timeout_seconds=source_timeout,
         redis_lock_seconds=lock_seconds,
+        stock_monitor_xq_enabled=xq_flag in {"true", "1"},
+        xueqiu_token=SecretStr(values.get("XUEQIU_TOKEN", "")),
+        stock_monitor_internal_token=SecretStr(
+            values.get("STOCK_MONITOR_INTERNAL_TOKEN", "")
+        ),
     )
 
 

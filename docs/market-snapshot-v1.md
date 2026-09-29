@@ -1,6 +1,6 @@
 # 市场快照 V1 契约
 
-`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON。`be-vita` 应按字符串读取并解析 JSON，不使用带 Java 类型信息的 Redis 对象反序列化器。单键 `SET` 保证读到完整一轮快照。
+`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。单键 `SET` 成功后向 `stock:market:v1:updates` 发布包含同一快照 `schemaVersion` 和 `generatedAt` 的 JSON 通知。通知仅唤醒读取方，读取方重新读取完整快照。锁键为 `stock:market:v1:lock`。
 
 ## 顶层与模块
 
@@ -8,10 +8,8 @@
 {
   "schemaVersion": 1,
   "provider": "akshare",
-  "generatedAt": "2026-09-23T10:00:00+08:00",
+  "generatedAt": "2026-09-25T10:10:00+08:00",
   "modules": {
-    "industryHeatmap": {},
-    "conceptHeatmap": {},
     "industryTop5": {},
     "conceptTop5": {},
     "marketFundFlow": {}
@@ -19,18 +17,34 @@
 }
 ```
 
-每个模块含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。`status` 为 `FRESH`、`STALE` 或 `ERROR`：成功采集为 `FRESH`；失败且有旧数据为 `STALE`；失败且没有旧数据为 `ERROR`，此时 `data=null`。`FRESH` 表示本轮**读取成功**，并不保证源站发布了当日数据，应同时检查 `tradeDate`。
+真实模块各含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。`FRESH` 表示本轮读取成功；失败且有旧成功数据为 `STALE`；失败且没有旧数据为 `ERROR`，此时 `data=null`。三个模块独立降级。`generatedAt` 是本轮快照生成时间，`lastSuccessAt` 是采集完成时间，不代表源站报价时间。
 
-板块列表和板块资金流源接口未提供可靠交易日期，`tradeDateBasis=CALENDAR` 表示日期来自采集时的交易日历，`lastSuccessAt` 是采集完成时间而非源站报价时间。大盘资金流使用源数据的 `日期`，`tradeDateBasis=SOURCE`；若盘中最新一行仍是前一交易日，就如实保留该日期。
+`industryTop5` 和 `conceptTop5` 分别来自 AKShare 的同花顺 `stock_fund_flow_industry(symbol="即时")` 和 `stock_fund_flow_concept(symbol="即时")`。这两个模块的 `tradeDateBasis=CALENDAR`，`tradeDate` 仅是采集时参考交易日，不声称同花顺源数据日期。`marketFundFlow` 使用 AKShare 的东方财富 `stock_market_fund_flow()`，`tradeDateBasis=SOURCE` 且交易日期取自源数据的 `日期`；`FRESH` 不保证源日期是当天。
 
 ## data 字段
 
 | 模块 | 内容 |
 | --- | --- |
-| `industryHeatmap`、`conceptHeatmap` | 板块数组：`sectorCode`、`sectorName`、`sectorType`、`marketCap`、`changePercent`、`turnoverRate`、`riseCount`、`fallCount`、`leadingStockName`。 |
-| `industryTop5`、`conceptTop5` | `topRise`、`topFall`、`topInflow`、`topOutflow` 四个数组，各最多五项；另有 `unmatchedFundRows`。资金榜项有 `mainNetInflow`、`mainNetInflowRatio`。 |
-| `marketFundFlow` | `latest` 为最新可得交易日记录；`series` 为按日期升序排列的最多 20 条交易日记录。含主力、超大单、大单、中单、小单净流入及净占比，以及上证、深证收盘点位和涨跌幅。 |
+| `industryTop5`、`conceptTop5` | 对象含 `source="THS"`、`period="INTRADAY"`、`topRise`、`topFall`、`topInflow`、`topOutflow`，四个榜单各最多五项。 |
+| `marketFundFlow` | `latest` 为最新可得交易日记录；`series` 为按日期升序排列的最多 20 条交易日记录。保留东方财富主力、超大单、大单、中单、小单净流入及净占比，以及上证、深证收盘点位和涨跌幅。 |
 
-金额及总市值单位为**元**；涨跌幅、换手率及净流入占比是百分数数值，例如 `2.5` 表示 `2.5%`，不是 `0.025`。无法确定的数值为 JSON `null`，不得写入 `NaN`、`Infinity` 或零值替代。资金流遵循 AKShare 对东方财富数据的字段口径。
+Top5 四类榜单的每个条目均为：
+
+```json
+{
+  "sectorName": "半导体",
+  "sectorType": "industry",
+  "changePercent": 2.5,
+  "netFlowAmount": 150000000
+}
+```
+
+`sectorType` 为 `industry` 或 `concept`。同花顺 `净额` 原单位为亿元，转换成以元为单位的 `netFlowAmount`；它不是东方财富的主力净流入。涨幅榜按正涨跌幅降序，跌幅榜按负涨跌幅升序；流入榜按正净额降序，流出榜按负净额升序，即流出绝对金额降序。同值按 `sectorName` 字符串升序。空名、重复名、无效数值不进入榜单；无可用行时按模块失败降级。
+
+金额单位为元，百分数字段的 `2.5` 表示 `2.5%`。无法确定的数值为 JSON `null`，不得用 `NaN`、`Infinity` 或伪造零值代替。
+
+## 采集时段和源保护
+
+`python -m app serve` 启动内置调度。北京时间工作日 09:40、10:10、10:40、11:10、13:10、13:40、14:10、14:40、15:30 各启动一次独立 `python -m app collect` 子进程；服务启动时已错过的时段不补跑，节假日由交易日历检查后跳过实际模块采集。手动 `python -m app collect --force` 只绕过时段检查，不绕过 Redis 分布式时段占位、全局 20 分钟最小间隔或源冷却。被限流、断连或超时的源进入 Redis 共享两小时冷却期；同花顺两个榜单共用源冷却。源调用不立即重试，同花顺分页请求至少间隔 1 秒且单次接口超时 45 秒，其余接口默认超时 15 秒。
 
 来源：[AKShare 股票数据文档](https://akshare.akfamily.xyz/data/stock/stock.html)。

@@ -1,12 +1,12 @@
-# 市场快照 V1：本地手动联调
+# 市场快照 V1：本地联调
 
-本说明只用于本地联调。采集由操作者运行一次命令触发；不安装 cron、launchd、Spring 调度任务或其他自动触发器。接口和字段以[市场快照 V1 契约](market-snapshot-v1.md)为准。
+本说明只用于本地联调。`python -m app serve` 启动服务内定点调度，手动 `collect --force` 仍可使用，但受 Redis 去重和源冷却约束。接口和字段以[市场快照 V1 契约](market-snapshot-v1.md)为准。
 
 ## 链路与前置条件
 
 | 环节 | 本地约定 |
 | --- | --- |
-| 采集 | `be-data-analysis`，Python 3.12，`python -m app collect --force` |
+| 采集 | `be-data-analysis`，Python 3.12，`python -m app serve` 内置调度或手动 `python -m app collect --force` |
 | Redis | 同一台本地 Redis，DB 2，字符串键 `stock:market:v1:snapshot`；值是 UTF-8 JSON，不设 TTL |
 | 后端 | `be-vita` 的 `vita-admin`，显式使用 `dev` profile，端口 19001、上下文路径 `/admin/api`；`GET /market/dashboard/snapshot` 需要 `market:dashboard:view` 权限 |
 | 前端 | `fe-data-stock`，Vite 5173；`/admin/api` 默认代理到 `http://127.0.0.1:19001`，动态路由为 `/market` → `/market/overview` |
@@ -19,7 +19,7 @@
 
 以下命令分别在终端执行，路径按本机实际检出位置调整。Redis 和 MySQL 只连接本地实例；启动命令因本机安装方式而异。
 
-1. 手动启动 MySQL 和 Redis，确认 `127.0.0.1:3306`、`127.0.0.1:6379` 可连接；确认 Redis DB 2 可读写。**不要启用定时采集。**
+1. 手动启动 MySQL 和 Redis，确认 `127.0.0.1:3306`、`127.0.0.1:6379` 可连接；确认 Redis DB 2 可读写。启动 `serve` 后内置调度会按交易时段自动采集。
 2. 在 `be-vita` 根目录启动管理端：
 
    ```bash
@@ -34,8 +34,8 @@
    python3.12 -m app collect --force
    ```
 
-   `--force` 只绕过采集时段检查，仍需 Redis 锁；命令完成一轮后退出。某个源失败时，快照可能仍被写入，但命令返回非零；检查各模块状态和日志。交易时段可另行手动执行 `python3.12 -m app probe`，只读核对大盘资金流的最新源数据日期。
-5. 用 `redis-cli -n 2 GET stock:market:v1:snapshot` 或本地 Redis 工具检查原始 JSON；确认顶层版本 1、五个模块、`generatedAt` 与每模块的 `tradeDate`、`tradeDateBasis`、`status`。在已登录页面核对热力图、四类 Top5 和大盘资金流三块展示。`FRESH` 不代表源数据为当日实时，特别要比较 `marketFundFlow.tradeDate` 与本地交易日。
+   `--force` 只绕过采集时段检查，仍受 Redis 锁、时段占位、全局最小间隔和源冷却约束；命令完成一轮后退出。某个源失败时，快照可能仍被写入，但命令返回非零；检查各模块状态和日志。交易时段可另行手动执行 `python3.12 -m app probe`，只读核对大盘资金流的最新源数据日期。
+5. 用 `redis-cli -n 2 GET stock:market:v1:snapshot` 或本地 Redis 工具检查原始 JSON；确认顶层版本 1、三个模块、`generatedAt` 与每模块的 `tradeDate`、`tradeDateBasis`、`status`。在已登录页面核对行业、概念 Top5 和大盘资金流。`FRESH` 不代表源数据为当日实时，特别要比较 `marketFundFlow.tradeDate` 与本地交易日。
 
 ## 行情源不可用时的本地快照联调
 
@@ -68,21 +68,15 @@ else:
         return {"status": "FRESH", "tradeDate": trade_date,
                 "tradeDateBasis": basis, "lastSuccessAt": stamp,
                 "lastAttemptAt": stamp, "message": None, "data": data}
-    def sector(kind):
-        return {"sectorCode": "BK0001", "sectorName": "示例板块", "sectorType": kind,
-                "marketCap": 120000000000, "changePercent": 1.2,
-                "turnoverRate": 2.5, "riseCount": 12, "fallCount": 3,
-                "leadingStockName": "示例股票"}
     def ranking(kind, change, flow):
-        return {"sectorCode": "BK0001", "sectorName": "示例板块", "sectorType": kind,
-                "changePercent": change, "mainNetInflow": flow,
-                "mainNetInflowRatio": 2.5}
+        return {"sectorName": "示例板块", "sectorType": kind,
+                "changePercent": change, "netFlowAmount": flow}
     def top5(kind):
-        return {"topRise": [ranking(kind, 1.2, 100000000)],
+        return {"source": "THS", "period": "INTRADAY",
+                "topRise": [ranking(kind, 1.2, 100000000)],
                 "topFall": [ranking(kind, -1.2, -100000000)],
                 "topInflow": [ranking(kind, 1.2, 100000000)],
-                "topOutflow": [ranking(kind, -1.2, -100000000)],
-                "unmatchedFundRows": 0}
+                "topOutflow": [ranking(kind, -1.2, -100000000)]}
     def fund_point(day):
         return {"date": day, "mainNetInflow": 100000000,
                 "mainNetInflowRatio": 2.5, "superLargeNetInflow": 60000000,
@@ -95,15 +89,13 @@ else:
     fund_date = old_date if case == "historical" else date
     point = fund_point(fund_date)
     modules = {
-        "industryHeatmap": module([sector("industry")]),
-        "conceptHeatmap": module([sector("concept")]),
         "industryTop5": module(top5("industry")),
         "conceptTop5": module(top5("concept")),
         "marketFundFlow": module({"latest": point, "series": [point]}, "SOURCE", fund_date),
     }
     if case == "partial":
-        modules["conceptHeatmap"]["status"] = "STALE"
-        modules["conceptHeatmap"]["message"] = "示例：本轮采集失败，保留上次数据"
+        modules["conceptTop5"]["status"] = "STALE"
+        modules["conceptTop5"]["message"] = "示例：本轮采集失败，保留上次数据"
         modules["marketFundFlow"].update(status="ERROR", tradeDate=None,
                                          lastSuccessAt=None, data=None,
                                          message="示例：首次采集失败")
@@ -116,7 +108,7 @@ print(f"已写入本地测试场景：{case}")
 PY
 ```
 
-预期：`normal` 显示三个展示区；`partial` 的概念热力图显示旧数据提示、大盘资金流显示错误空态；`historical` 显示实际历史日期且不称为当日实时；`missing` 使后端返回业务错误，前端显示页面空态。上述数据均为**合成测试值**，与真实行情无关。测试结束后手动再次采集真实数据，或在专用本地 Redis 上删除该快照键。
+预期：`normal` 显示三个展示区；`partial` 的概念 Top5 显示旧数据提示、大盘资金流显示错误空态；`historical` 显示实际历史日期且不称为当日实时；`missing` 使后端返回业务错误，前端显示页面空态。上述数据均为**合成测试值**，与真实行情无关。测试结束后手动再次采集真实数据，或在专用本地 Redis 上删除该快照键。
 
 ## 2026-09-23 本机执行记录
 
