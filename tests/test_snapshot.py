@@ -5,7 +5,7 @@ import json
 import pytest
 
 from app.snapshot import (
-    LOCK_KEY, RESERVE_SLOT_SCRIPT, SNAPSHOT_KEY, UPDATES_CHANNEL,
+    LOCK_KEY, RENEW_LOCK_SCRIPT, SNAPSHOT_KEY, UPDATES_CHANNEL,
     RedisSnapshotStore,
 )
 
@@ -49,13 +49,11 @@ class FakeRedis:
         return 0
 
     def eval(self, script, count, *args):
-        if script == RESERVE_SLOT_SCRIPT:
-            assert count == 2
-            slot_key, interval_key, slot_ttl, interval_ttl = args
-            if self.exists(slot_key, interval_key):
+        if script == RENEW_LOCK_SCRIPT:
+            key, token, seconds = args
+            if self.get(key) != token:
                 return 0
-            self.set(slot_key, "1", ex=slot_ttl)
-            self.set(interval_key, "1", ex=interval_ttl)
+            self.expiry[key] = self.now + seconds
             return 1
         key, token = args
         if self.get(key) == token:
@@ -73,10 +71,10 @@ def test_snapshot_is_plain_utf8_json_and_atomic_single_key():
     store.save({
         "schemaVersion": 1,
         "generatedAt": "2026-09-23T10:00:00+08:00",
-        "modules": {"industryTop5": {"data": "半导体"}},
+        "modules": {"industrySectors": {"data": "半导体"}},
     })
     assert list(client.values) == [SNAPSHOT_KEY]
-    assert json.loads(client.values[SNAPSHOT_KEY])["modules"]["industryTop5"]["data"] == "半导体"
+    assert json.loads(client.values[SNAPSHOT_KEY])["modules"]["industrySectors"]["data"] == "半导体"
     assert "半导体" in client.values[SNAPSHOT_KEY]
     assert [event[:2] for event in client.events] == [
         ("set", SNAPSHOT_KEY), ("publish", UPDATES_CHANNEL)
@@ -119,6 +117,39 @@ def test_lock_excludes_overlap_and_only_owner_can_release():
     assert store.acquire() is not None
 
 
+def test_lock_renewal_extends_long_request_and_rejects_wrong_owner():
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    token = store.acquire()
+    client.advance(200)
+    assert not store.renew("wrong-owner")
+    assert store.renew(token)
+    client.advance(200)
+    assert client.get(LOCK_KEY) == token
+    store.release(token)
+
+
+def test_background_renewal_keeps_long_pagination_lock(monkeypatch):
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    token = store.acquire()
+    client.advance(200)
+    waits = []
+
+    def wait(_interval):
+        waits.append(1)
+        return len(waits) > 1
+
+    monkeypatch.setattr(store._renew_stop, "wait", wait)
+    store.start_renewal(token)
+    store._renew_thread.join(timeout=1)
+    assert client.expiry[LOCK_KEY] == 440
+    client.advance(200)
+    assert client.get(LOCK_KEY) == token
+    store.stop_renewal()
+    store.release(token)
+
+
 def test_slot_reservation_is_atomic_and_enforces_interval():
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -129,9 +160,9 @@ def test_slot_reservation_is_atomic_and_enforces_interval():
     at = datetime(2026, 9, 23, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     assert first.reserve_slot(at)
     assert not second.reserve_slot(at)
-    assert not second.reserve_slot(at.replace(minute=10))
-    client.advance(20 * 60)
-    assert second.reserve_slot(at.replace(minute=10))
+    assert not second.reserve_slot(at.replace(minute=1))
+    client.advance(120)
+    assert second.reserve_slot(at.replace(minute=2))
 
 
 def test_unsupported_snapshot_version_is_rejected():

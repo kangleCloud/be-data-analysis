@@ -17,7 +17,8 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 def test_next_sample_slot_skips_lunch_and_weekend():
     assert next_sample_slot(datetime(2026, 9, 28, 9, 31, tzinfo=SHANGHAI)).strftime("%H:%M") == "09:32"
     assert next_sample_slot(datetime(2026, 9, 28, 11, 30, tzinfo=SHANGHAI)).strftime("%H:%M") == "13:00"
-    assert next_sample_slot(datetime(2026, 9, 25, 15, 1, tzinfo=SHANGHAI)).strftime("%Y-%m-%d %H:%M") == "2026-09-28 09:30"
+    assert next_sample_slot(datetime(2026, 9, 25, 15, 1, tzinfo=SHANGHAI)).strftime("%Y-%m-%d %H:%M") == "2026-09-25 15:02"
+    assert next_sample_slot(datetime(2026, 9, 25, 15, 10, tzinfo=SHANGHAI)).strftime("%Y-%m-%d %H:%M") == "2026-09-28 09:30"
 
 
 def test_serve_starts_monitor_scheduler_only_when_enabled(monkeypatch):

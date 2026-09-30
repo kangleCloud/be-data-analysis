@@ -1,50 +1,80 @@
 # 市场快照 V1 契约
 
-`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。单键 `SET` 成功后向 `stock:market:v1:updates` 发布包含同一快照 `schemaVersion` 和 `generatedAt` 的 JSON 通知。通知仅唤醒读取方，读取方重新读取完整快照。锁键为 `stock:market:v1:lock`。
-
-## 顶层与模块
+`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。单键写入成功后向 `stock:market:v1:updates` 发布同一快照的 `schemaVersion` 与 `generatedAt`。读取方收到通知后重新读取完整快照。
 
 ```json
 {
   "schemaVersion": 1,
   "provider": "akshare",
-  "generatedAt": "2026-09-25T10:10:00+08:00",
+  "generatedAt": "2026-09-30T10:00:00+08:00",
   "modules": {
-    "industryTop5": {},
-    "conceptTop5": {},
+    "industrySectors": {},
+    "conceptSectors": {},
     "marketFundFlow": {}
   }
 }
 ```
 
-真实模块各含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。`FRESH` 表示本轮读取成功；失败且有旧成功数据为 `STALE`；失败且没有旧数据为 `ERROR`，此时 `data=null`。三个模块独立降级。`generatedAt` 是本轮快照生成时间，`lastSuccessAt` 是采集完成时间，不代表源站报价时间。
+各模块均包含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。本轮成功为 `FRESH`；失败但有符合当前契约的旧数据为 `STALE`；无旧数据为 `ERROR/data=null`。三个模块独立降级。三组同花顺源均没有可靠的源日期和源时间，因此 `tradeDateBasis=CALENDAR`；`tradeDate` 仅是交易日历参考日期。`lastSuccessAt`、市场曲线的 `collectedAt` 与 `generatedAt` 是本服务采集时间，不代表源站时间。
 
-`industryTop5` 和 `conceptTop5` 分别来自 AKShare 的同花顺 `stock_fund_flow_industry(symbol="即时")` 和 `stock_fund_flow_concept(symbol="即时")`。这两个模块的 `tradeDateBasis=CALENDAR`，`tradeDate` 仅是采集时参考交易日，不声称同花顺源数据日期。`marketFundFlow` 使用 AKShare 的东方财富 `stock_market_fund_flow()`，`tradeDateBasis=SOURCE` 且交易日期取自源数据的 `日期`；`FRESH` 不保证源日期是当天。
+## 行业与概念
 
-## data 字段
-
-| 模块 | 内容 |
-| --- | --- |
-| `industryTop5`、`conceptTop5` | 对象含 `source="THS"`、`period="INTRADAY"`、`topRise`、`topFall`、`topInflow`、`topOutflow`，四个榜单各最多五项。 |
-| `marketFundFlow` | `latest` 为最新可得交易日记录；`series` 为按日期升序排列的最多 20 条交易日记录。保留东方财富主力、超大单、大单、中单、小单净流入及净占比，以及上证、深证收盘点位和涨跌幅。 |
-
-Top5 四类榜单的每个条目均为：
+`industrySectors`、`conceptSectors` 分别来自 AKShare `stock_fund_flow_industry(symbol="即时")` 和 `stock_fund_flow_concept(symbol="即时")`：
 
 ```json
 {
-  "sectorName": "半导体",
-  "sectorType": "industry",
-  "changePercent": 2.5,
-  "netFlowAmount": 150000000
+  "source": "THS",
+  "period": "INTRADAY",
+  "items": [{
+    "code": null,
+    "name": "半导体",
+    "type": "industry",
+    "indexValue": 1234.5,
+    "changePct": 2.31,
+    "inflow": 200000000,
+    "outflow": 50000000,
+    "netAmount": 150000000,
+    "netFlowRate": 60,
+    "companyCount": 55,
+    "leader": "示例股票",
+    "leaderChangePct": 9.9,
+    "leaderPrice": 23.5
+  }]
 }
 ```
 
-`sectorType` 为 `industry` 或 `concept`。同花顺 `净额` 原单位为亿元，转换成以元为单位的 `netFlowAmount`；它不是东方财富的主力净流入。涨幅榜按正涨跌幅降序，跌幅榜按负涨跌幅升序；流入榜按正净额降序，流出榜按负净额升序，即流出绝对金额降序。同值按 `sectorName` 字符串升序。空名、重复名、无效数值不进入榜单；无可用行时按模块失败降级。
+`items` 保存完整的有效板块行，页面从中计算排行：正涨幅降序前 5、负涨幅升序前 5、正净额降序前 10、负净额升序前 10。缺失字段返回 `null`，不伪造代码或零值。所有金额单位为元；百分数 `2.31` 表示 `2.31%`。`netFlowRate=netAmount/(inflow+outflow)*100`，分母缺失或非正数时为 `null`；它不是主力净占比。
 
-金额单位为元，百分数字段的 `2.5` 表示 `2.5%`。无法确定的数值为 JSON `null`，不得用 `NaN`、`Infinity` 或伪造零值代替。
+## 大盘资金
 
-## 采集时段和源保护
+`marketFundFlow` 来自 AKShare `stock_fund_flow_individual(symbol="即时")` 的有效、去重股票行汇总：
 
-`python -m app serve` 启动内置调度。北京时间工作日 09:40、10:10、10:40、11:10、13:10、13:40、14:10、14:40、15:30 各启动一次独立 `python -m app collect` 子进程；服务启动时已错过的时段不补跑，节假日由交易日历检查后跳过实际模块采集。手动 `python -m app collect --force` 只绕过时段检查，不绕过 Redis 分布式时段占位、全局 20 分钟最小间隔或源冷却。被限流、断连或超时的源进入 Redis 共享两小时冷却期；同花顺两个榜单共用源冷却。源调用不立即重试，同花顺分页请求至少间隔 1 秒且单次接口超时 45 秒，其余接口默认超时 15 秒。
+```json
+{
+  "source": "THS_INDIVIDUAL_AGGREGATE",
+  "latest": {
+    "collectedAt": "2026-09-30T10:00:00+08:00",
+    "inflow": 130000000,
+    "outflow": 90000000,
+    "netAmount": 40000000,
+    "riseCount": 1,
+    "fallCount": 1,
+    "flatCount": 0,
+    "stockCount": 2
+  },
+  "series": [{
+    "collectedAt": "2026-09-30T10:00:00+08:00",
+    "inflow": 130000000,
+    "outflow": 90000000,
+    "netAmount": 40000000
+  }]
+}
+```
+
+`netAmount` 求源列“净额”之和。关键金额缺失或同一股票出现冲突行时拒绝本轮市场汇总，保留旧成功数据。曲线仅追加当日实际成功采样点，不补午间或失败点；新交易日重新开始。
+
+## 采集与风控
+
+`python -m app serve` 在北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每 120 秒启动一次采集子进程。上一轮未结束时跳过已错过的时段，不排队补采。手动 `python -m app collect --force` 也不能绕过交易窗口、交易日历、分布式锁、120 秒最小间隔和源冷却。同花顺分页请求至少间隔一秒，单次请求有超时；源断连、限流或长时间无响应后进入 Redis 共享冷却。采集锁在长分页期间由持有者续租，发布前再次核验锁归属。
 
 来源：[AKShare 股票数据文档](https://akshare.akfamily.xyz/data/stock/stock.html)。

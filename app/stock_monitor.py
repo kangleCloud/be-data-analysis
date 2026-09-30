@@ -20,9 +20,12 @@ QUOTE_PREFIX = "stock:monitor:v1:quote:"
 SERIES_PREFIX = "stock:monitor:v1:series:"
 LAST_TRADE_DATE_KEY = "stock:monitor:v1:lastTradeDate"
 SAMPLE_LOCK_KEY = "stock:monitor:v1:sample:lock"
+LAST_REQUEST_PREFIX = "stock:monitor:v1:sample:lastRequest:"
 XQ_COOLDOWN_KEY = "stock:monitor:v1:xq:cooldown"
 LOCK_SECONDS = 240
 COOLDOWN_SECONDS = 2 * 60 * 60
+PER_SYMBOL_INTERVAL_SECONDS = 120
+CLOSE_RETRY_MINUTES = frozenset({2, 4, 6, 8, 10})
 SYMBOL_RE = re.compile(r"^(SH|SZ|BJ)[0-9]{6}$")
 RELEASE_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -81,6 +84,14 @@ def normalize_quote(symbol: str, raw: dict[str, Any], collected_at: datetime) ->
         "price": price,
         "changePercent": change,
         "amount": amount,
+        "low": _number(raw.get("low")),
+        "high": _number(raw.get("high")),
+        "open": _number(raw.get("open")),
+        "limitUp": _number(raw.get("limit_up")),
+        "limitDown": _number(raw.get("limit_down")),
+        "averagePrice": _number(raw.get("avg_price")),
+        "volume": _number(raw.get("volume")),
+        "previousClose": _number(raw.get("previous_close")),
         "status": "FRESH",
     }
 
@@ -90,17 +101,26 @@ def normalize_profile(symbol: str, raw: dict[str, Any], quote: dict[str, Any] | 
     if not valid_symbol(symbol) or not isinstance(raw, dict):
         raise ValueError("雪球个股资料格式不正确")
     industry = raw.get("industry") or raw.get("industry_name") or raw.get("所属行业")
-    industry = str(industry).strip() if industry is not None else None
+    industry = str(industry).strip() if industry is not None and not (
+        isinstance(industry, float) and math.isnan(industry)
+    ) else None
     listing = raw.get("list_date") or raw.get("listing_date") or raw.get("上市日期")
     listing_date: str | None = None
     if isinstance(listing, str):
         try:
-            listing_date = date.fromisoformat(listing[:10]).isoformat()
+            text = listing.strip()[:10]
+            listing_date = date.fromisoformat(text).isoformat() if "-" in text else datetime.strptime(
+                text, "%Y%m%d"
+            ).date().isoformat()
         except ValueError:
             pass
     elif isinstance(listing, (int, float)):
-        parsed = _source_time(listing)
-        listing_date = parsed.date().isoformat() if parsed else None
+        text = str(int(listing)) if math.isfinite(listing) else ""
+        try:
+            listing_date = datetime.strptime(text, "%Y%m%d").date().isoformat()
+        except ValueError:
+            parsed = _source_time(listing)
+            listing_date = parsed.date().isoformat() if parsed else None
     capital = _number(raw.get("market_capital"))
     if capital is None and quote is not None:
         capital = _number(quote.get("market_capital"))
@@ -151,6 +171,11 @@ class MonitorStore:
         raw = self.client.get(f"{QUOTE_PREFIX}{symbol}")
         return json.loads(raw) if raw else None
 
+    def reserve_request(self, symbol: str) -> bool:
+        """Redis 原子 TTL 按实际请求时间限制同股源调用。"""
+        key = f"{LAST_REQUEST_PREFIX}{symbol}"
+        return bool(self.client.set(key, "1", nx=True, ex=PER_SYMBOL_INTERVAL_SECONDS))
+
     def prepare_trade_date(self, trade_date: str) -> None:
         old_date = self.client.get(LAST_TRADE_DATE_KEY)
         if old_date == trade_date:
@@ -194,9 +219,11 @@ class StockMonitorSampler:
         if not self.xq_enabled:
             return "disabled"
         local = at.astimezone(SHANGHAI)
+        close_retry = local.hour == 15 and local.minute in CLOSE_RETRY_MINUTES
         if local.weekday() >= 5 or not (
             day_time(9, 30) <= local.time() <= day_time(11, 30)
             or day_time(13) <= local.time() <= day_time(15)
+            or close_retry
         ):
             return "skipped"
         token = self.store.acquire()
@@ -206,22 +233,45 @@ class StockMonitorSampler:
             if self.calendar.latest_trading_date(local.date()) != local.date():
                 return "skipped"
             stocks = self.store.enabled()
+            if not stocks:
+                return "skipped"
             self.store.prepare_trade_date(local.date().isoformat())
             if self.store.cooldown_active():
+                if close_retry:
+                    for stock in stocks:
+                        if not self._close_confirmed(stock["symbol"], local.date()):
+                            self._mark_failed(stock["symbol"], local)
                 return "cooldown"
             failures = 0
             last_request: float | None = None
             for index, stock in enumerate(stocks):
                 symbol = stock["symbol"]
+                if close_retry and self._close_confirmed(symbol, local.date()):
+                    continue
                 if last_request is not None:
                     remaining = self.request_interval_seconds - (time.monotonic() - last_request)
                     if remaining > 0:
                         time.sleep(remaining)
+                if not self.store.reserve_request(symbol):
+                    if close_retry:
+                        self._mark_failed(symbol, local)
+                    continue
                 last_request = time.monotonic()
                 try:
                     quote = normalize_quote(symbol, self.source.quote(symbol), local)
                     if quote["tradeDate"] != local.date().isoformat():
                         raise ValueError("雪球报价源日期不是当前交易日")
+                    source_time = datetime.fromisoformat(quote["sourceTime"])
+                    if close_retry and source_time.time() <= day_time(15):
+                        previous = self.store.quote(symbol)
+                        if previous is None or (
+                            previous.get("sourceTime") or ""
+                        ) <= quote["sourceTime"]:
+                            quote["status"] = "STALE"
+                            self.store.write_quote(quote, append_point=False)
+                        else:
+                            self._mark_failed(symbol, local)
+                        continue
                     previous = self.store.quote(symbol)
                     previous_time = previous.get("sourceTime") if previous else None
                     if previous_time and previous_time > quote["sourceTime"]:
@@ -255,5 +305,16 @@ class StockMonitorSampler:
                 "sourceTime": None,
                 "collectedAt": at.isoformat(timespec="seconds"),
                 "tradeDate": None, "price": None,
-                "changePercent": None, "amount": None, "status": "ERROR",
+                "changePercent": None, "amount": None,
+                "low": None, "high": None, "open": None,
+                "limitUp": None, "limitDown": None, "averagePrice": None,
+                "volume": None, "status": "ERROR",
+                "previousClose": None,
             }, append_point=False)
+
+    def _close_confirmed(self, symbol: str, trade_date: date) -> bool:
+        previous = self.store.quote(symbol)
+        if not previous or previous.get("tradeDate") != trade_date.isoformat():
+            return False
+        source = _source_time(previous.get("sourceTime"))
+        return source is not None and source.time() > day_time(15)

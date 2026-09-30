@@ -8,18 +8,16 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 
 import app.main as main_module
-from app.scheduler import launch_slot, next_slot, slot_label
+from app.scheduler import launch_slot, next_slot
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def test_next_slot_skips_missed_times_and_weekend():
     at = datetime(2026, 9, 25, 10, 5, tzinfo=SHANGHAI)
-    assert next_slot(at).strftime("%Y-%m-%d %H:%M") == "2026-09-25 10:10"
-    assert next_slot(at.replace(minute=10)).strftime("%H:%M") == "10:40"
-    assert next_slot(at.replace(hour=16)).strftime("%Y-%m-%d %H:%M") == "2026-09-28 09:40"
-    assert slot_label(at) == "20260925:0940"
-    assert slot_label(at.replace(hour=9, minute=35)) == "20260925:manual"
+    assert next_slot(at).strftime("%Y-%m-%d %H:%M") == "2026-09-25 10:06"
+    assert next_slot(at.replace(minute=10)).strftime("%H:%M") == "10:12"
+    assert next_slot(at.replace(hour=15, minute=10)).strftime("%Y-%m-%d %H:%M") == "2026-09-28 09:30"
 
 
 def test_launch_slot_skips_late_start_and_uses_child_process(monkeypatch):

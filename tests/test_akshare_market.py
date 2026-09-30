@@ -26,7 +26,7 @@ def test_adapter_uses_expected_akshare_functions():
         tool_trade_date_hist_sina=capture("calendar"),
         stock_fund_flow_industry=capture("ths_industry"),
         stock_fund_flow_concept=capture("ths_concept"),
-        stock_market_fund_flow=capture("market"),
+        stock_fund_flow_individual=capture("ths_individual"),
     )
     assert provider.latest_trading_date(date(2026, 9, 23)) == date(2026, 9, 23)
     provider.sector_fund_flow("industry")
@@ -36,7 +36,7 @@ def test_adapter_uses_expected_akshare_functions():
         ("calendar", {}),
         ("ths_industry", {"symbol": "即时"}),
         ("ths_concept", {"symbol": "即时"}),
-        ("market", {}),
+        ("ths_individual", {"symbol": "即时"}),
     ]
 
 
@@ -44,11 +44,11 @@ def test_failed_interface_is_not_retried():
     provider = AkShareMarketProvider(15)
     calls = []
 
-    def fail():
+    def fail(**_kwargs):
         calls.append(1)
         raise requests.ConnectionError("断连")
 
-    provider._akshare = SimpleNamespace(stock_market_fund_flow=fail)
+    provider._akshare = SimpleNamespace(stock_fund_flow_individual=fail)
     with pytest.raises(requests.ConnectionError):
         provider.market_fund_flow()
     assert calls == [1]
@@ -57,13 +57,13 @@ def test_failed_interface_is_not_retried():
 def test_connection_failure_logs_root_type_without_request_details(caplog):
     provider = AkShareMarketProvider(15)
 
-    def fail():
+    def fail(**_kwargs):
         try:
             raise RemoteDisconnected("sensitive request details")
         except RemoteDisconnected as cause:
             raise requests.ConnectionError("sensitive request details") from cause
 
-    provider._akshare = SimpleNamespace(stock_market_fund_flow=fail)
+    provider._akshare = SimpleNamespace(stock_fund_flow_individual=fail)
     with pytest.raises(requests.ConnectionError):
         provider.market_fund_flow()
     assert "ConnectionError" in caplog.text
@@ -71,7 +71,7 @@ def test_connection_failure_logs_root_type_without_request_details(caplog):
     assert "sensitive request details" not in caplog.text
 
 
-def test_ths_has_45_second_deadline_and_other_sources_have_15(monkeypatch):
+def test_ths_long_pagination_deadlines(monkeypatch):
     deadlines = []
 
     @contextmanager
@@ -83,11 +83,11 @@ def test_ths_has_45_second_deadline_and_other_sources_have_15(monkeypatch):
     provider = AkShareMarketProvider(15)
     provider._akshare = SimpleNamespace(
         stock_fund_flow_industry=lambda **_kwargs: pd.DataFrame(),
-        stock_market_fund_flow=lambda: pd.DataFrame(),
+        stock_fund_flow_individual=lambda **_kwargs: pd.DataFrame(),
     )
     provider.sector_fund_flow("industry")
     provider.market_fund_flow()
-    assert deadlines == [45, 15]
+    assert deadlines == [120, 900]
 
 
 def test_ths_pagination_requests_are_spaced_in_collect_process(monkeypatch):
@@ -99,8 +99,8 @@ def test_ths_pagination_requests_are_spaced_in_collect_process(monkeypatch):
         sleeps.append(seconds)
         virtual_time[0] += seconds
 
-    def fake_get(url, **_kwargs):
-        requests_seen.append((url, virtual_time[0]))
+    def fake_get(url, **kwargs):
+        requests_seen.append((url, virtual_time[0], kwargs.get("timeout")))
         return object()
 
     monkeypatch.setattr("app.providers.akshare_market.time.monotonic", lambda: virtual_time[0])
@@ -112,9 +112,9 @@ def test_ths_pagination_requests_are_spaced_in_collect_process(monkeypatch):
         requests.get("http://data.10jqka.com.cn/funds/hyzjl/page/2")
         return pd.DataFrame()
 
-    provider = AkShareMarketProvider(15, pace_ths_requests=True)
+    provider = AkShareMarketProvider(15)
     provider._akshare = SimpleNamespace(stock_fund_flow_industry=fetch)
     provider.sector_fund_flow("industry")
-    assert [at for _url, at in requests_seen] == [0.0, 1.0]
+    assert [(at, timeout) for _url, at, timeout in requests_seen] == [(0.0, 15), (1.0, 15)]
     assert sleeps == [1.0]
     assert requests.get is fake_get

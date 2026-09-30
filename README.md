@@ -1,6 +1,6 @@
 # be-data-analysis
 
-AKShare 市场数据采集程序。每轮采集同花顺行业、概念 Top5 和东方财富大盘资金流，写入 Redis DB 2，供 `be-vita` 读取。前端不直接调用本程序。
+AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股即时资金流，汇总后写入 Redis DB 2，供 `be-vita` 读取。前端不直接调用本程序。
 
 ## 环境
 
@@ -15,7 +15,7 @@ python -m app collect --force
 python -m app serve
 ```
 
-`serve` 启动健康接口与内置调度：北京时间工作日 09:40、10:10、10:40、11:10、13:10、13:40、14:10、14:40、15:30 分别通过独立子进程采集一次；已错过的时段不补跑，非交易日由交易日历跳过。`collect --force` 可在时段外手动采集，但仍受 Redis 时段占位、全局 20 分钟最小间隔及源冷却限制。
+`serve` 启动健康接口与内置调度：北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。上一轮未完成时不排队补跑；非交易日由交易日历跳过。`collect --force` 可在采集窗口内手动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
 
 ## 服务器容器部署
 
@@ -38,7 +38,7 @@ tail -f /data/logs/be-data-analysis/service.log
 
 个股监控 V1 使用独立的交易所股票字典和雪球资料/报价。`STOCK_MONITOR_XQ_ENABLED` 默认 `false`；关闭时自动调度和手动 `python -m app monitor-sample` 均不访问雪球，资料接口也拒绝调用。明确开启且配置 `XUEQIU_TOKEN` 后，服务在交易日盘中每两分钟对 Redis enabled 清单中的最多 10 只股票采样。配置、接口样例、Redis 键及频控见 [个股监控 V1](docs/stock-monitor-v1.md)。
 
-交易时段可运行 `python -m app probe` 只读检查大盘资金流最新行的实际日期；命令不连接 Redis，也不写入快照。`sameCalendarDay=false` 时，后续页面须按 `latestTradeDate` 展示，不得称为当日实时资金流。
+同花顺三组即时接口没有可靠源交易日期或源时间；快照的 `tradeDate` 仅依据交易日历，`lastSuccessAt` 和市场曲线的 `collectedAt` 是采集时间。
 
 ## Redis 契约
 

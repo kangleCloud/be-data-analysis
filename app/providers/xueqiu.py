@@ -1,8 +1,12 @@
-"""雪球个股资料与报价的受控请求。"""
+"""AKShare 雪球 DataFrame 到个股监控领域字段的适配。"""
 
+import os
+import time
 from typing import Any
 
-import requests
+import akshare
+import pandas as pd
+from akshare.exceptions import APIError, NetworkError, RateLimitError
 
 
 class XueqiuSourceError(RuntimeError):
@@ -11,69 +15,69 @@ class XueqiuSourceError(RuntimeError):
         self.cooldown = cooldown
 
 
-class XueqiuProvider:
-    BASE_URL = "https://stock.xueqiu.com"
+def _items(frame: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(frame, pd.DataFrame) or not {"item", "value"}.issubset(frame.columns):
+        raise XueqiuSourceError("雪球数据结构不正确")
+    if frame.empty:
+        raise XueqiuSourceError("雪球数据为空")
+    return dict(zip(frame["item"], frame["value"]))
 
-    def __init__(self, token: str, timeout_seconds: int = 15, session: Any = None) -> None:
+
+def _call(function: Any, *, symbol: str, token: str, timeout: int) -> dict[str, Any]:
+    try:
+        return _items(function(symbol=symbol, token=token, timeout=timeout))
+    except XueqiuSourceError:
+        raise
+    except APIError as exc:
+        message = str(exc).lower()
+        raise XueqiuSourceError(
+            "雪球接口拒绝访问或数据异常",
+            cooldown=exc.status_code in (401, 403, 429)
+            or "token" in message or "login" in message,
+        ) from exc
+    except RateLimitError as exc:
+        raise XueqiuSourceError("雪球接口限流", cooldown=True) from exc
+    except NetworkError as exc:
+        raise XueqiuSourceError("雪球网络请求失败") from exc
+    except (ValueError, KeyError, TypeError) as exc:
+        raise XueqiuSourceError("雪球数据转换失败") from exc
+
+
+class XueqiuProvider:
+    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None) -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
-        self._session = session if session is not None else requests.Session()
+        # AKShare 1.18.97 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
+        os.environ["TZ"] = "Asia/Shanghai"
+        time.tzset()
+        self._token = token
         self._timeout = timeout_seconds
-        self._headers = {
-            "Cookie": f"xq_a_token={token};",
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
-                "Mobile/15E148 Safari/604.1"
-            ),
-        }
-        self._initialized = False
-
-    def _request(self, path: str, *, symbol: str | None = None) -> dict[str, Any]:
-        try:
-            if not self._initialized:
-                home = self._session.get(
-                    "https://xueqiu.com", headers=self._headers, timeout=self._timeout
-                )
-                if home.status_code in (403, 429):
-                    raise XueqiuSourceError("雪球登录页拒绝访问", cooldown=True)
-                home.raise_for_status()
-                self._initialized = True
-            response = self._session.get(
-                f"{self.BASE_URL}{path}",
-                params={"symbol": symbol} if symbol else None,
-                headers=self._headers,
-                timeout=self._timeout,
-            )
-            if response.status_code in (401, 403, 429):
-                raise XueqiuSourceError("雪球接口拒绝访问或触发限流", cooldown=True)
-            response.raise_for_status()
-            payload = response.json()
-        except XueqiuSourceError:
-            raise
-        except requests.RequestException as exc:
-            raise XueqiuSourceError("雪球请求失败") from exc
-        except ValueError as exc:
-            raise XueqiuSourceError("雪球响应不是有效 JSON") from exc
-        if not isinstance(payload, dict):
-            raise XueqiuSourceError("雪球响应结构不正确")
-        if payload.get("error_code") not in (None, 0):
-            raise XueqiuSourceError("雪球令牌失效或源接口异常", cooldown=True)
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise XueqiuSourceError("雪球响应缺少数据", cooldown=True)
-        return data
+        self._api = api if api is not None else akshare
 
     def quote(self, symbol: str) -> dict[str, Any]:
-        data = self._request("/v5/stock/quote.json", symbol=symbol)
-        quote = data.get("quote")
-        if not isinstance(quote, dict):
-            raise XueqiuSourceError("雪球报价结构不正确")
-        return quote
+        rows = _call(
+            self._api.stock_individual_spot_xq,
+            symbol=symbol, token=self._token, timeout=self._timeout,
+        )
+        return {
+            field: rows.get(item)
+            for field, item in {
+                "current": "现价", "percent": "涨幅", "amount": "成交额",
+                "time": "时间", "low": "最低", "high": "最高",
+                "open": "今开", "limit_up": "涨停", "limit_down": "跌停",
+                "avg_price": "均价", "volume": "成交量",
+                "previous_close": "昨收",
+                "market_capital": "资产净值/总市值",
+            }.items()
+        }
 
     def profile(self, symbol: str) -> dict[str, Any]:
-        data = self._request("/v5/stock/f10/cn/company.json", symbol=symbol)
-        company = data.get("company", data)
-        if not isinstance(company, dict):
-            raise XueqiuSourceError("雪球公司资料结构不正确")
-        return company
+        rows = _call(
+            self._api.stock_individual_basic_info_xq,
+            symbol=symbol, token=self._token, timeout=self._timeout,
+        )
+        affiliate = rows.get("affiliate_industry")
+        industry = rows.get("affiliate_industry.ind_name")
+        if industry is None and isinstance(affiliate, dict):
+            industry = affiliate.get("ind_name")
+        return {"industry": industry, "list_date": rows.get("listed_date")}

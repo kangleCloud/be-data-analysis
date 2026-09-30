@@ -10,7 +10,8 @@ from typing import Any, Iterator, Protocol
 import requests
 
 LOGGER = logging.getLogger(__name__)
-THS_TIMEOUT_SECONDS = 45
+THS_SECTOR_TIMEOUT_SECONDS = 120
+THS_INDIVIDUAL_TIMEOUT_SECONDS = 900
 THS_REQUEST_INTERVAL_SECONDS = 1
 
 
@@ -54,12 +55,11 @@ def _deadline(seconds: int) -> Iterator[None]:
 class AkShareMarketProvider:
     """只暴露 V1 需要的 AKShare 接口，便于测试替换。"""
 
-    def __init__(self, timeout_seconds: int, *, pace_ths_requests: bool = False) -> None:
+    def __init__(self, timeout_seconds: int) -> None:
         import akshare
 
         self._akshare = akshare
         self._timeout_seconds = timeout_seconds
-        self._pace_ths_requests = pace_ths_requests
         self._last_ths_request_at: float | None = None
 
     @contextmanager
@@ -76,6 +76,7 @@ class AkShareMarketProvider:
                     if remaining > 0:
                         time.sleep(remaining)
                 self._last_ths_request_at = time.monotonic()
+                kwargs.setdefault("timeout", self._timeout_seconds)
             return original_get(url, *args, **kwargs)
 
         requests.get = paced_get
@@ -120,9 +121,13 @@ class AkShareMarketProvider:
             else self._akshare.stock_fund_flow_concept
         )
         return self._call(
-            function, symbol="即时", timeout_seconds=THS_TIMEOUT_SECONDS,
-            pace_ths=self._pace_ths_requests,
+            function, symbol="即时", timeout_seconds=THS_SECTOR_TIMEOUT_SECONDS,
+            pace_ths=True,
         )
 
     def market_fund_flow(self) -> Any:
-        return self._call(self._akshare.stock_market_fund_flow)
+        return self._call(
+            self._akshare.stock_fund_flow_individual, symbol="即时",
+            timeout_seconds=THS_INDIVIDUAL_TIMEOUT_SECONDS,
+            pace_ths=True,
+        )

@@ -1,7 +1,8 @@
-"""将 AKShare DataFrame 转换为跨服务 JSON 数据。"""
+"""将 AKShare 同花顺 DataFrame 转换为市场快照 JSON。"""
 
 import math
-from datetime import date
+import re
+from collections import Counter
 from typing import Any
 
 
@@ -13,14 +14,13 @@ def _rows(frame: Any) -> list[dict[str, Any]]:
     if frame is None:
         raise SourceDataError("数据源返回空结果")
     rows = frame.to_dict("records") if hasattr(frame, "to_dict") else frame
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
         raise SourceDataError("数据源返回空结果")
     return rows
 
 
 def _require(rows: list[dict[str, Any]], *columns: str) -> None:
-    missing = set(columns) - set(rows[0])
-    if missing:
+    if not all(set(columns).issubset(row) for row in rows):
         raise SourceDataError("数据源字段变化")
 
 
@@ -28,96 +28,123 @@ def _number(raw: Any) -> float | None:
     if raw is None or isinstance(raw, bool):
         return None
     try:
-        value = float(raw)
+        value = float(str(raw).replace(",", "").strip().removesuffix("%"))
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
 
 
-def _text(raw: Any) -> str:
+def _text(raw: Any) -> str | None:
     value = str(raw).strip() if raw is not None else ""
-    return "" if value.lower() in {"nan", "nat", "<na>", "none"} else value
+    return None if value.lower() in {"", "nan", "nat", "<na>", "none", "-"} else value
 
 
-def normalize_top5(frame: Any, sector_type: str) -> dict[str, Any]:
-    """从同花顺即时板块资金流独立生成涨跌与净额榜。"""
+def _money(raw: Any) -> float | None:
+    """同花顺资金列字符串自带单位；纯数值按接口表格的亿元口径。"""
+    if isinstance(raw, str):
+        value = raw.strip().replace(",", "")
+        for suffix, factor in (("亿元", 1e8), ("亿", 1e8), ("万元", 1e4), ("万", 1e4), ("元", 1.0)):
+            if value.endswith(suffix):
+                number = _number(value.removesuffix(suffix))
+                return number * factor if number is not None else None
+        if value.endswith("%"):
+            return None
+    number = _number(raw)
+    return number * 1e8 if number is not None else None
+
+
+def _count(raw: Any) -> int | None:
+    number = _number(raw)
+    return int(number) if number is not None and number >= 0 and number.is_integer() else None
+
+
+def normalize_sectors(frame: Any, sector_type: str) -> dict[str, Any]:
+    """保留完整板块行；排行由读取方按有效数值过滤计算。"""
+    if sector_type not in {"industry", "concept"}:
+        raise ValueError("板块类型不正确")
     rows = _rows(frame)
-    _require(rows, "行业", "行业-涨跌幅", "净额")
-    name_counts: dict[str, int] = {}
-    for row in rows:
-        name = _text(row["行业"])
-        name_counts[name] = name_counts.get(name, 0) + 1
-
+    _require(rows, "行业", "行业指数", "行业-涨跌幅", "流入资金", "流出资金", "净额")
+    names = [_text(row["行业"]) for row in rows]
+    name_counts = Counter(names)
     items = []
-    for row in rows:
-        name = _text(row["行业"])
-        change = _number(row["行业-涨跌幅"])
-        net_amount = _number(row["净额"])
-        if not name or name_counts[name] != 1 or change is None or net_amount is None:
+    for row, name in zip(rows, names):
+        if name is None or name_counts[name] != 1:
             continue
+        inflow = _money(row["流入资金"])
+        outflow = _money(row["流出资金"])
+        net_amount = _money(row["净额"])
+        denominator = inflow + outflow if inflow is not None and outflow is not None else None
+        index_value = _number(row["行业指数"])
+        change = _number(row["行业-涨跌幅"])
+        if all(value is None for value in (index_value, change, inflow, outflow, net_amount)):
+            continue
+        code = _text(row.get("板块代码") or row.get("代码"))
         items.append({
-            "sectorName": name,
-            "sectorType": sector_type,
-            "changePercent": change,
-            "netFlowAmount": net_amount * 100_000_000,
+            "code": code if code and re.fullmatch(r"[A-Za-z0-9]+", code) else None,
+            "name": name,
+            "type": sector_type,
+            "indexValue": index_value,
+            "changePct": change,
+            "inflow": inflow,
+            "outflow": outflow,
+            "netAmount": net_amount,
+            "netFlowRate": (
+                net_amount / denominator * 100
+                if net_amount is not None and denominator is not None and denominator > 0
+                else None
+            ),
+            "companyCount": _count(row.get("公司家数")),
+            "leader": _text(row.get("领涨股")),
+            "leaderChangePct": _number(row.get("领涨股-涨跌幅")),
+            "leaderPrice": _number(row.get("当前价")),
         })
-
     if not items:
         raise SourceDataError("无有效同花顺板块资金流数据")
-
-    return {
-        "source": "THS",
-        "period": "INTRADAY",
-        "topRise": sorted(
-            (item for item in items if item["changePercent"] > 0),
-            key=lambda item: (-item["changePercent"], item["sectorName"]),
-        )[:5],
-        "topFall": sorted(
-            (item for item in items if item["changePercent"] < 0),
-            key=lambda item: (item["changePercent"], item["sectorName"]),
-        )[:5],
-        "topInflow": sorted(
-            (item for item in items if item["netFlowAmount"] > 0),
-            key=lambda item: (-item["netFlowAmount"], item["sectorName"]),
-        )[:5],
-        "topOutflow": sorted(
-            (item for item in items if item["netFlowAmount"] < 0),
-            key=lambda item: (item["netFlowAmount"], item["sectorName"]),
-        )[:5],
-    }
+    return {"source": "THS", "period": "INTRADAY", "items": items}
 
 
-def normalize_market_fund_flow(frame: Any) -> tuple[str, dict[str, Any]]:
-    """只保留最新 20 个实际交易日，且交易日期取自源数据。"""
+def normalize_individual_aggregate(frame: Any, collected_at: str) -> dict[str, Any]:
+    """去除非股票行与完全重复行，拒绝金额缺失或冲突的部分数据。"""
     rows = _rows(frame)
-    _require(rows, "日期", "主力净流入-净额")
-    by_date = {}
+    _require(rows, "股票代码", "股票简称", "涨跌幅", "流入资金", "流出资金", "净额")
+    stocks: dict[str, tuple[str, tuple[float, float, float, float]]] = {}
     for row in rows:
-        try:
-            trading_date = date.fromisoformat(_text(row["日期"])[:10])
-        except ValueError:
+        raw_code = row["股票代码"]
+        if isinstance(raw_code, (int, float)) and not isinstance(raw_code, bool):
+            code = (
+                str(int(raw_code)).zfill(6)
+                if math.isfinite(raw_code) and raw_code >= 0 and raw_code == int(raw_code)
+                else None
+            )
+        else:
+            code = _text(raw_code)
+            if code is not None and code.isdigit() and len(code) < 6:
+                code = code.zfill(6)
+        name = _text(row["股票简称"])
+        if code is None or not re.fullmatch(r"\d{6}", code) or name is None:
             continue
-        main = _number(row["主力净流入-净额"])
-        if main is None:
-            continue
-        by_date[trading_date.isoformat()] = {
-            "date": trading_date.isoformat(),
-            "mainNetInflow": main,
-            "mainNetInflowRatio": _number(row.get("主力净流入-净占比")),
-            "superLargeNetInflow": _number(row.get("超大单净流入-净额")),
-            "superLargeNetInflowRatio": _number(row.get("超大单净流入-净占比")),
-            "largeNetInflow": _number(row.get("大单净流入-净额")),
-            "largeNetInflowRatio": _number(row.get("大单净流入-净占比")),
-            "mediumNetInflow": _number(row.get("中单净流入-净额")),
-            "mediumNetInflowRatio": _number(row.get("中单净流入-净占比")),
-            "smallNetInflow": _number(row.get("小单净流入-净额")),
-            "smallNetInflowRatio": _number(row.get("小单净流入-净占比")),
-            "shanghaiClose": _number(row.get("上证-收盘价")),
-            "shanghaiChangePercent": _number(row.get("上证-涨跌幅")),
-            "shenzhenClose": _number(row.get("深证-收盘价")),
-            "shenzhenChangePercent": _number(row.get("深证-涨跌幅")),
-        }
-    if not by_date:
-        raise SourceDataError("无有效大盘资金流数据")
-    series = [by_date[key] for key in sorted(by_date)[-20:]]
-    return series[-1]["date"], {"latest": series[-1], "series": series}
+        change = _number(row["涨跌幅"])
+        inflow = _money(row["流入资金"])
+        outflow = _money(row["流出资金"])
+        net_amount = _money(row["净额"])
+        if any(value is None for value in (change, inflow, outflow, net_amount)):
+            raise SourceDataError("个股资金行缺少必要数值，拒绝部分汇总")
+        values = (change, inflow, outflow, net_amount)
+        if code in stocks and stocks[code] != (name, values):
+            raise SourceDataError("个股资金重复行互相冲突")
+        stocks[code] = (name, values)
+    if not stocks:
+        raise SourceDataError("无有效同花顺个股资金流数据")
+    values = [entry[1] for entry in stocks.values()]
+    latest = {
+        "collectedAt": collected_at,
+        "inflow": sum(row[1] for row in values),
+        "outflow": sum(row[2] for row in values),
+        "netAmount": sum(row[3] for row in values),
+        "riseCount": sum(row[0] > 0 for row in values),
+        "fallCount": sum(row[0] < 0 for row in values),
+        "flatCount": sum(row[0] == 0 for row in values),
+        "stockCount": len(values),
+    }
+    point = {field: latest[field] for field in ("collectedAt", "inflow", "outflow", "netAmount")}
+    return {"source": "THS_INDIVIDUAL_AGGREGATE", "latest": latest, "series": [point]}

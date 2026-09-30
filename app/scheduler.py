@@ -8,18 +8,13 @@ from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-SLOT_TIMES = (
-    time(9, 40), time(10, 10), time(10, 40), time(11, 10),
-    time(13, 10), time(13, 40), time(14, 10), time(14, 40), time(15, 30),
+SLOT_TIMES = tuple(
+    time(hour, minute)
+    for start, end in ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60 + 10))
+    for minute_of_day in range(start, end + 1, 2)
+    for hour, minute in (divmod(minute_of_day, 60),)
 )
 MAX_START_LAG_SECONDS = 60
-
-
-def slot_label(at: datetime) -> str:
-    """将手动与定点采集映射到当天最近的时段。"""
-    local = at.astimezone(SHANGHAI)
-    slot = max((value for value in SLOT_TIMES if value <= local.time()), default=None)
-    return f"{local:%Y%m%d}:{slot:%H%M}" if slot else f"{local:%Y%m%d}:manual"
 
 
 def next_slot(after: datetime) -> datetime:

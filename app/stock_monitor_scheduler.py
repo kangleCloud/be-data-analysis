@@ -14,7 +14,7 @@ SAMPLE_TIMES = tuple(
     for start, end in ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
     for minute_of_day in range(start, end + 1, 2)
     for hour, minute in (divmod(minute_of_day, 60),)
-)
+) + tuple(time(15, minute) for minute in (2, 4, 6, 8, 10))
 
 
 def next_sample_slot(after: datetime) -> datetime:

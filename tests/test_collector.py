@@ -1,4 +1,4 @@
-"""单次采集、交易时段与降级行为。"""
+"""两分钟采集、独立降级、交易日和同日曲线。"""
 
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -15,14 +15,15 @@ TRADING_AT = datetime(2026, 9, 23, 10, 0, tzinfo=SHANGHAI)
 
 class FakeProvider:
     def __init__(self, flow_rows, market_rows):
-        self.flows = flow_rows
-        self.market = market_rows
+        self.flows, self.market = flow_rows, market_rows
         self.fail = set()
         self.calls = []
         self.calendar_date = date(2026, 9, 23)
 
-    def latest_trading_date(self, today):
+    def latest_trading_date(self, _today):
         self.calls.append("calendar")
+        if "calendar" in self.fail:
+            raise TimeoutError()
         return self.calendar_date
 
     def sector_fund_flow(self, sector_type):
@@ -38,258 +39,168 @@ class FakeProvider:
         return self.market
 
 
-def test_full_snapshot_has_three_fresh_modules(flow_rows, market_rows):
+def setup(flow_rows, market_rows):
     provider = FakeProvider(flow_rows, market_rows)
-    store = RedisSnapshotStore(FakeRedis(), 240)
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "published"
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    return provider, client, store, MarketCollector(provider, store)
+
+
+def test_snapshot_has_new_three_modules_and_calendar_basis(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
     snapshot = store.load()
-    assert snapshot["schemaVersion"] == 1
-    assert set(snapshot["modules"]) == {
-        "industryTop5", "conceptTop5", "marketFundFlow"
-    }
-    assert all(item["status"] == "FRESH" for item in snapshot["modules"].values())
-    assert snapshot["modules"]["marketFundFlow"]["tradeDate"] == "2026-09-23"
-    assert snapshot["modules"]["industryTop5"]["data"]["source"] == "THS"
-    assert snapshot["modules"]["industryTop5"]["tradeDateBasis"] == "CALENDAR"
+    assert snapshot["schemaVersion"] == 1 and snapshot["provider"] == "akshare"
+    assert set(snapshot["modules"]) == {"industrySectors", "conceptSectors", "marketFundFlow"}
+    assert all(module["status"] == "FRESH" and module["tradeDateBasis"] == "CALENDAR"
+               for module in snapshot["modules"].values())
+    assert snapshot["modules"]["industrySectors"]["data"]["items"][0]["name"] == "半导体"
+    assert snapshot["modules"]["marketFundFlow"]["data"]["source"] == "THS_INDIVIDUAL_AGGREGATE"
+    assert provider.calls == ["calendar", "flow:industry", "flow:concept", "market"]
+    assert [event[1] for event in client.events if event[0] == "publish"] == [UPDATES_CHANNEL]
 
 
-def test_partial_failure_preserves_old_module_data(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
+def test_two_minute_interval_and_force_keep_safety_gates(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
     assert collector.collect(TRADING_AT) == "published"
-    before = store.load()["modules"]["industryTop5"]
-    provider.fail.add("flow:industry")
-    client.advance(40 * 60)
-    later = TRADING_AT.replace(minute=40)
-    assert collector.collect(later) == "partial"
-    after = store.load()["modules"]
-    assert after["industryTop5"]["status"] == "STALE"
-    assert after["industryTop5"]["data"] == before["data"]
-    assert after["industryTop5"]["lastSuccessAt"] == before["lastSuccessAt"]
-    assert after["marketFundFlow"]["status"] == "FRESH"
-    notices = [event for event in client.events if event[0] == "publish"]
-    assert len(notices) == 2
-    assert notices[-1][1] == UPDATES_CHANNEL
+    before = list(provider.calls)
+    assert collector.collect(TRADING_AT.replace(minute=1), force=True) == "throttled"
+    assert provider.calls == before
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2), force=True) == "published"
+    assert collector.collect(TRADING_AT.replace(hour=15, minute=12), force=True) == "skipped"
+    assert provider.calls.count("market") == 2
 
 
-def test_ths_cooldown_skips_second_ths_request(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    provider.fail.add("flow:industry")
-    store = RedisSnapshotStore(FakeRedis(), 240)
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "partial"
-    modules = store.load()["modules"]
-    assert modules["industryTop5"]["status"] == "ERROR"
-    assert modules["conceptTop5"]["status"] == "ERROR"
-    assert "flow:industry" in provider.calls
-    assert "flow:concept" not in provider.calls
+def test_final_1510_slot_allows_process_startup_seconds(flow_rows, market_rows):
+    _, _, _, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT.replace(hour=15, minute=10, second=8)) == "published"
+    assert collector.collect(TRADING_AT.replace(hour=15, minute=11)) == "skipped"
 
 
-def test_force_still_obeys_slot_and_global_interval(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
+def test_market_curve_only_adds_actual_success_points_same_day(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
     assert collector.collect(TRADING_AT) == "published"
-    before_calls = list(provider.calls)
-    assert collector.collect(TRADING_AT.replace(minute=5), force=True) == "throttled"
-    assert provider.calls == before_calls
-    client.advance(20 * 60)
-    assert collector.collect(TRADING_AT.replace(minute=10), force=True) == "published"
-
-
-def test_ths_cooldown_is_shared_across_rounds(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    provider.fail.add("flow:industry")
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
-    assert collector.collect(TRADING_AT) == "partial"
-    assert provider.calls.count("flow:industry") == 1
-    assert "flow:concept" not in provider.calls
-    client.advance(40 * 60)
-    provider.fail.clear()
-    assert collector.collect(TRADING_AT.replace(minute=40)) == "partial"
-    assert provider.calls.count("flow:industry") == 1
-    client.advance(2 * 60 * 60)
-    assert collector.collect(TRADING_AT.replace(hour=13, minute=10)) == "published"
-    assert provider.calls.count("flow:industry") == 2
-
-
-def test_first_failure_is_error_without_fake_zero(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
+    first = store.load()["modules"]["marketFundFlow"]["data"]["series"]
+    assert len(first) == 1
+    client.advance(120)
     provider.fail.add("market")
-    store = RedisSnapshotStore(FakeRedis(), 240)
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "partial"
-    result = store.load()["modules"]["marketFundFlow"]
-    assert result["status"] == "ERROR"
-    assert result["tradeDate"] is None
-    assert result["data"] is None
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    failed = store.load()["modules"]["marketFundFlow"]
+    assert failed["status"] == "STALE" and failed["data"]["series"] == first
+    provider.fail.clear()
+    client.advance(2 * 60 * 60)
+    assert collector.collect(TRADING_AT.replace(hour=13)) == "published"
+    series = store.load()["modules"]["marketFundFlow"]["data"]["series"]
+    assert [point["collectedAt"] for point in series] == [
+        "2026-09-23T10:00:00+08:00", "2026-09-23T13:00:00+08:00"
+    ]
 
 
-def test_outside_session_and_holiday_skip_without_fetch(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
-    assert collector.collect(TRADING_AT.replace(hour=12)) == "skipped"
-    assert provider.calls == []
-    provider.calendar_date = date(2026, 9, 22)
-    assert collector.collect(TRADING_AT) == "skipped"
-    assert store.load() is None
-    assert not any(event[0] == "publish" for event in client.events)
-
-
-def test_overlap_returns_locked(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    token = store.acquire()
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "locked"
-    assert provider.calls == []
-    assert not any(event[0] == "publish" for event in client.events)
-    store.release(token)
-
-
-def test_failed_snapshot_set_does_not_notify(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    client.fail_set = True
-    store = RedisSnapshotStore(client, 240)
-    with pytest.raises(RuntimeError, match="写入失败"):
-        MarketCollector(provider, store).collect(TRADING_AT)
-    assert client.get(SNAPSHOT_KEY) is None
-    assert not any(event[0] == "publish" for event in client.events)
-
-
-def test_failed_publish_does_not_change_collection_result(flow_rows, market_rows, caplog):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    client.fail_publish = True
-    store = RedisSnapshotStore(client, 240)
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "published"
-    assert set(store.load()["modules"]) == {
-        "industryTop5", "conceptTop5", "marketFundFlow"
-    }
-    assert "更新通知发送失败" in caplog.text
-
-
-def test_fatal_load_failure_does_not_notify(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-
-    def fail_load():
-        raise ConnectionError("load failed")
-
-    store.load = fail_load
-    with pytest.raises(ConnectionError, match="load failed"):
-        MarketCollector(provider, store).collect(TRADING_AT)
-    assert not any(event[0] == "publish" for event in client.events)
-
-
-def test_market_source_date_can_lag_collection_date(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    provider.market = market_rows.iloc[[0]]
-    store = RedisSnapshotStore(FakeRedis(), 240)
-    MarketCollector(provider, store).collect(TRADING_AT)
-    item = store.load()["modules"]["marketFundFlow"]
-    assert item["status"] == "FRESH"
-    assert item["tradeDate"] == "2026-09-22"
-    assert item["lastSuccessAt"].startswith("2026-09-23")
-
-
-def test_calendar_failure_marks_existing_modules_stale(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
+def test_module_failure_retains_only_that_module_valid_history(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
     assert collector.collect(TRADING_AT) == "published"
-
-    def fail_calendar(_today):
-        raise TimeoutError()
-
-    provider.latest_trading_date = fail_calendar
-    client.advance(40 * 60)
-    assert collector.collect(TRADING_AT.replace(minute=40)) == "partial"
-    assert all(item["status"] == "STALE" for item in store.load()["modules"].values())
-
-
-def _seed_old_v1_top5(store, *, both: bool = False):
-    """模拟旧 V1 五模块快照：东财 Top5 口径与新同花顺口径不兼容。"""
-    snapshot = store.load()
-    snapshot["modules"]["industryTop5"]["data"] = {
-        "topRise": [{"sectorName": "半导体", "sectorType": "industry",
-                     "changePercent": 2.5, "mainNetInflow": 120000000}],
-        "topFall": [], "topInflow": [], "topOutflow": [],
-        "unmatchedFundRows": [],
-    }
-    if both:
-        snapshot["modules"]["conceptTop5"]["data"] = {
-            "topRise": [{"sectorName": "机器人", "sectorType": "concept",
-                         "changePercent": 1.2, "mainNetInflow": 98000000}],
-            "topFall": [], "topInflow": [], "topOutflow": [],
-            "unmatchedFundRows": [],
-        }
-    snapshot["modules"]["industryHeatmap"] = {"status": "FRESH", "data": []}
-    snapshot["modules"]["conceptHeatmap"] = {"status": "FRESH", "data": []}
-    store.save(snapshot)
-
-
-def test_calendar_failure_drops_incompatible_old_v1_top5(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
-    assert collector.collect(TRADING_AT) == "published"
-    _seed_old_v1_top5(store, both=True)
-
-    def fail_calendar(_today):
-        raise TimeoutError()
-
-    provider.latest_trading_date = fail_calendar
-    client.advance(40 * 60)
-    assert collector.collect(TRADING_AT.replace(minute=40)) == "partial"
-    modules = store.load()["modules"]
-    assert set(modules) == {"industryTop5", "conceptTop5", "marketFundFlow"}
-    assert modules["industryTop5"]["status"] == "ERROR"
-    assert modules["industryTop5"]["data"] is None
-    assert modules["industryTop5"]["lastSuccessAt"] is None
-    assert modules["conceptTop5"]["status"] == "ERROR"
-    assert modules["conceptTop5"]["data"] is None
-    assert modules["marketFundFlow"]["status"] == "STALE"
-
-
-def test_module_failure_drops_incompatible_old_v1_top5(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    client = FakeRedis()
-    store = RedisSnapshotStore(client, 240)
-    collector = MarketCollector(provider, store)
-    assert collector.collect(TRADING_AT) == "published"
-    _seed_old_v1_top5(store)
+    old = store.load()["modules"]["industrySectors"]
     provider.fail.add("flow:industry")
-    client.advance(40 * 60)
-
-    assert collector.collect(TRADING_AT.replace(minute=40)) == "partial"
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     modules = store.load()["modules"]
-    assert set(modules) == {"industryTop5", "conceptTop5", "marketFundFlow"}
-    assert modules["industryTop5"]["status"] == "ERROR"
-    assert modules["industryTop5"]["data"] is None
-    assert modules["conceptTop5"]["status"] == "STALE"
-    assert modules["conceptTop5"]["data"]["source"] == "THS"
+    assert modules["industrySectors"]["status"] == "STALE"
+    assert modules["industrySectors"]["data"] == old["data"]
+    assert modules["conceptSectors"]["status"] == "STALE"
+    assert modules["marketFundFlow"]["status"] == "STALE"
+    assert provider.calls.count("flow:concept") == 1
+
+
+def test_invalid_one_module_does_not_block_other_two(flow_rows, market_rows):
+    provider, _, store, collector = setup(flow_rows, market_rows)
+    bad = flow_rows.drop(columns="行业指数")
+    original = provider.sector_fund_flow
+
+    def sector(kind):
+        return bad if kind == "industry" else original(kind)
+
+    provider.sector_fund_flow = sector
+    assert collector.collect(TRADING_AT) == "partial"
+    modules = store.load()["modules"]
+    assert modules["industrySectors"]["status"] == "ERROR"
+    assert modules["conceptSectors"]["status"] == "FRESH"
     assert modules["marketFundFlow"]["status"] == "FRESH"
 
 
-def test_first_calendar_failure_publishes_error_modules(flow_rows, market_rows):
-    provider = FakeProvider(flow_rows, market_rows)
-    store = RedisSnapshotStore(FakeRedis(), 240)
+def test_partial_individual_data_is_not_published_as_market_success(flow_rows, market_rows):
+    provider, _, store, collector = setup(flow_rows, market_rows)
+    provider.market = market_rows.assign(净额=None)
+    assert collector.collect(TRADING_AT) == "partial"
+    module = store.load()["modules"]["marketFundFlow"]
+    assert module["status"] == "ERROR" and module["data"] is None
 
-    def fail_calendar(_today):
-        raise TimeoutError()
 
-    provider.latest_trading_date = fail_calendar
-    assert MarketCollector(provider, store).collect(TRADING_AT) == "partial"
+def test_calendar_failure_marks_previous_modules_stale(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    provider.fail.add("calendar")
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    assert all(item["status"] == "STALE" for item in store.load()["modules"].values())
+
+
+def test_holiday_closed_market_and_overlap_do_not_fetch(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT.replace(hour=12)) == "skipped"
+    assert provider.calls == []
+    provider.calendar_date = date(2026, 9, 22)
+    assert collector.collect(TRADING_AT, force=True) == "skipped"
+    assert store.load() is None
+    client.advance(120)
+    provider.calendar_date = date(2026, 9, 23)
+    token = store.acquire()
+    assert collector.collect(TRADING_AT) == "locked"
+    store.release(token)
+    assert provider.calls == ["calendar"]
+
+
+def test_old_top5_and_eastmoney_data_are_not_reused(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    previous = store.load()
+    previous["modules"]["industrySectors"]["data"] = {"topRise": []}
+    previous["modules"]["marketFundFlow"]["data"]["source"] = "EASTMONEY"
+    store.save(previous)
+    provider.fail.add("flow:industry")
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     modules = store.load()["modules"]
-    assert len(modules) == 3
-    assert all(item["status"] == "ERROR" and item["data"] is None for item in modules.values())
+    assert modules["industrySectors"]["status"] == "ERROR"
+    assert modules["marketFundFlow"]["status"] == "ERROR"
+
+
+def test_old_float_company_count_is_not_republished_on_failure(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    old = store.load()
+    old["modules"]["industrySectors"]["data"]["items"][0]["companyCount"] = 55.0
+    store.save(old)
+    provider.fail.add("flow:industry")
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    module = store.load()["modules"]["industrySectors"]
+    assert module["status"] == "ERROR"
+    assert module["data"] is None
+
+
+def test_lost_lock_rejects_publication(flow_rows, market_rows):
+    _, client, store, collector = setup(flow_rows, market_rows)
+    store.renew = lambda _token: False
+    with pytest.raises(RuntimeError, match="锁已失效"):
+        collector.collect(TRADING_AT)
+    assert client.get(SNAPSHOT_KEY) is None
+
+
+def test_snapshot_set_failure_does_not_notify(flow_rows, market_rows):
+    _, client, store, collector = setup(flow_rows, market_rows)
+    client.fail_set = True
+    with pytest.raises(RuntimeError, match="写入失败"):
+        collector.collect(TRADING_AT)
+    assert client.get(SNAPSHOT_KEY) is None
+    assert not any(event[0] == "publish" for event in client.events)
