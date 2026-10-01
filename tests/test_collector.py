@@ -20,12 +20,6 @@ class FakeProvider:
         self.calls = []
         self.calendar_date = date(2026, 9, 23)
 
-    def latest_trading_date(self, _today):
-        self.calls.append("calendar")
-        if "calendar" in self.fail:
-            raise TimeoutError()
-        return self.calendar_date
-
     def sector_fund_flow(self, sector_type):
         self.calls.append(f"flow:{sector_type}")
         if f"flow:{sector_type}" in self.fail:
@@ -39,11 +33,22 @@ class FakeProvider:
         return self.market
 
 
+class FakeCalendar:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def day_status(self, day, _at):
+        self.provider.calls.append("calendar")
+        if "calendar" in self.provider.fail:
+            return None
+        return self.provider.calendar_date == day
+
+
 def setup(flow_rows, market_rows):
     provider = FakeProvider(flow_rows, market_rows)
     client = FakeRedis()
     store = RedisSnapshotStore(client, 240)
-    return provider, client, store, MarketCollector(provider, store)
+    return provider, client, store, MarketCollector(provider, store, FakeCalendar(provider))
 
 
 def test_snapshot_has_new_three_modules_and_calendar_basis(flow_rows, market_rows):
@@ -143,6 +148,8 @@ def test_calendar_failure_marks_previous_modules_stale(flow_rows, market_rows):
     client.advance(120)
     assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     assert all(item["status"] == "STALE" for item in store.load()["modules"].values())
+    assert provider.calls.count("flow:industry") == 1
+    assert provider.calls.count("market") == 1
 
 
 def test_holiday_closed_market_and_overlap_do_not_fetch(flow_rows, market_rows):

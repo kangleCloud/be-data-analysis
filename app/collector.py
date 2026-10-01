@@ -12,6 +12,7 @@ import requests
 from app.normalize import normalize_individual_aggregate, normalize_sectors
 from app.providers.akshare_market import MarketSource
 from app.snapshot import SnapshotStore
+from app.trading_calendar import CalendarService
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -119,9 +120,11 @@ def _fallback(key: str, prior: Any, timestamp: str, message: str) -> dict[str, A
 
 
 class MarketCollector:
-    def __init__(self, provider: MarketSource, store: SnapshotStore) -> None:
+    def __init__(self, provider: MarketSource, store: SnapshotStore,
+                 calendar: CalendarService) -> None:
         self._provider = provider
         self._store = store
+        self._calendar = calendar
 
     def collect(self, at: datetime, *, force: bool = False) -> str:
         """手动 force 只允许主动触发，不绕过交易日、时段、锁、间隔或冷却。"""
@@ -146,22 +149,20 @@ class MarketCollector:
             previous = self._store.load() or {}
             old_modules = previous.get("modules", {})
             try:
-                if self._store.cooldown_active("sina"):
-                    raise SourceCooldownError("交易日历源冷却中")
-                trading_date = self._provider.latest_trading_date(local.date())
+                trading_status = self._calendar.day_status(local.date(), local)
             except Exception as exc:
-                if _needs_cooldown(exc, "sina"):
-                    self._store.start_cooldown("sina")
                 LOGGER.warning("交易日历失败，异常 %s", type(exc).__name__)
+                trading_status = None
+            if trading_status is None:
                 modules = {
-                    key: _fallback(key, old_modules.get(key), timestamp, "交易日历获取失败，展示上次成功数据")
+                    key: _fallback(key, old_modules.get(key), timestamp, "交易日历未知，展示上次成功数据")
                     for key in MODULE_KEYS
                 }
                 self._publish(token, collected_time(), modules)
                 return "partial"
-            if trading_date != local.date():
+            if not trading_status:
                 return "skipped"
-            day = trading_date.isoformat()
+            day = local.date().isoformat()
             modules: dict[str, Any] = {}
             failures = 0
 

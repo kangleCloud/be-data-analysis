@@ -2,13 +2,18 @@
 
 import json
 from datetime import date, datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from app.providers.xueqiu import XueqiuSourceError
+import pandas as pd
+
+from app.providers.xueqiu import XueqiuProvider, XueqiuSourceError
 from app.stock_monitor import (
     ENABLED_KEY, LAST_TRADE_DATE_KEY, QUOTE_PREFIX, SERIES_PREFIX,
-    MonitorStore, StockMonitorSampler, normalize_profile, normalize_quote,
+    MonitorStore, QuoteValidationError, StockMonitorSampler, normalize_profile,
+    normalize_quote,
 )
+from app.trading_calendar import CACHE_KEY, CalendarService, normalize_dates
 from tests.test_snapshot import FakeRedis
 
 
@@ -48,8 +53,8 @@ class RedisClient(FakeRedis):
 
 
 class Calendar:
-    def latest_trading_date(self, today):
-        return today
+    def day_status(self, _today, _at):
+        return True
 
 
 class QuoteSource:
@@ -130,7 +135,7 @@ def test_sampler_writes_quote_and_real_points_without_duplicate_or_gap_fill(monk
     assert client.get(LAST_TRADE_DATE_KEY) == "2026-09-28"
     source.time = int(AT.timestamp() * 1000)
     client.advance(120)
-    assert sampler.sample(AT.replace(hour=13, minute=4)) == "partial"
+    assert sampler.sample(AT.replace(hour=13, minute=4)) == "published"
     assert len(json.loads(client.get(key))) == 2
     assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "STALE"
 
@@ -158,7 +163,7 @@ def test_cooldown_stops_remaining_symbols_and_keeps_stale_data(monkeypatch):
     source.fail = False
     assert sampler.sample(AT.replace(minute=38)) == "published"
     assert len(json.loads(client.get(f"{SERIES_PREFIX}2026-09-28:SH600000"))) == 1
-    assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "FRESH"
+    assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "STALE"
 
 
 def test_lock_holiday_and_enabled_limit_block_source_calls():
@@ -172,8 +177,8 @@ def test_lock_holiday_and_enabled_limit_block_source_calls():
     store.release(first)
 
     class Holiday:
-        def latest_trading_date(self, _today):
-            return date(2026, 9, 25)
+        def day_status(self, _today, _at):
+            return False
 
     assert StockMonitorSampler(store, source, Holiday(), xq_enabled=True).sample(AT) == "skipped"
     assert source.calls == []
@@ -276,7 +281,7 @@ def test_close_rejects_previous_trade_date_and_preserves_quote():
     assert sampler.sample(AT) == "published"
     source.time = int(AT.replace(day=25, hour=15, minute=3).timestamp() * 1000)
     client.advance(120)
-    assert sampler.sample(AT.replace(hour=15, minute=2)) == "partial"
+    assert sampler.sample(AT.replace(hour=15, minute=2)) == "published"
     quote = json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))
     assert quote["sourceTime"] == "2026-09-28T09:32:00+08:00"
     assert quote["status"] == "STALE"
@@ -291,10 +296,135 @@ def test_close_holiday_and_empty_list_do_not_request_source():
     client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
 
     class Holiday:
-        def latest_trading_date(self, _today):
-            return date(2026, 9, 25)
+        def day_status(self, _today, _at):
+            return False
 
     assert StockMonitorSampler(MonitorStore(client), source, Holiday(), xq_enabled=True).sample(
         AT.replace(hour=15, minute=2)
     ) == "skipped"
     assert source.calls == []
+
+
+def test_unknown_calendar_does_not_request_xueqiu():
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
+    source = QuoteSource()
+
+    class UnknownCalendar:
+        def day_status(self, _today, _at):
+            return None
+
+    sampler = StockMonitorSampler(
+        MonitorStore(client), source, UnknownCalendar(), xq_enabled=True,
+    )
+    assert sampler.sample(AT) == "skipped"
+    assert source.calls == []
+
+
+def test_october_first_cached_holiday_blocks_all_four_xueqiu_requests():
+    at = datetime(2026, 10, 1, 14, 30, tzinfo=SHANGHAI)
+    symbols = ("SH601991", "SH600410", "SH601179", "SH600036")
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps([
+        {"symbol": symbol, "code": symbol[2:], "name": symbol, "market": "SH"}
+        for symbol in symbols
+    ]))
+    client.set(CACHE_KEY, json.dumps(normalize_dates([
+        "2026-01-05", "2026-09-30", "2026-10-08", "2026-12-31",
+    ], at.replace(hour=0, minute=10))))
+
+    class NoRefresh:
+        def dates(self):
+            raise AssertionError("有效缓存不应刷新")
+
+    class NoQuote:
+        def quote(self, _symbol):
+            raise AssertionError("休市日不得请求雪球")
+
+    calendar = CalendarService(client, NoRefresh())
+    assert calendar.day_status(at.date(), at) is False
+    sampler = StockMonitorSampler(MonitorStore(client), NoQuote(), calendar, xq_enabled=True)
+    assert sampler.sample(at) == "skipped"
+    assert client.get(LAST_TRADE_DATE_KEY) is None
+
+
+def test_four_symbols_with_akshare_dataframe_previous_day_are_stale_without_points(monkeypatch, caplog):
+    at = datetime(2026, 10, 1, 14, 30, tzinfo=SHANGHAI)
+    symbols = ("SH601991", "SH600410", "SH601179", "SH600036")
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps([
+        {"symbol": symbol, "code": symbol[2:], "name": symbol, "market": "SH"}
+        for symbol in symbols
+    ]))
+    calls = []
+
+    def spot(**kwargs):
+        calls.append(kwargs["symbol"])
+        return pd.DataFrame([
+            ("时间", "2026-09-30 15:00:00"),
+            ("现价", 10.2), ("涨幅", 1.2), ("成交额", 500000),
+        ], columns=["item", "value"])
+
+    source = XueqiuProvider("fake-token", api=SimpleNamespace(stock_individual_spot_xq=spot))
+    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
+    with caplog.at_level("INFO"):
+        assert sampler.sample(at) == "published"
+    assert calls == list(symbols)
+    assert caplog.text.count("原因 source_previous_date") == 4
+    assert "fake-token" not in caplog.text
+    for symbol in symbols:
+        quote = json.loads(client.get(f"{QUOTE_PREFIX}{symbol}"))
+        assert quote["status"] == "STALE"
+        assert quote["sourceTime"] == "2026-09-30T15:00:00+08:00"
+        assert client.get(f"{SERIES_PREFIX}2026-10-01:{symbol}") is None
+
+
+def test_new_trading_day_delayed_quote_keeps_history_until_current_day_point():
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
+    source = QuoteSource()
+    sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
+    assert sampler.sample(AT) == "published"
+    old_key = f"{SERIES_PREFIX}2026-09-28:SH600000"
+    old_series = client.get(old_key)
+    next_day = AT.replace(day=29)
+    client.advance(120)
+    assert sampler.sample(next_day) == "published"
+    quote = json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))
+    assert quote["status"] == "STALE"
+    assert quote["sourceTime"] == "2026-09-28T09:32:00+08:00"
+    assert client.get(old_key) == old_series
+    assert client.get(f"{SERIES_PREFIX}2026-09-29:SH600000") is None
+    source.time = int(next_day.replace(minute=34).timestamp() * 1000)
+    client.advance(120)
+    assert sampler.sample(next_day.replace(minute=34)) == "published"
+    assert client.get(old_key) is None
+    assert len(json.loads(client.get(f"{SERIES_PREFIX}2026-09-29:SH600000"))) == 1
+    assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "FRESH"
+
+
+def test_invalid_quote_logs_safe_reason_and_preserves_previous_point(caplog):
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
+    source = QuoteSource()
+    sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
+    assert sampler.sample(AT) == "published"
+    key = f"{SERIES_PREFIX}2026-09-28:SH600000"
+    points = client.get(key)
+    client.advance(120)
+    source.quote = lambda _symbol: {
+        "time": "invalid", "current": "bad", "cookie": "private-cookie"
+    }
+    with caplog.at_level("WARNING"):
+        assert sampler.sample(AT.replace(minute=34)) == "partial"
+    assert "原因 invalid_source_time，字段 time" in caplog.text
+    assert "private-cookie" not in caplog.text
+    assert client.get(key) == points
+    assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "STALE"
+    try:
+        normalize_quote("SH600000", {"time": "invalid", "current": 1}, AT)
+    except QuoteValidationError as exc:
+        assert (exc.reason, exc.field) == ("invalid_source_time", "time")
+    else:
+        raise AssertionError("无效时间应被拒绝")

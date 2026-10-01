@@ -35,6 +35,15 @@ return 0
 """
 
 
+class QuoteValidationError(ValueError):
+    """可安全记录原因码和字段名的报价校验异常。"""
+
+    def __init__(self, reason: str, field: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.field = field
+
+
 def valid_symbol(symbol: Any) -> bool:
     return isinstance(symbol, str) and SYMBOL_RE.fullmatch(symbol) is not None
 
@@ -65,15 +74,15 @@ def _source_time(raw: Any) -> datetime | None:
 
 def normalize_quote(symbol: str, raw: dict[str, Any], collected_at: datetime) -> dict[str, Any]:
     if not valid_symbol(symbol) or not isinstance(raw, dict):
-        raise ValueError("雪球报价格式不正确")
+        raise QuoteValidationError("invalid_quote_shape", "symbol_or_quote")
     source_time = _source_time(raw.get("time") or raw.get("timestamp"))
     if source_time is None:
-        raise ValueError("雪球报价缺少有效源时间")
+        raise QuoteValidationError("invalid_source_time", "time")
     price = _number(raw.get("current"))
     change = _number(raw.get("percent"))
     amount = _number(raw.get("amount"))
     if price is None and change is None and amount is None:
-        raise ValueError("雪球报价缺少有效数值")
+        raise QuoteValidationError("missing_numeric_values", "current_percent_amount")
     return {
         "schemaVersion": 1,
         "symbol": symbol,
@@ -205,7 +214,7 @@ class QuoteSource(Protocol):
 
 
 class TradingCalendar(Protocol):
-    def latest_trading_date(self, today: date) -> date | None: ...
+    def day_status(self, today: date, at: datetime) -> bool | None: ...
 
 
 class StockMonitorSampler:
@@ -230,12 +239,11 @@ class StockMonitorSampler:
         if token is None:
             return "locked"
         try:
-            if self.calendar.latest_trading_date(local.date()) != local.date():
+            if self.calendar.day_status(local.date(), local) is not True:
                 return "skipped"
             stocks = self.store.enabled()
             if not stocks:
                 return "skipped"
-            self.store.prepare_trade_date(local.date().isoformat())
             if self.store.cooldown_active():
                 if close_retry:
                     for stock in stocks:
@@ -259,31 +267,43 @@ class StockMonitorSampler:
                 last_request = time.monotonic()
                 try:
                     quote = normalize_quote(symbol, self.source.quote(symbol), local)
-                    if quote["tradeDate"] != local.date().isoformat():
-                        raise ValueError("雪球报价源日期不是当前交易日")
                     source_time = datetime.fromisoformat(quote["sourceTime"])
-                    if close_retry and source_time.time() <= day_time(15):
-                        previous = self.store.quote(symbol)
-                        if previous is None or (
-                            previous.get("sourceTime") or ""
-                        ) <= quote["sourceTime"]:
-                            quote["status"] = "STALE"
-                            self.store.write_quote(quote, append_point=False)
-                        else:
-                            self._mark_failed(symbol, local)
-                        continue
                     previous = self.store.quote(symbol)
-                    previous_time = previous.get("sourceTime") if previous else None
-                    if previous_time and previous_time > quote["sourceTime"]:
-                        raise ValueError("雪球报价源时间早于已保存报价")
-                    if previous_time == quote["sourceTime"]:
-                        if previous.get("status") != "FRESH":
-                            self.store.write_quote(quote, append_point=False)
+                    previous_time = _source_time(previous.get("sourceTime")) if previous else None
+                    if source_time.date() > local.date():
+                        raise QuoteValidationError("source_date_in_future", "time")
+                    if source_time.date() < local.date():
+                        self._preserve_stale(
+                            symbol, quote, previous, local, "source_previous_date"
+                        )
                         continue
+                    if previous_time and previous_time > source_time:
+                        self._preserve_stale(
+                            symbol, quote, previous, local, "source_older_than_cache"
+                        )
+                        continue
+                    if close_retry and source_time.time() <= day_time(15):
+                        self._preserve_stale(
+                            symbol, quote, previous, local, "close_not_confirmed"
+                        )
+                        continue
+                    if previous_time == source_time:
+                        self._preserve_stale(
+                            symbol, quote, previous, local, "source_unchanged"
+                        )
+                        continue
+                    self.store.prepare_trade_date(local.date().isoformat())
                     self.store.write_quote(quote, append_point=True)
                 except Exception as exc:
                     failures += 1
-                    LOGGER.warning("雪球报价 %s 失败，异常 %s", symbol, type(exc).__name__)
+                    reason = exc.reason if isinstance(exc, QuoteValidationError) else (
+                        "source_error" if isinstance(exc, XueqiuSourceError) else "unexpected_error"
+                    )
+                    field = exc.field if isinstance(exc, QuoteValidationError) else "none"
+                    LOGGER.warning(
+                        "雪球报价 %s 失败，原因 %s，字段 %s，异常 %s，采集日期 %s",
+                        symbol, reason, field, type(exc).__name__, local.date().isoformat(),
+                    )
                     self._mark_failed(symbol, local)
                     if isinstance(exc, XueqiuSourceError) and exc.cooldown:
                         self.store.start_cooldown()
@@ -293,6 +313,28 @@ class StockMonitorSampler:
             return "partial" if failures else "published"
         finally:
             self.store.release(token)
+
+    def _preserve_stale(
+        self, symbol: str, incoming: dict[str, Any], previous: dict[str, Any] | None,
+        at: datetime, reason: str,
+    ) -> None:
+        """延迟报价只更新最近有效报价状态，不写入当日曲线。"""
+        incoming_time = datetime.fromisoformat(incoming["sourceTime"])
+        previous_time = _source_time(previous.get("sourceTime")) if previous else None
+        use_previous = (
+            previous is not None and previous_time is not None
+            and _number(previous.get("price")) is not None
+            and previous_time >= incoming_time
+        )
+        selected = previous if use_previous else incoming
+        assert selected is not None
+        self.store.write_quote({**selected, "status": "STALE"}, append_point=False)
+        LOGGER.info(
+            "雪球报价 %s 已标记 STALE，原因 %s，源时间 %s，缓存源时间 %s，采集日期 %s",
+            symbol, reason, incoming_time.isoformat(timespec="seconds"),
+            previous_time.isoformat(timespec="seconds") if previous_time else "none",
+            at.date().isoformat(),
+        )
 
     def _mark_failed(self, symbol: str, at: datetime) -> None:
         previous = self.store.quote(symbol)

@@ -77,4 +77,6 @@
 
 `python -m app serve` 在北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每 120 秒启动一次采集子进程。上一轮未结束时跳过已错过的时段，不排队补采。手动 `python -m app collect --force` 也不能绕过交易窗口、交易日历、分布式锁、120 秒最小间隔和源冷却。同花顺分页请求至少间隔一秒，单次请求有超时；源断连、限流或长时间无响应后进入 Redis 共享冷却。采集锁在长分页期间由持有者续租，发布前再次核验锁归属。
 
+交易日历由 `stock:calendar:v1:trading-days` 缓存提供。当天超出缓存日期范围时状态为 `UNKNOWN`，本轮不请求同花顺，旧成功模块降级为 `STALE`；没有旧数据则为 `ERROR`。详情见[交易日历与内部任务 V1](trading-calendar-jobs-v1.md)。
+
 来源：[AKShare 股票数据文档](https://akshare.akfamily.xyz/data/stock/stock.html)。

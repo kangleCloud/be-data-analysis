@@ -50,6 +50,7 @@ def test_serve_lifespan_starts_and_stops_scheduler(monkeypatch):
             events.append("stop")
 
     monkeypatch.setattr(main_module, "run_scheduler", fake_scheduler)
+    monkeypatch.setattr(main_module, "run_calendar_scheduler", lambda _settings: fake_scheduler())
     with TestClient(main_module.create_app()) as client:
         assert client.get("/health").status_code == 200
-    assert events == ["start", "stop"]
+    assert events == ["start", "start", "stop", "stop"]

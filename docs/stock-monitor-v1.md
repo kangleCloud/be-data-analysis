@@ -40,10 +40,12 @@ Content-Type: application/json
 
 Python 只读 `stock:monitor:v1:enabled`（按排序的最多 10 只 `{symbol,code,name,market}`）；Java 在监控清单改变后写入。Python 仅在雪球开关开启且交易日盘中每两分钟、收盘后 15:02/04/06/08/10 运行 `monitor-sample` 子进程，并写：
 
+交易日判断读取与市场采集共用的 `stock:calendar:v1:trading-days`。若当天不在缓存覆盖范围，状态为 `UNKNOWN`，本轮跳过且不访问雪球；缓存命中非交易日也跳过。
+
 - `stock:monitor:v1:quote:{symbol}`：`{schemaVersion:1,symbol,source:"XQ",sourceTime,collectedAt,tradeDate,price,changePercent,amount,low,high,open,limitUp,limitDown,averagePrice,volume,previousClose,status}`；新增数值字段均可为 `null`，价格单位元、成交量单位股；失败时保留有效历史报价为 `STALE`，没有历史报价为 `ERROR`。
 - `stock:monitor:v1:series:{tradeDate}:{symbol}`：真实雪球源时间点 `[{time,price}]`；同一源时间去重，不补点，不制造午间点。
-- `stock:monitor:v1:lastTradeDate`：最近实际采样交易日 `YYYY-MM-DD`，进入下一交易日后清理旧日期曲线。
+- `stock:monitor:v1:lastTradeDate`：最近收到有效当日报价的交易日 `YYYY-MM-DD`；确认新交易日的有效报价后清理旧日期曲线，延迟或跨日报价不会清理曲线。
 
-同一实例或跨实例采样与资料请求由 `stock:monitor:v1:sample:lock` 排他；雪球 403、429 或令牌失效进入 `stock:monitor:v1:xq:cooldown` 两小时冷却。不同股票请求至少间隔一秒；同一股票两次报价请求由 Redis 原子 TTL 保证至少间隔 120 秒。收盘后仅源日期为当日且源时间严格晚于 15:00:00 才追加收盘点，该股确认后停止重试；未确认时保留有效历史并标 `STALE`，15:10 后停止请求。行情源时间取自雪球响应并按上海时区解析；金额和价格以元、涨跌幅以百分数传递，缺失数值用 `null`。
+同一实例或跨实例采样与资料请求由 `stock:monitor:v1:sample:lock` 排他；雪球 403、429 或令牌失效进入 `stock:monitor:v1:xq:cooldown` 两小时冷却。不同股票请求至少间隔一秒；同一股票两次报价请求由 Redis 原子 TTL 保证至少间隔 120 秒。延迟、跨日及重复的有效源报价只将最近有效报价标记 `STALE`，不追加采样点；字段无效仍记失败。收盘后仅源日期为当日且源时间严格晚于 15:00:00 才追加收盘点，该股确认后停止重试；未确认时保留有效历史并标 `STALE`，15:10 后停止请求。行情源时间取自雪球响应并按上海时区解析；金额和价格以元、涨跌幅以百分数传递，缺失数值用 `null`。
 
 本仓库测试全部模拟交易所、雪球和 Redis，不向雪球发真实请求。可使用 `python -m pytest` 与 `python -m compileall app` 验证。

@@ -14,4 +14,5 @@ def test_health_and_internal_routes():
     assert set(create_app(scheduler_enabled=False).openapi()["paths"]) == {
         "/health", "/internal/stock-monitor/v1/exchange-dictionary",
         "/internal/stock-monitor/v1/profiles",
+        "/internal/jobs/v1/{kind}/refresh",
     }

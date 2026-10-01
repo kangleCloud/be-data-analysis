@@ -23,17 +23,14 @@ def test_adapter_uses_expected_akshare_functions():
 
     provider = AkShareMarketProvider(2)
     provider._akshare = SimpleNamespace(
-        tool_trade_date_hist_sina=capture("calendar"),
         stock_fund_flow_industry=capture("ths_industry"),
         stock_fund_flow_concept=capture("ths_concept"),
         stock_fund_flow_individual=capture("ths_individual"),
     )
-    assert provider.latest_trading_date(date(2026, 9, 23)) == date(2026, 9, 23)
     provider.sector_fund_flow("industry")
     provider.sector_fund_flow("concept")
     provider.market_fund_flow()
     assert calls == [
-        ("calendar", {}),
         ("ths_industry", {"symbol": "即时"}),
         ("ths_concept", {"symbol": "即时"}),
         ("ths_individual", {"symbol": "即时"}),

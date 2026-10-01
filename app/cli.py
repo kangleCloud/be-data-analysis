@@ -1,88 +1,58 @@
-"""单次采集和可选健康服务入口。"""
+"""市场采集、个股采样、日历刷新和健康服务入口。"""
 
 import argparse
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import redis
 import uvicorn
 
-from app.collector import MarketCollector
 from app.core.config import get_settings
-from app.providers.akshare_market import AkShareMarketProvider
-from app.providers.xueqiu import XueqiuProvider
-from app.snapshot import RedisSnapshotStore
-from app.stock_monitor import MonitorStore, StockMonitorSampler
+from app.workflows import run_calendar, run_market, run_monitor
 
 LOGGER = logging.getLogger(__name__)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="A 股市场快照采集程序")
+    parser = argparse.ArgumentParser(description="A 股数据采集程序")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    collect_parser = subparsers.add_parser("collect", help="执行一次采集")
-    collect_parser.add_argument("--force", action="store_true", help="允许在交易时段外补采")
-    subparsers.add_parser("serve", help="启动可选的健康接口")
-    subparsers.add_parser("monitor-sample", help="运行一次个股监控盘中采样")
+    collect = subparsers.add_parser("collect", help="执行一次市场采集")
+    collect.add_argument("--force", action="store_true", help="主动触发，但不绕过风控")
+    subparsers.add_parser("calendar-refresh", help="刷新共享交易日历")
+    subparsers.add_parser("monitor-sample", help="执行一次个股采样")
+    subparsers.add_parser("serve", help="启动健康接口与调度")
     args = parser.parse_args()
     settings = get_settings()
     logging.basicConfig(level=settings.service_log_level.upper())
 
     if args.command == "serve":
         uvicorn.run(
-            "app.main:app",
-            host=settings.service_host,
-            port=settings.service_port,
-            log_level=settings.service_log_level,
+            "app.main:app", host=settings.service_host,
+            port=settings.service_port, log_level=settings.service_log_level,
         )
         return 0
 
-    if args.command == "monitor-sample":
-        if not settings.stock_monitor_xq_enabled:
-            LOGGER.info("雪球生产采集已关闭，跳过个股采样")
-            return 0
-        token = settings.xueqiu_token.get_secret_value()
-        if not token:
-            LOGGER.error("雪球令牌未配置，跳过个股采样")
-            return 1
-        client = redis.Redis.from_url(
-            settings.redis_url.get_secret_value(), decode_responses=True,
-            socket_timeout=5, socket_connect_timeout=5,
-        )
-        try:
-            outcome = StockMonitorSampler(
-                MonitorStore(client),
-                XueqiuProvider(token, settings.source_timeout_seconds),
-                AkShareMarketProvider(settings.source_timeout_seconds),
-                xq_enabled=settings.stock_monitor_xq_enabled,
-            ).sample(datetime.now(ZoneInfo("Asia/Shanghai")))
-            LOGGER.info("个股采样结果: %s", outcome)
-            return 0 if outcome in {"published", "skipped", "locked", "cooldown"} else 1
-        except Exception:
-            LOGGER.exception("个股采样失败")
-            return 1
-        finally:
-            client.close()
+    if args.command == "monitor-sample" and not settings.stock_monitor_xq_enabled:
+        LOGGER.info("雪球生产采集已关闭，跳过个股采样")
+        return 0
 
     client = redis.Redis.from_url(
-        settings.redis_url.get_secret_value(),
-        decode_responses=True,
-        socket_timeout=5,
-        socket_connect_timeout=5,
+        settings.redis_url.get_secret_value(), decode_responses=True,
+        socket_timeout=5, socket_connect_timeout=5,
     )
     try:
-        collector = MarketCollector(
-            AkShareMarketProvider(settings.source_timeout_seconds),
-            RedisSnapshotStore(client, settings.redis_lock_seconds),
-        )
-        outcome = collector.collect(
-            datetime.now(ZoneInfo("Asia/Shanghai")), force=args.force
-        )
-        LOGGER.info("采集结果: %s", outcome)
-        return 0 if outcome in {"published", "skipped", "throttled"} else 1
+        if args.command == "calendar-refresh":
+            outcome = run_calendar(settings, client)
+        elif args.command == "monitor-sample":
+            outcome = run_monitor(settings, client)
+        else:
+            outcome = run_market(settings, client)
+        LOGGER.info("%s 结果: %s", args.command, outcome)
+        return 0 if outcome in {
+            "refreshed", "published", "skipped", "throttled", "locked",
+            "cooldown", "disabled",
+        } else 1
     except Exception:
-        LOGGER.exception("市场快照采集失败")
+        LOGGER.exception("%s 失败", args.command)
         return 1
     finally:
         client.close()

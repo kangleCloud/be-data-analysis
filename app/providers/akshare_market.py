@@ -4,7 +4,6 @@ import signal
 import time
 import logging
 from contextlib import contextmanager, nullcontext
-from datetime import date
 from typing import Any, Iterator, Protocol
 
 import requests
@@ -30,8 +29,6 @@ def _root_exception_name(exc: BaseException) -> str:
 
 
 class MarketSource(Protocol):
-    def latest_trading_date(self, today: date) -> date | None: ...
-
     def sector_fund_flow(self, sector_type: str) -> Any: ...
 
     def market_fund_flow(self) -> Any: ...
@@ -104,15 +101,6 @@ class AkShareMarketProvider:
                 _root_exception_name(exc),
             )
             raise
-
-    def latest_trading_date(self, today: date) -> date | None:
-        frame = self._call(self._akshare.tool_trade_date_hist_sina)
-        dates = []
-        for raw in frame["trade_date"]:
-            trading_date = date.fromisoformat(str(raw)[:10])
-            if trading_date <= today:
-                dates.append(trading_date)
-        return max(dates, default=None)
 
     def sector_fund_flow(self, sector_type: str) -> Any:
         function = (
