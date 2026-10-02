@@ -2,12 +2,16 @@
 
 import math
 import re
+import logging
 from collections import Counter
 from typing import Any
 
 
 class SourceDataError(ValueError):
     """源字段不完整或结果不可用。"""
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _rows(frame: Any) -> list[dict[str, Any]]:
@@ -39,8 +43,8 @@ def _text(raw: Any) -> str | None:
     return None if value.lower() in {"", "nan", "nat", "<na>", "none", "-"} else value
 
 
-def _money(raw: Any) -> float | None:
-    """同花顺资金列字符串自带单位；纯数值按接口表格的亿元口径。"""
+def _money(raw: Any, *, numeric_factor: float) -> float | None:
+    """字符串采用显式单位；纯数值采用对应接口表头单位。"""
     if isinstance(raw, str):
         value = raw.strip().replace(",", "")
         for suffix, factor in (("亿元", 1e8), ("亿", 1e8), ("万元", 1e4), ("万", 1e4), ("元", 1.0)):
@@ -50,7 +54,7 @@ def _money(raw: Any) -> float | None:
         if value.endswith("%"):
             return None
     number = _number(raw)
-    return number * 1e8 if number is not None else None
+    return number * numeric_factor if number is not None else None
 
 
 def _count(raw: Any) -> int | None:
@@ -70,9 +74,9 @@ def normalize_sectors(frame: Any, sector_type: str) -> dict[str, Any]:
     for row, name in zip(rows, names):
         if name is None or name_counts[name] != 1:
             continue
-        inflow = _money(row["流入资金"])
-        outflow = _money(row["流出资金"])
-        net_amount = _money(row["净额"])
+        inflow = _money(row["流入资金"], numeric_factor=1e8)
+        outflow = _money(row["流出资金"], numeric_factor=1e8)
+        net_amount = _money(row["净额"], numeric_factor=1e8)
         denominator = inflow + outflow if inflow is not None and outflow is not None else None
         index_value = _number(row["行业指数"])
         change = _number(row["行业-涨跌幅"])
@@ -103,8 +107,10 @@ def normalize_sectors(frame: Any, sector_type: str) -> dict[str, Any]:
     return {"source": "THS", "period": "INTRADAY", "items": items}
 
 
-def normalize_individual_aggregate(frame: Any, collected_at: str) -> dict[str, Any]:
-    """去除非股票行与完全重复行，拒绝金额缺失或冲突的部分数据。"""
+def normalize_individual_batch(
+    frame: Any, collected_at: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
+    """从同一批去重股票构造市场汇总与个股资金点。"""
     rows = _rows(frame)
     _require(rows, "股票代码", "股票简称", "涨跌幅", "流入资金", "流出资金", "净额")
     stocks: dict[str, tuple[str, tuple[float, float, float, float]]] = {}
@@ -124,27 +130,50 @@ def normalize_individual_aggregate(frame: Any, collected_at: str) -> dict[str, A
         if code is None or not re.fullmatch(r"\d{6}", code) or name is None:
             continue
         change = _number(row["涨跌幅"])
-        inflow = _money(row["流入资金"])
-        outflow = _money(row["流出资金"])
-        net_amount = _money(row["净额"])
-        if any(value is None for value in (change, inflow, outflow, net_amount)):
+        inflow = _money(row["流入资金"], numeric_factor=1.0)
+        outflow = _money(row["流出资金"], numeric_factor=1.0)
+        source_net = _money(row["净额"], numeric_factor=1.0)
+        if any(value is None for value in (change, inflow, outflow, source_net)):
             raise SourceDataError("个股资金行缺少必要数值，拒绝部分汇总")
-        values = (change, inflow, outflow, net_amount)
+        values = (change, inflow, outflow, source_net)
         if code in stocks and stocks[code] != (name, values):
             raise SourceDataError("个股资金重复行互相冲突")
         stocks[code] = (name, values)
     if not stocks:
         raise SourceDataError("无有效同花顺个股资金流数据")
     values = [entry[1] for entry in stocks.values()]
+    inflow_total = sum(row[1] for row in values)
+    outflow_total = sum(row[2] for row in values)
+    source_net_total = sum(row[3] for row in values)
+    net_total = inflow_total - outflow_total
+    if not math.isclose(source_net_total, net_total, rel_tol=0, abs_tol=max(1.0, len(values))):
+        LOGGER.info(
+            "同花顺个股源净额与流入减流出存在差异：样本数 %d，差额 %.2f 元",
+            len(values), source_net_total - net_total,
+        )
     latest = {
         "collectedAt": collected_at,
-        "inflow": sum(row[1] for row in values),
-        "outflow": sum(row[2] for row in values),
-        "netAmount": sum(row[3] for row in values),
+        "inflow": inflow_total,
+        "outflow": outflow_total,
+        "netAmount": net_total,
         "riseCount": sum(row[0] > 0 for row in values),
         "fallCount": sum(row[0] < 0 for row in values),
         "flatCount": sum(row[0] == 0 for row in values),
         "stockCount": len(values),
     }
+    if latest["riseCount"] + latest["fallCount"] + latest["flatCount"] != latest["stockCount"]:
+        raise SourceDataError("个股涨跌样本计数不一致")
     point = {field: latest[field] for field in ("collectedAt", "inflow", "outflow", "netAmount")}
-    return {"source": "THS_INDIVIDUAL_AGGREGATE", "latest": latest, "series": [point]}
+    by_code = {
+        code: {"collectedAt": collected_at, "inflow": value[1],
+               "outflow": value[2], "netAmount": value[1] - value[2]}
+        for code, (_name, value) in stocks.items()
+    }
+    return {
+        "source": "THS_INDIVIDUAL_AGGREGATE", "latest": latest,
+        "series": [point], "reconciledFromLegacy": False,
+    }, by_code
+
+
+def normalize_individual_aggregate(frame: Any, collected_at: str) -> dict[str, Any]:
+    return normalize_individual_batch(frame, collected_at)[0]

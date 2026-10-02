@@ -207,7 +207,141 @@ def test_lost_lock_rejects_publication(flow_rows, market_rows):
 def test_snapshot_set_failure_does_not_notify(flow_rows, market_rows):
     _, client, store, collector = setup(flow_rows, market_rows)
     client.fail_set = True
-    with pytest.raises(RuntimeError, match="写入失败"):
+    with pytest.raises(RuntimeError, match="事务失败"):
         collector.collect(TRADING_AT)
     assert client.get(SNAPSHOT_KEY) is None
     assert not any(event[0] == "publish" for event in client.events)
+
+
+def test_same_market_batch_writes_only_enabled_fund_points(flow_rows, market_rows):
+    import json
+    import pandas as pd
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY
+
+    extra = pd.DataFrame([
+        {"股票代码": f"{600001 + index:06d}", "股票简称": f"股票{index}",
+         "涨跌幅": 0, "流入资金": 0, "流出资金": 0, "净额": 0}
+        for index in range(9)
+    ])
+    provider, client, store, collector = setup(
+        flow_rows, pd.concat([market_rows, extra], ignore_index=True)
+    )
+    symbols = ["SH600000"] + [f"SH{600001 + index:06d}" for index in range(9)]
+    client.set(ENABLED_KEY, json.dumps([
+        {"symbol": symbol, "code": symbol[2:], "name": symbol, "market": "SH"}
+        for symbol in symbols
+    ]))
+    assert collector.collect(TRADING_AT) == "published"
+    assert provider.calls.count("market") == 1
+    assert store.load()["modules"]["marketFundFlow"]["data"]["latest"]["stockCount"] == 11
+    fund_keys = [key for key in client.values if key.startswith(
+        f"{FUND_SERIES_PREFIX}2026-09-23:"
+    )]
+    assert len(fund_keys) == 10
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SZ000001") is None
+    point = json.loads(client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SH600001"))[0]
+    assert point == {
+        "collectedAt": "2026-09-23T10:00:00+08:00",
+        "inflow": 0, "outflow": 0, "netAmount": 0,
+    }
+    assert len(client.transactions) == 1
+    assert ("set", SNAPSHOT_KEY) in [command[:2] for command in client.transactions[0]]
+    assert client.transactions[0][-1][:2] == ("publish", UPDATES_CHANNEL)
+
+
+def test_market_source_failure_leaves_fund_series_and_snapshot_stale(flow_rows, market_rows):
+    import json
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY
+
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    client.set(ENABLED_KEY, json.dumps([{
+        "symbol": "SH600000", "code": "600000", "name": "浦发银行", "market": "SH",
+    }]))
+    assert collector.collect(TRADING_AT) == "published"
+    key = f"{FUND_SERIES_PREFIX}2026-09-23:SH600000"
+    first = client.get(key)
+    client.advance(120)
+    provider.fail.add("market")
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    assert client.get(key) == first
+    assert store.load()["modules"]["marketFundFlow"]["status"] == "STALE"
+    assert len(client.transactions) == 2
+    assert not any(command[:2] == ("publish", "stock:monitor:v1:updates")
+                   for command in client.transactions[1])
+
+
+def test_fund_history_keeps_two_data_days_and_holiday_does_not_prune(flow_rows, market_rows):
+    import json
+    from app.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY
+
+    provider, client, _, collector = setup(flow_rows, market_rows)
+    client.set(ENABLED_KEY, json.dumps([{
+        "symbol": "SH600000", "code": "600000", "name": "浦发银行", "market": "SH",
+    }]))
+    for day in (23, 24, 25):
+        provider.calendar_date = date(2026, 9, day)
+        client.advance(120)
+        assert collector.collect(TRADING_AT.replace(day=day)) == "published"
+    assert json.loads(client.get(FUND_DATES_KEY)) == ["2026-09-24", "2026-09-25"]
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SH600000") is None
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-09-24:SH600000") is not None
+    before = client.get(FUND_DATES_KEY)
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(month=10, day=1)) == "skipped"
+    assert client.get(FUND_DATES_KEY) == before
+
+
+def test_snapshot_transaction_failure_writes_neither_snapshot_nor_fund_point(flow_rows, market_rows):
+    import json
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY
+
+    _, client, _, collector = setup(flow_rows, market_rows)
+    client.set(ENABLED_KEY, json.dumps([{
+        "symbol": "SH600000", "code": "600000", "name": "浦发银行", "market": "SH",
+    }]))
+    client.fail_set = True
+    with pytest.raises(RuntimeError, match="事务失败"):
+        collector.collect(TRADING_AT)
+    assert client.get(SNAPSHOT_KEY) is None
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SH600000") is None
+
+
+def test_new_snapshot_reconciles_legacy_market_curve_points(flow_rows, market_rows):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    legacy = store.load()
+    old_point = legacy["modules"]["marketFundFlow"]["data"]["series"][0]
+    old_point["netAmount"] = -999
+    legacy["modules"]["marketFundFlow"]["data"].pop("reconciledFromLegacy")
+    store.save(legacy)
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "published"
+    data = store.load()["modules"]["marketFundFlow"]["data"]
+    assert data["reconciledFromLegacy"] is False
+    assert all(point["netAmount"] == point["inflow"] - point["outflow"]
+               for point in data["series"])
+
+
+def test_enabled_stock_missing_from_next_batch_leaves_fund_gap(flow_rows, market_rows):
+    import json
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY
+
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    client.set(ENABLED_KEY, json.dumps([
+        {"symbol": "SH600000", "code": "600000", "name": "浦发银行", "market": "SH"},
+        {"symbol": "SZ000001", "code": "000001", "name": "平安银行", "market": "SZ"},
+    ]))
+    assert collector.collect(TRADING_AT) == "published"
+    client.advance(120)
+    provider.market = market_rows.iloc[[0]]
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "published"
+    first = json.loads(client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SH600000"))
+    missing = json.loads(client.get(f"{FUND_SERIES_PREFIX}2026-09-23:SZ000001"))
+    assert len(first) == 2
+    assert len(missing) == 1
+    assert store.load()["modules"]["marketFundFlow"]["data"]["latest"]["stockCount"] == 1

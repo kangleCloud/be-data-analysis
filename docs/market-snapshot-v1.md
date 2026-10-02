@@ -1,10 +1,11 @@
 # 市场快照 V1 契约
 
-`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。单键写入成功后向 `stock:market:v1:updates` 发布同一快照的 `schemaVersion` 与 `generatedAt`。读取方收到通知后重新读取完整快照。
+`be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。每次发布分配唯一 `snapshotId`。同一 Redis 事务写入快照并向 `stock:market:v1:updates` 发布 `{schemaVersion:1,snapshotId,previousSnapshotId,changedModules}`；有已启用个股资金点时，它们也在该事务中写入。`changedModules` 只列出相对上次快照内容变化的模块，含状态变化。旧缓存没有 `snapshotId` 时 `previousSnapshotId=null`，从新快照开始建立版本链。读取方可按版本获取快照并生成增量事件，遇缺口重新读取全量快照。
 
 ```json
 {
   "schemaVersion": 1,
+  "snapshotId": "示例唯一标识",
   "provider": "akshare",
   "generatedAt": "2026-09-30T10:00:00+08:00",
   "modules": {
@@ -52,6 +53,7 @@
 ```json
 {
   "source": "THS_INDIVIDUAL_AGGREGATE",
+  "reconciledFromLegacy": false,
   "latest": {
     "collectedAt": "2026-09-30T10:00:00+08:00",
     "inflow": 130000000,
@@ -71,7 +73,9 @@
 }
 ```
 
-`netAmount` 求源列“净额”之和。关键金额缺失或同一股票出现冲突行时拒绝本轮市场汇总，保留旧成功数据。曲线仅追加当日实际成功采样点，不补午间或失败点；新交易日重新开始。
+`netAmount` 始终由同批有效去重股票的 `inflow-outflow` 计算，`latest` 和 `series` 使用同一结果；源列“净额”仅用于记录差异，不直接作为产品净额。新采集 `reconciledFromLegacy=false`。个股资金表头为元：纯数值按元解析，带“万/亿”的字符串按显式单位换算；板块表头为亿，纯数值按亿元解析。关键金额缺失或同一股票出现冲突行时拒绝本轮市场汇总，保留旧成功数据。涨、跌、平数量之和必须等于有效去重股票数。曲线仅追加当日实际成功采样点，不补午间或失败点；新交易日重新开始。
+
+同一轮全市场个股 DataFrame 也为已启用的最多 10 只股票生成 `stock:monitor:v1:fund-series:{tradeDate}:{symbol}` 资金点，格式为 `[{"collectedAt":"2026-09-30T10:00:00+08:00","inflow":100000000,"outflow":40000000,"netAmount":60000000}]`，单位元。横轴是采集时间，源未提供可靠的逐股时间；缺样留空，不补点。快照、资金点及通知在同一 Redis 事务中提交；新增资金点同时更新 `stock:monitor:v1:state-id` 并发布个股通知。资金曲线只保留最近两个有数据交易日。
 
 ## 采集与风控
 

@@ -44,7 +44,7 @@ tail -f /data/logs/be-data-analysis/service.log
 
 ## Redis 契约
 
-快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON，单次 `SET` 原子发布，不设 TTL；写入成功后向 `stock:market:v1:updates` 发送更新通知。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market-snapshot-v1.md)。
+快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON 且不设 TTL；快照、同批已启用股票的资金点和更新通知在同一 Redis 事务中提交。市场与个股各有版本 ID，通知供读取方生成增量事件并在缺口时重同步。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market-snapshot-v1.md)。
 
 ## 验证
 

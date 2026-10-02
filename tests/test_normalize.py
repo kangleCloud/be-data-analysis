@@ -70,9 +70,10 @@ def test_sector_missing_required_columns_or_all_invalid_are_errors(flow_rows):
         }), "industry")
 
 
-def test_individual_aggregate_sums_source_net_and_counts_stocks(market_rows):
+def test_individual_aggregate_reconciles_flows_and_counts_stocks(market_rows):
     data = normalize_individual_aggregate(market_rows, COLLECTED_AT)
     assert data["source"] == "THS_INDIVIDUAL_AGGREGATE"
+    assert data["reconciledFromLegacy"] is False
     assert data["latest"] == {
         "collectedAt": COLLECTED_AT,
         "inflow": 130_000_000, "outflow": 90_000_000,
@@ -112,3 +113,44 @@ def test_individual_partial_amount_or_conflicting_duplicate_is_error(market_rows
     conflicting = pd.concat([market_rows, market_rows.iloc[[0]].assign(净额="2亿")])
     with pytest.raises(SourceDataError, match="冲突"):
         normalize_individual_aggregate(conflicting, COLLECTED_AT)
+
+
+def test_individual_numeric_uses_yuan_and_source_net_is_only_audited(caplog):
+    rows = pd.DataFrame([
+        {"股票代码": "600000", "股票简称": "甲", "涨跌幅": "1%",
+         "流入资金": 100, "流出资金": "20元", "净额": "999元"},
+        {"股票代码": "000001", "股票简称": "乙", "涨跌幅": "0%",
+         "流入资金": "1万", "流出资金": "0.5万", "净额": "0元"},
+    ])
+    with caplog.at_level("INFO"):
+        data = normalize_individual_aggregate(rows, COLLECTED_AT)
+    latest = data["latest"]
+    assert (latest["inflow"], latest["outflow"], latest["netAmount"]) == (
+        10100, 5020, 5080,
+    )
+    assert (latest["riseCount"], latest["fallCount"], latest["flatCount"],
+            latest["stockCount"]) == (1, 0, 1, 2)
+    assert data["series"][0]["netAmount"] == 5080
+    assert "源净额与流入减流出存在差异" in caplog.text
+
+
+def test_aggregate_7023_96_minus_7327_06_is_minus_303_10_billion():
+    rows = pd.DataFrame([
+        {"股票代码": "600000", "股票简称": "甲", "涨跌幅": "1%",
+         "流入资金": "7023.96亿", "流出资金": "7327.06亿", "净额": "-300亿"},
+    ])
+    data = normalize_individual_aggregate(rows, COLLECTED_AT)
+    assert data["latest"]["inflow"] / 1e8 == pytest.approx(7023.96)
+    assert data["latest"]["outflow"] / 1e8 == pytest.approx(7327.06)
+    assert data["latest"]["netAmount"] / 1e8 == pytest.approx(-303.10)
+    assert data["series"][0]["netAmount"] == data["latest"]["netAmount"]
+
+
+def test_individual_zero_flow_is_valid_and_missing_flow_rejects_batch(market_rows):
+    rows = market_rows.iloc[[0]].astype(object).copy()
+    rows.loc[rows.index[0], ["流入资金", "流出资金", "净额"]] = [0, 0, 0]
+    data = normalize_individual_aggregate(rows, COLLECTED_AT)
+    assert data["latest"]["netAmount"] == 0
+    rows.loc[rows.index[0], "流入资金"] = None
+    with pytest.raises(SourceDataError, match="部分汇总"):
+        normalize_individual_aggregate(rows, COLLECTED_AT)

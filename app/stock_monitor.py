@@ -11,6 +11,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from app.providers.xueqiu import XueqiuSourceError
+from app.monitor_events import monitor_event_lock
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +20,8 @@ ENABLED_KEY = "stock:monitor:v1:enabled"
 QUOTE_PREFIX = "stock:monitor:v1:quote:"
 SERIES_PREFIX = "stock:monitor:v1:series:"
 LAST_TRADE_DATE_KEY = "stock:monitor:v1:lastTradeDate"
+MONITOR_STATE_KEY = "stock:monitor:v1:state-id"
+MONITOR_UPDATES_CHANNEL = "stock:monitor:v1:updates"
 SAMPLE_LOCK_KEY = "stock:monitor:v1:sample:lock"
 LAST_REQUEST_PREFIX = "stock:monitor:v1:sample:lastRequest:"
 XQ_COOLDOWN_KEY = "stock:monitor:v1:xq:cooldown"
@@ -185,20 +188,28 @@ class MonitorStore:
         key = f"{LAST_REQUEST_PREFIX}{symbol}"
         return bool(self.client.set(key, "1", nx=True, ex=PER_SYMBOL_INTERVAL_SECONDS))
 
-    def prepare_trade_date(self, trade_date: str) -> None:
-        old_date = self.client.get(LAST_TRADE_DATE_KEY)
-        if old_date == trade_date:
-            return
-        for key in self.client.scan_iter(match=f"{SERIES_PREFIX}*"):
-            if not key.startswith(f"{SERIES_PREFIX}{trade_date}:"):
-                self.client.delete(key)
-        self.client.set(LAST_TRADE_DATE_KEY, trade_date)
-
     def write_quote(self, quote: dict[str, Any], *, append_point: bool) -> None:
+        with monitor_event_lock(self.client):
+            self._write_quote_transaction(quote, append_point=append_point)
+
+    def _write_quote_transaction(self, quote: dict[str, Any], *, append_point: bool) -> None:
         symbol, trade_date = quote["symbol"], quote["tradeDate"]
+        base_id = self.client.get(MONITOR_STATE_KEY)
+        state_id = uuid4().hex
         pipe = self.client.pipeline(transaction=True)
         pipe.set(f"{QUOTE_PREFIX}{symbol}", json.dumps(quote, ensure_ascii=False, allow_nan=False))
         if append_point and quote["price"] is not None:
+            keys = list(self.client.scan_iter(match=f"{SERIES_PREFIX}*"))
+            dates = {trade_date}
+            for old_key in keys:
+                day = old_key.removeprefix(SERIES_PREFIX).split(":", 1)[0]
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                    dates.add(day)
+            keep = set(sorted(dates)[-2:])
+            for old_key in keys:
+                day = old_key.removeprefix(SERIES_PREFIX).split(":", 1)[0]
+                if day not in keep:
+                    pipe.delete(old_key)
             key = f"{SERIES_PREFIX}{trade_date}:{symbol}"
             raw = self.client.get(key)
             points = json.loads(raw) if raw else []
@@ -206,6 +217,12 @@ class MonitorStore:
             points.append({"time": quote["sourceTime"], "price": quote["price"]})
             points.sort(key=lambda point: point["time"])
             pipe.set(key, json.dumps(points, ensure_ascii=False, allow_nan=False))
+            pipe.set(LAST_TRADE_DATE_KEY, trade_date)
+        pipe.set(MONITOR_STATE_KEY, state_id)
+        pipe.publish(MONITOR_UPDATES_CHANNEL, json.dumps({
+            "baseStateId": base_id, "stateId": state_id,
+            "changedSymbols": [symbol],
+        }, ensure_ascii=False, separators=(",", ":")))
         pipe.execute()
 
 
@@ -292,7 +309,6 @@ class StockMonitorSampler:
                             symbol, quote, previous, local, "source_unchanged"
                         )
                         continue
-                    self.store.prepare_trade_date(local.date().isoformat())
                     self.store.write_quote(quote, append_point=True)
                 except Exception as exc:
                     failures += 1

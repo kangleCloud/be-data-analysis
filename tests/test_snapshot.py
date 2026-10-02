@@ -18,6 +18,7 @@ class FakeRedis:
         self.events = []
         self.fail_set = False
         self.fail_publish = False
+        self.transactions = []
 
     def get(self, key):
         if key in self.expiry and self.expiry[key] <= self.now:
@@ -41,6 +42,46 @@ class FakeRedis:
             self.expiry[key] = self.now + int(ex)
         self.events.append(("set", key, value))
         return True
+
+    def pipeline(self, transaction=True):
+        assert transaction
+        client = self
+
+        class Pipeline:
+            def __init__(self):
+                self.commands = []
+
+            def set(self, key, value):
+                self.commands.append(("set", key, value))
+                return self
+
+            def delete(self, key):
+                self.commands.append(("delete", key))
+                return self
+
+            def publish(self, channel, payload):
+                self.commands.append(("publish", channel, payload))
+                return self
+
+            def execute(self):
+                if client.fail_set and any(
+                    command[:2] == ("set", SNAPSHOT_KEY) for command in self.commands
+                ):
+                    raise RuntimeError("模拟 Redis 事务失败")
+                if client.fail_publish and any(command[0] == "publish" for command in self.commands):
+                    raise ConnectionError("模拟 Redis 事务通知失败")
+                client.transactions.append(tuple(self.commands))
+                for command in self.commands:
+                    if command[0] == "set":
+                        client.set(command[1], command[2])
+                    elif command[0] == "delete":
+                        client.values.pop(command[1], None)
+                        client.expiry.pop(command[1], None)
+                    else:
+                        client.publish(command[1], command[2])
+                return [True] * len(self.commands)
+
+        return Pipeline()
 
     def publish(self, channel, payload):
         self.events.append(("publish", channel, payload))
@@ -79,16 +120,19 @@ def test_snapshot_is_plain_utf8_json_and_atomic_single_key():
     assert [event[:2] for event in client.events] == [
         ("set", SNAPSHOT_KEY), ("publish", UPDATES_CHANNEL)
     ]
-    assert json.loads(client.events[1][2]) == {
+    notice = json.loads(client.events[1][2])
+    assert notice == {
         "schemaVersion": 1,
-        "generatedAt": json.loads(client.values[SNAPSHOT_KEY])["generatedAt"],
+        "snapshotId": json.loads(client.values[SNAPSHOT_KEY])["snapshotId"],
+        "previousSnapshotId": None,
+        "changedModules": ["industrySectors"],
     }
 
 
 def test_failed_set_does_not_publish():
     client = FakeRedis()
     client.fail_set = True
-    with pytest.raises(RuntimeError, match="写入失败"):
+    with pytest.raises(RuntimeError, match="事务失败"):
         RedisSnapshotStore(client, 240).save({
             "schemaVersion": 1, "generatedAt": "2026-09-23T10:00:00+08:00"
         })
@@ -96,13 +140,14 @@ def test_failed_set_does_not_publish():
     assert client.get(SNAPSHOT_KEY) is None
 
 
-def test_failed_publish_keeps_saved_snapshot(caplog):
+def test_failed_transaction_does_not_save_or_publish():
     client = FakeRedis()
     client.fail_publish = True
     snapshot = {"schemaVersion": 1, "generatedAt": "2026-09-23T10:00:00+08:00"}
-    RedisSnapshotStore(client, 240).save(snapshot)
-    assert json.loads(client.get(SNAPSHOT_KEY)) == snapshot
-    assert "更新通知发送失败" in caplog.text
+    with pytest.raises(ConnectionError, match="通知失败"):
+        RedisSnapshotStore(client, 240).save(snapshot)
+    assert client.get(SNAPSHOT_KEY) is None
+    assert client.events == []
 
 
 def test_lock_excludes_overlap_and_only_owner_can_release():
@@ -170,3 +215,82 @@ def test_unsupported_snapshot_version_is_rejected():
     client.set(SNAPSHOT_KEY, '{"schemaVersion":2}')
     with pytest.raises(ValueError, match="版本"):
         RedisSnapshotStore(client, 240).load()
+
+
+def test_fund_series_dedupes_sample_time_and_keeps_two_cross_year_dates():
+    from app.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
+
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    symbol = "SH600000"
+    for day in ("2026-09-30", "2026-12-31", "2027-01-04"):
+        point = {"collectedAt": f"{day}T10:00:00+08:00", "inflow": 100,
+                 "outflow": 70, "netAmount": 30}
+        snapshot = {"schemaVersion": 1, "generatedAt": point["collectedAt"]}
+        store.save(snapshot, trade_date=day, fund_points={symbol: point})
+        store.save(snapshot, trade_date=day, fund_points={symbol: point})
+        assert len(json.loads(client.get(f"{FUND_SERIES_PREFIX}{day}:{symbol}"))) == 1
+    assert json.loads(client.get(FUND_DATES_KEY)) == ["2026-12-31", "2027-01-04"]
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-09-30:{symbol}") is None
+    assert client.get(f"{FUND_SERIES_PREFIX}2026-12-31:{symbol}") is not None
+    assert client.get(f"{FUND_SERIES_PREFIX}2027-01-04:{symbol}") is not None
+    assert len([event for event in client.events if event[0] == "publish"]) == 12
+
+
+def test_market_snapshot_ids_link_and_only_changed_modules_are_listed():
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    first = {"schemaVersion": 1, "generatedAt": "2026-09-23T10:00:00+08:00",
+             "modules": {"industrySectors": {"status": "FRESH"},
+                         "marketFundFlow": {"status": "FRESH"}}}
+    store.save(first)
+    first_id = store.load()["snapshotId"]
+    second = {**first, "generatedAt": "2026-09-23T10:02:00+08:00",
+              "modules": {"industrySectors": {"status": "FRESH"},
+                          "marketFundFlow": {"status": "STALE"}}}
+    store.save(second)
+    second_id = store.load()["snapshotId"]
+    notices = [json.loads(event[2]) for event in client.events
+               if event[:2] == ("publish", UPDATES_CHANNEL)]
+    assert first_id != second_id
+    assert notices[0] == {
+        "schemaVersion": 1, "snapshotId": first_id, "previousSnapshotId": None,
+        "changedModules": ["industrySectors", "marketFundFlow"],
+    }
+    assert notices[1] == {
+        "schemaVersion": 1, "snapshotId": second_id,
+        "previousSnapshotId": first_id, "changedModules": ["marketFundFlow"],
+    }
+    assert client.transactions[1][-1][:2] == ("publish", UPDATES_CHANNEL)
+
+
+def test_fund_point_market_and_monitor_events_follow_atomic_business_writes():
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
+
+    client = FakeRedis()
+    store = RedisSnapshotStore(client, 240)
+    symbol = "SH600000"
+    for minute in (0, 2):
+        timestamp = f"2026-09-23T10:{minute:02d}:00+08:00"
+        store.save({"schemaVersion": 1, "generatedAt": timestamp, "modules": {}},
+                   trade_date="2026-09-23", fund_points={symbol: {
+                       "collectedAt": timestamp, "inflow": 100, "outflow": 40,
+                       "netAmount": 60,
+                   }})
+    first, second = client.transactions
+    for transaction in (first, second):
+        names = [command[:2] for command in transaction]
+        assert ("set", SNAPSHOT_KEY) in names
+        assert ("set", f"{FUND_SERIES_PREFIX}2026-09-23:{symbol}") in names
+        assert ("set", MONITOR_STATE_KEY) in names
+        assert names[-2:] == [
+            ("publish", MONITOR_UPDATES_CHANNEL), ("publish", UPDATES_CHANNEL)
+        ]
+    notices = [json.loads(event[2]) for event in client.events
+               if event[:2] == ("publish", MONITOR_UPDATES_CHANNEL)]
+    assert notices[0]["baseStateId"] is None
+    assert notices[1]["baseStateId"] == notices[0]["stateId"]
+    assert notices[0]["stateId"] != notices[1]["stateId"]
+    assert notices[1]["stateId"] == client.get(MONITOR_STATE_KEY)
+    assert notices[0]["changedSymbols"] == [symbol]

@@ -25,25 +25,7 @@ STOCKS = [
 ]
 
 
-class Pipeline:
-    def __init__(self, client):
-        self.client = client
-        self.commands = []
-
-    def set(self, key, value):
-        self.commands.append((key, value))
-        return self
-
-    def execute(self):
-        for key, value in self.commands:
-            self.client.set(key, value)
-
-
 class RedisClient(FakeRedis):
-    def pipeline(self, transaction=True):
-        assert transaction
-        return Pipeline(self)
-
     def scan_iter(self, match):
         prefix = match[:-1]
         return (key for key in list(self.values) if key.startswith(prefix))
@@ -191,12 +173,15 @@ def test_lock_holiday_and_enabled_limit_block_source_calls():
         raise AssertionError("超过 10 只应被拒绝")
 
 
-def test_new_trade_day_removes_old_series_only():
+def test_price_series_keeps_two_data_days_and_removes_third_oldest():
     client = RedisClient()
     store = MonitorStore(client)
     client.set(f"{SERIES_PREFIX}2026-09-25:SH600000", "[]")
     client.set(f"{SERIES_PREFIX}2026-09-28:SH600000", "[]")
-    store.prepare_trade_date("2026-09-28")
+    store.write_quote({
+        "symbol": "SH600000", "tradeDate": "2026-09-29",
+        "sourceTime": "2026-09-29T10:00:00+08:00", "price": 10,
+    }, append_point=True)
     assert client.get(f"{SERIES_PREFIX}2026-09-25:SH600000") is None
     assert client.get(f"{SERIES_PREFIX}2026-09-28:SH600000") == "[]"
 
@@ -399,7 +384,7 @@ def test_new_trading_day_delayed_quote_keeps_history_until_current_day_point():
     source.time = int(next_day.replace(minute=34).timestamp() * 1000)
     client.advance(120)
     assert sampler.sample(next_day.replace(minute=34)) == "published"
-    assert client.get(old_key) is None
+    assert client.get(old_key) == old_series
     assert len(json.loads(client.get(f"{SERIES_PREFIX}2026-09-29:SH600000"))) == 1
     assert json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))["status"] == "FRESH"
 
@@ -428,3 +413,56 @@ def test_invalid_quote_logs_safe_reason_and_preserves_previous_point(caplog):
         assert (exc.reason, exc.field) == ("invalid_source_time", "time")
     else:
         raise AssertionError("无效时间应被拒绝")
+
+
+def test_price_history_retains_two_data_days_across_year_end():
+    client = RedisClient()
+    store = MonitorStore(client)
+    for day in ("2026-09-30", "2026-12-31", "2027-01-04"):
+        store.write_quote({
+            "symbol": "SH600000", "tradeDate": day,
+            "sourceTime": f"{day}T10:00:00+08:00", "price": 10,
+        }, append_point=True)
+    assert client.get(f"{SERIES_PREFIX}2026-09-30:SH600000") is None
+    assert client.get(f"{SERIES_PREFIX}2026-12-31:SH600000") is not None
+    assert client.get(f"{SERIES_PREFIX}2027-01-04:SH600000") is not None
+
+
+def test_quote_and_price_point_publish_monitor_state_in_same_transaction():
+    from app.stock_monitor import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
+
+    client = RedisClient()
+    store = MonitorStore(client)
+    for minute in (30, 32):
+        store.write_quote({
+            "symbol": "SH600000", "tradeDate": "2026-09-28",
+            "sourceTime": f"2026-09-28T09:{minute}:00+08:00", "price": 10,
+        }, append_point=True)
+    first, second = client.transactions
+    for transaction in (first, second):
+        names = [command[:2] for command in transaction]
+        assert ("set", f"{QUOTE_PREFIX}SH600000") in names
+        assert ("set", f"{SERIES_PREFIX}2026-09-28:SH600000") in names
+        assert names[-2:] == [
+            ("set", MONITOR_STATE_KEY), ("publish", MONITOR_UPDATES_CHANNEL),
+        ]
+    notices = [json.loads(event[2]) for event in client.events
+               if event[:2] == ("publish", MONITOR_UPDATES_CHANNEL)]
+    assert notices[0]["baseStateId"] is None
+    assert notices[1]["baseStateId"] == notices[0]["stateId"]
+    assert notices[1]["stateId"] == client.get(MONITOR_STATE_KEY)
+    assert notices[1]["changedSymbols"] == ["SH600000"]
+
+
+def test_1456_quote_does_not_confirm_close_at_1502():
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
+    source = QuoteSource()
+    source.time = int(AT.replace(hour=14, minute=56).timestamp() * 1000)
+    sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
+    assert sampler.sample(AT.replace(hour=15, minute=2)) == "published"
+    quote = json.loads(client.get(f"{QUOTE_PREFIX}SH600000"))
+    assert quote["sourceTime"] == "2026-09-28T14:56:00+08:00"
+    assert quote["status"] == "STALE"
+    assert not sampler._close_confirmed("SH600000", AT.date())
+    assert client.get(f"{SERIES_PREFIX}2026-09-28:SH600000") is None

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from app.normalize import normalize_individual_aggregate, normalize_sectors
+from app.normalize import normalize_individual_batch, normalize_sectors
 from app.providers.akshare_market import MarketSource
 from app.snapshot import SnapshotStore
 from app.trading_calendar import CalendarService
@@ -165,6 +165,7 @@ class MarketCollector:
             day = local.date().isoformat()
             modules: dict[str, Any] = {}
             failures = 0
+            fund_points: dict[str, dict[str, Any]] = {}
 
             def update(key: str, action: Callable[[], dict[str, Any]]) -> None:
                 nonlocal failures
@@ -200,30 +201,46 @@ class MarketCollector:
             update("conceptSectors", lambda: normalize_sectors(
                 self._provider.sector_fund_flow("concept"), "concept"
             ))
-            update("marketFundFlow", lambda: normalize_individual_aggregate(
-                self._provider.market_fund_flow(), collected_time()
-            ))
-            self._publish(token, collected_time(), modules)
+            def market_action() -> dict[str, Any]:
+                nonlocal fund_points
+                data, by_code = normalize_individual_batch(
+                    self._provider.market_fund_flow(), collected_time()
+                )
+                selected = self._store.enabled_symbols()
+                fund_points = {
+                    symbol: by_code[symbol[2:]]
+                    for symbol in selected if symbol[2:] in by_code
+                }
+                return data
+
+            update("marketFundFlow", market_action)
+            if modules["marketFundFlow"]["status"] != "FRESH":
+                fund_points = {}
+            self._publish(token, collected_time(), modules, day, fund_points)
             return "partial" if failures else "published"
         finally:
             self._store.stop_renewal()
             self._store.release(token)
             LOGGER.info("采集总耗时 %.2f 秒", clock.monotonic() - started)
 
-    def _publish(self, token: str, timestamp: str, modules: dict[str, Any]) -> None:
+    def _publish(
+        self, token: str, timestamp: str, modules: dict[str, Any],
+        trade_date: str | None = None, fund_points: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         if not self._store.renew(token):
             raise RuntimeError("市场采集锁已失效，拒绝发布快照")
         self._store.save({
             "schemaVersion": 1, "provider": "akshare",
             "generatedAt": timestamp, "modules": modules,
-        })
+        }, trade_date=trade_date, fund_points=fund_points)
 
     @staticmethod
     def _append_market_series(data: dict[str, Any], prior: Any, day: str) -> dict[str, Any]:
         point = data["series"][0]
         if _reusable_prior("marketFundFlow", prior) and prior["tradeDate"] == day:
             series = [
-                old for old in prior["data"]["series"]
+                {**old, "netAmount": old["inflow"] - old["outflow"]}
+                for old in prior["data"]["series"]
                 if old["collectedAt"] != point["collectedAt"]
             ]
             series.append(point)

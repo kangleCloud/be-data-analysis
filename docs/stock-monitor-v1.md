@@ -44,7 +44,9 @@ Python 只读 `stock:monitor:v1:enabled`（按排序的最多 10 只 `{symbol,co
 
 - `stock:monitor:v1:quote:{symbol}`：`{schemaVersion:1,symbol,source:"XQ",sourceTime,collectedAt,tradeDate,price,changePercent,amount,low,high,open,limitUp,limitDown,averagePrice,volume,previousClose,status}`；新增数值字段均可为 `null`，价格单位元、成交量单位股；失败时保留有效历史报价为 `STALE`，没有历史报价为 `ERROR`。
 - `stock:monitor:v1:series:{tradeDate}:{symbol}`：真实雪球源时间点 `[{time,price}]`；同一源时间去重，不补点，不制造午间点。
-- `stock:monitor:v1:lastTradeDate`：最近收到有效当日报价的交易日 `YYYY-MM-DD`；确认新交易日的有效报价后清理旧日期曲线，延迟或跨日报价不会清理曲线。
+- `stock:monitor:v1:lastTradeDate`：最近收到有效当日报价的交易日 `YYYY-MM-DD`；价格曲线仅保留最近两个有数据交易日，延迟或跨日报价不会清理曲线。
+- `stock:monitor:v1:fund-series:{tradeDate}:{symbol}`：复用市场采集的同批同花顺个股资金 DataFrame，按采集时间写入 `[{collectedAt,inflow,outflow,netAmount}]`，金额单位元且净额为流入减流出；仅为同批出现的已启用股票写点，不增加逐股源请求。仅保留最近两个有数据交易日，缺样不补点。该曲线与雪球价格曲线独立。
+- `stock:monitor:v1:state-id`：每次个股报价/价格曲线写入或资金点写入生成唯一状态 ID。业务键、状态 ID 与 `stock:monitor:v1:updates` 通知在同一 Redis 事务提交；通知为 `{baseStateId,stateId,changedSymbols}`。旧状态无 ID 时 `baseStateId=null`，读取方应重同步全量数据。
 
 同一实例或跨实例采样与资料请求由 `stock:monitor:v1:sample:lock` 排他；雪球 403、429 或令牌失效进入 `stock:monitor:v1:xq:cooldown` 两小时冷却。不同股票请求至少间隔一秒；同一股票两次报价请求由 Redis 原子 TTL 保证至少间隔 120 秒。延迟、跨日及重复的有效源报价只将最近有效报价标记 `STALE`，不追加采样点；字段无效仍记失败。收盘后仅源日期为当日且源时间严格晚于 15:00:00 才追加收盘点，该股确认后停止重试；未确认时保留有效历史并标 `STALE`，15:10 后停止请求。行情源时间取自雪球响应并按上海时区解析；金额和价格以元、涨跌幅以百分数传递，缺失数值用 `null`。
 
