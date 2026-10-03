@@ -33,7 +33,7 @@ def headers():
 
 def test_all_jobs_require_existing_internal_token_and_have_no_status_route():
     client = client_for(RedisClient(), lambda _kind: "published")
-    for kind in ("calendar", "market", "monitor"):
+    for kind in ("calendar", "market", "monitor", "etf"):
         assert client.post(f"/internal/jobs/v1/{kind}/refresh").status_code == 401
         assert client.get(f"/internal/jobs/v1/{kind}/status", headers=headers()).status_code == 404
 
@@ -74,10 +74,12 @@ def test_post_waits_for_result_and_overlap_returns_409_without_queuing():
 def test_business_outcomes_are_distinct_terminal_states():
     outcomes = {
         "calendar": "throttled", "market": "partial", "monitor": "disabled",
+        "etf": "published",
     }
     client = client_for(RedisClient(), lambda kind: outcomes[kind])
     for kind, state in (
-        ("calendar", "SKIPPED"), ("market", "PARTIAL"), ("monitor", "SKIPPED")
+        ("calendar", "SKIPPED"), ("market", "PARTIAL"),
+        ("monitor", "SKIPPED"), ("etf", "SUCCEEDED")
     ):
         response = client.post(f"/internal/jobs/v1/{kind}/refresh", headers=headers())
         assert response.status_code == 200

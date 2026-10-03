@@ -9,14 +9,14 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from app.normalize import normalize_individual_batch, normalize_sectors
+from app.normalize import normalize_core_indices, normalize_individual_batch, normalize_sectors
 from app.providers.akshare_market import MarketSource
 from app.snapshot import SnapshotStore
 from app.trading_calendar import CalendarService
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-MODULE_KEYS = ("industrySectors", "conceptSectors", "marketFundFlow")
+MODULE_KEYS = ("industrySectors", "conceptSectors", "marketFundFlow", "coreIndices")
 SECTOR_FIELDS = {
     "code", "name", "type", "indexValue", "changePct", "inflow", "outflow",
     "netAmount", "netFlowRate", "companyCount", "leader", "leaderChangePct",
@@ -65,6 +65,15 @@ def _reusable_prior(key: str, prior: Any) -> bool:
                 and all(_finite(point[field]) for field in MARKET_POINT_FIELDS - {"collectedAt"})
                 for point in series
             )
+        )
+    if key == "coreIndices":
+        items = data.get("items")
+        return (
+            data.get("source") == "SINA_INDEX"
+            and isinstance(items, list) and len(items) == 5
+            and all(isinstance(item, dict) and isinstance(item.get("code"), str)
+                    and _finite(item.get("price")) and isinstance(item.get("series"), list)
+                    for item in items)
         )
     sector_type = "industry" if key == "industrySectors" else "concept"
     items = data.get("items")
@@ -167,15 +176,19 @@ class MarketCollector:
             failures = 0
             fund_points: dict[str, dict[str, Any]] = {}
 
-            def update(key: str, action: Callable[[], dict[str, Any]]) -> None:
+            def update(
+                key: str, action: Callable[[], dict[str, Any]], source: str = "ths",
+            ) -> None:
                 nonlocal failures
                 module_started = clock.monotonic()
                 try:
-                    if self._store.cooldown_active("ths"):
-                        raise SourceCooldownError("同花顺源冷却中")
+                    if self._store.cooldown_active(source):
+                        raise SourceCooldownError("数据源冷却中")
                     data = action()
                     if key == "marketFundFlow":
                         data = self._append_market_series(data, old_modules.get(key), day)
+                    elif key == "coreIndices":
+                        data = self._append_index_series(data, old_modules.get(key), day)
                     success_at = collected_time()
                     modules[key] = {
                         "status": "FRESH", "tradeDate": day,
@@ -185,8 +198,8 @@ class MarketCollector:
                     LOGGER.info("模块 %s 成功，耗时 %.2f 秒", key, clock.monotonic() - module_started)
                 except Exception as exc:
                     failures += 1
-                    if _needs_cooldown(exc, "ths"):
-                        self._store.start_cooldown("ths")
+                    if _needs_cooldown(exc, source):
+                        self._store.start_cooldown(source)
                     LOGGER.warning(
                         "模块 %s 失败，耗时 %.2f 秒，异常 %s",
                         key, clock.monotonic() - module_started, type(exc).__name__,
@@ -214,6 +227,9 @@ class MarketCollector:
                 return data
 
             update("marketFundFlow", market_action)
+            update("coreIndices", lambda: normalize_core_indices(
+                self._provider.index_spot(), collected_time()
+            ), source="sina-index")
             if modules["marketFundFlow"]["status"] != "FRESH":
                 fund_points = {}
             self._publish(token, collected_time(), modules, day, fund_points)
@@ -246,4 +262,21 @@ class MarketCollector:
             series.append(point)
             series.sort(key=lambda old: old["collectedAt"])
             data["series"] = series
+        return data
+
+    @staticmethod
+    def _append_index_series(data: dict[str, Any], prior: Any, day: str) -> dict[str, Any]:
+        if not _reusable_prior("coreIndices", prior) or prior["tradeDate"] != day:
+            return data
+        old_by_code = {item["code"]: item for item in prior["data"]["items"]}
+        for item in data["items"]:
+            previous = old_by_code.get(item["code"])
+            if previous is None:
+                continue
+            point = item["series"][0]
+            series = [old for old in previous["series"]
+                      if old.get("collectedAt") != point["collectedAt"]]
+            series.append(point)
+            series.sort(key=lambda old: old["collectedAt"])
+            item["series"] = series
         return data

@@ -15,4 +15,7 @@ def test_health_and_internal_routes():
         "/health", "/internal/stock-monitor/v1/exchange-dictionary",
         "/internal/stock-monitor/v1/profiles",
         "/internal/jobs/v1/{kind}/refresh",
+        "/internal/etf-monitor/v1/dictionary",
+        "/internal/etf-monitor/v1/profiles",
+        "/internal/etf-monitor/v1/asset-allocation",
     }

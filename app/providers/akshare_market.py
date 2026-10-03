@@ -5,6 +5,7 @@ import time
 import logging
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator, Protocol
+from urllib.parse import urlparse
 
 import requests
 
@@ -12,6 +13,8 @@ LOGGER = logging.getLogger(__name__)
 THS_SECTOR_TIMEOUT_SECONDS = 120
 THS_INDIVIDUAL_TIMEOUT_SECONDS = 900
 THS_REQUEST_INTERVAL_SECONDS = 1
+SINA_INDEX_TIMEOUT_SECONDS = 120
+SINA_REQUEST_INTERVAL_SECONDS = 0.2
 
 
 def _root_exception_name(exc: BaseException) -> str:
@@ -32,6 +35,8 @@ class MarketSource(Protocol):
     def sector_fund_flow(self, sector_type: str) -> Any: ...
 
     def market_fund_flow(self) -> Any: ...
+
+    def index_spot(self) -> Any: ...
 
 
 @contextmanager
@@ -58,6 +63,7 @@ class AkShareMarketProvider:
         self._akshare = akshare
         self._timeout_seconds = timeout_seconds
         self._last_ths_request_at: float | None = None
+        self._last_sina_request_at: float | None = None
 
     @contextmanager
     def _paced_ths(self) -> Iterator[None]:
@@ -82,14 +88,38 @@ class AkShareMarketProvider:
         finally:
             requests.get = original_get
 
+    @contextmanager
+    def _paced_sina(self) -> Iterator[None]:
+        """指数分页仅放行已审计的新浪域名，并限制请求速率。"""
+        original_get = requests.get
+
+        def paced_get(url: str, *args: Any, **kwargs: Any) -> Any:
+            if urlparse(url).hostname != "vip.stock.finance.sina.com.cn":
+                raise RuntimeError("指数源请求了未审计域名")
+            if self._last_sina_request_at is not None:
+                remaining = SINA_REQUEST_INTERVAL_SECONDS - (
+                    time.monotonic() - self._last_sina_request_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._last_sina_request_at = time.monotonic()
+            kwargs.setdefault("timeout", self._timeout_seconds)
+            return original_get(url, *args, **kwargs)
+
+        requests.get = paced_get
+        try:
+            yield
+        finally:
+            requests.get = original_get
+
     def _call(
         self, function: Any, *, timeout_seconds: int | None = None,
-        pace_ths: bool = False, **kwargs: str
+        pace_ths: bool = False, pace_sina: bool = False, **kwargs: str
     ) -> Any:
         started = time.monotonic()
         name = getattr(function, "__name__", "unknown")
         try:
-            pacing = self._paced_ths() if pace_ths else nullcontext()
+            pacing = self._paced_ths() if pace_ths else self._paced_sina() if pace_sina else nullcontext()
             with _deadline(timeout_seconds or self._timeout_seconds), pacing:
                 result = function(**kwargs)
             LOGGER.info("接口 %s 成功，耗时 %.2f 秒", name, time.monotonic() - started)
@@ -118,4 +148,10 @@ class AkShareMarketProvider:
             self._akshare.stock_fund_flow_individual, symbol="即时",
             timeout_seconds=THS_INDIVIDUAL_TIMEOUT_SECONDS,
             pace_ths=True,
+        )
+
+    def index_spot(self) -> Any:
+        return self._call(
+            self._akshare.stock_zh_index_spot_sina,
+            timeout_seconds=SINA_INDEX_TIMEOUT_SECONDS, pace_sina=True,
         )

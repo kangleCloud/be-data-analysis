@@ -36,9 +36,11 @@ tail -f /data/logs/be-data-analysis/service.log
 
 重叠运行由 Redis 锁阻止。源被限流、断连或超时后冷却两小时；同花顺分页请求至少间隔一秒。任一模块失败时仍发布保留旧成功数据的快照，但命令返回非零状态，需检查日志。日志记录接口、模块和总耗时以及异常类型，不包含 Redis 凭据。
 
-健康接口为 `GET /health`；采集由服务内调度启动的一次性子进程执行。另有两个仅供 Spring 使用、需 `X-Internal-Token` 鉴权的个股监控内部接口。
+健康接口为 `GET /health`；采集由服务内调度启动的一次性子进程执行。个股和 ETF 内部同步接口需 `X-Internal-Token` 鉴权。
 
 个股监控 V1 使用独立的交易所股票字典和雪球资料/报价。`STOCK_MONITOR_XQ_ENABLED` 默认 `false`；关闭时自动调度和手动 `python -m app monitor-sample` 均不访问雪球，资料接口也拒绝调用。明确开启且配置 `XUEQIU_TOKEN` 后，服务在交易日盘中每两分钟对 Redis enabled 清单中的最多 10 只股票采样。配置、接口样例、Redis 键及频控见 [个股监控 V1](docs/stock-monitor-v1.md)。
+
+市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、交易所基金资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/index-etf-sources-v1.md)。
 
 同花顺三组即时接口没有可靠源交易日期或源时间；快照的 `tradeDate` 仅依据交易日历，`lastSuccessAt` 和市场曲线的 `collectedAt` 是采集时间。
 

@@ -177,3 +177,44 @@ def normalize_individual_batch(
 
 def normalize_individual_aggregate(frame: Any, collected_at: str) -> dict[str, Any]:
     return normalize_individual_batch(frame, collected_at)[0]
+
+
+CORE_INDICES = {
+    "sh000001": "上证指数",
+    "sz399001": "深证成指",
+    "sh000300": "沪深300",
+    "sz399006": "创业板指",
+    "sh000688": "科创50",
+}
+
+
+def normalize_core_indices(frame: Any, collected_at: str) -> dict[str, Any]:
+    """从新浪全指数表中严格提取五只核心指数；源无可靠逐条时间。"""
+    rows = _rows(frame)
+    _require(rows, "代码", "名称", "最新价", "涨跌额", "涨跌幅", "昨收", "今开",
+             "最高", "最低", "成交量", "成交额")
+    selected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = (_text(row["代码"]) or "").lower()
+        if code not in CORE_INDICES:
+            continue
+        price = _number(row["最新价"])
+        if price is None or price <= 0:
+            raise SourceDataError("核心指数缺少有效点位")
+        item = {
+            "code": code, "name": CORE_INDICES[code], "price": price,
+            "change": _number(row["涨跌额"]),
+            "changePercent": _number(row["涨跌幅"]),
+            "previousClose": _number(row["昨收"]), "open": _number(row["今开"]),
+            "high": _number(row["最高"]), "low": _number(row["最低"]),
+            "volume": _number(row["成交量"]), "amount": _number(row["成交额"]),
+            "sourceTime": None, "collectedAt": collected_at,
+            "series": [{"collectedAt": collected_at, "price": price}],
+        }
+        if code in selected and selected[code] != item:
+            raise SourceDataError("核心指数重复行互相冲突")
+        selected[code] = item
+    if set(selected) != set(CORE_INDICES):
+        raise SourceDataError("核心指数批次不完整")
+    return {"source": "SINA_INDEX", "sourceTime": None,
+            "items": [selected[code] for code in CORE_INDICES]}

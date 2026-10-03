@@ -32,6 +32,22 @@ class FakeProvider:
             raise TimeoutError()
         return self.market
 
+    def index_spot(self):
+        self.calls.append("index")
+        if "index" in self.fail:
+            raise TimeoutError()
+        return [
+            {"代码": code, "名称": name, "最新价": 3000 + offset,
+             "涨跌额": 1, "涨跌幅": 0.1, "昨收": 2999,
+             "今开": 3000, "最高": 3010, "最低": 2990,
+             "成交量": 1000, "成交额": 10000}
+            for offset, (code, name) in enumerate((
+                ("sh000001", "上证指数"), ("sz399001", "深证成指"),
+                ("sh000300", "沪深300"), ("sz399006", "创业板指"),
+                ("sh000688", "科创50"),
+            ))
+        ]
+
 
 class FakeCalendar:
     def __init__(self, provider):
@@ -56,12 +72,14 @@ def test_snapshot_has_new_three_modules_and_calendar_basis(flow_rows, market_row
     assert collector.collect(TRADING_AT) == "published"
     snapshot = store.load()
     assert snapshot["schemaVersion"] == 1 and snapshot["provider"] == "akshare"
-    assert set(snapshot["modules"]) == {"industrySectors", "conceptSectors", "marketFundFlow"}
+    assert set(snapshot["modules"]) == {
+        "industrySectors", "conceptSectors", "marketFundFlow", "coreIndices"
+    }
     assert all(module["status"] == "FRESH" and module["tradeDateBasis"] == "CALENDAR"
                for module in snapshot["modules"].values())
     assert snapshot["modules"]["industrySectors"]["data"]["items"][0]["name"] == "半导体"
     assert snapshot["modules"]["marketFundFlow"]["data"]["source"] == "THS_INDIVIDUAL_AGGREGATE"
-    assert provider.calls == ["calendar", "flow:industry", "flow:concept", "market"]
+    assert provider.calls == ["calendar", "flow:industry", "flow:concept", "market", "index"]
     assert [event[1] for event in client.events if event[0] == "publish"] == [UPDATES_CHANNEL]
 
 

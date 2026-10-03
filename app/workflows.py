@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 from app.collector import MarketCollector
 from app.core.config import Settings
 from app.providers.akshare_market import AkShareMarketProvider
+from app.providers.akshare_etf import AkShareEtfProvider
+from app.etf_monitor import EtfCollector, EtfStore
 from app.providers.xueqiu import XueqiuProvider
 from app.snapshot import RedisSnapshotStore
 from app.stock_monitor import MonitorStore, StockMonitorSampler
@@ -46,3 +48,10 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) 
         calendar_service(settings, client),
         xq_enabled=True,
     ).sample(at or datetime.now(SHANGHAI))
+
+
+def run_etf(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
+    return EtfCollector(
+        AkShareEtfProvider(settings.source_timeout_seconds),
+        EtfStore(client), calendar_service(settings, client),
+    ).collect(at or datetime.now(SHANGHAI))

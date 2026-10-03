@@ -9,9 +9,9 @@ from typing import Literal
 import redis
 
 from app.core.config import get_settings
-from app.workflows import run_calendar, run_market, run_monitor
+from app.workflows import run_calendar, run_etf, run_market, run_monitor
 
-Kind = Literal["calendar", "market", "monitor"]
+Kind = Literal["calendar", "market", "monitor", "etf"]
 
 
 def run(kind: Kind, result_path: Path) -> None:
@@ -26,8 +26,10 @@ def run(kind: Kind, result_path: Path) -> None:
             outcome = run_calendar(settings, client, manual=True)
         elif kind == "market":
             outcome = run_market(settings, client)
-        else:
+        elif kind == "monitor":
             outcome = run_monitor(settings, client)
+        else:
+            outcome = run_etf(settings, client)
         result_path.write_text(json.dumps({"outcome": outcome}), encoding="utf-8")
     finally:
         client.close()

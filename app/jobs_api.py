@@ -20,11 +20,11 @@ from app.core.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-Kind = Literal["calendar", "market", "monitor"]
+Kind = Literal["calendar", "market", "monitor", "etf"]
 LOCK_PREFIX = "stock:jobs:v1:lock:"
 # 市场三个源最多约 120 + 120 + 900 秒，另留日历与进程开销。
-JOB_TIMEOUT_SECONDS = {"calendar": 60, "market": 1260, "monitor": 300}
-LOCK_SECONDS = 1320
+JOB_TIMEOUT_SECONDS = {"calendar": 60, "market": 1380, "monitor": 300, "etf": 120}
+LOCK_SECONDS = 1440
 RELEASE_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
   return redis.call('del', KEYS[1])

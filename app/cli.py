@@ -7,7 +7,7 @@ import redis
 import uvicorn
 
 from app.core.config import get_settings
-from app.workflows import run_calendar, run_market, run_monitor
+from app.workflows import run_calendar, run_etf, run_market, run_monitor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ def main() -> int:
     collect.add_argument("--force", action="store_true", help="主动触发，但不绕过风控")
     subparsers.add_parser("calendar-refresh", help="刷新共享交易日历")
     subparsers.add_parser("monitor-sample", help="执行一次个股采样")
+    subparsers.add_parser("etf-collect", help="执行一次 ETF 行情采集")
     subparsers.add_parser("serve", help="启动健康接口与调度")
     args = parser.parse_args()
     settings = get_settings()
@@ -44,6 +45,8 @@ def main() -> int:
             outcome = run_calendar(settings, client)
         elif args.command == "monitor-sample":
             outcome = run_monitor(settings, client)
+        elif args.command == "etf-collect":
+            outcome = run_etf(settings, client)
         else:
             outcome = run_market(settings, client)
         LOGGER.info("%s 结果: %s", args.command, outcome)
