@@ -7,11 +7,13 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+import redis
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.core.config import Settings
-from app.etf_normalize import asset_allocation, catalog, etf_symbol, profiles
+from app.etf_normalize import asset_allocation, catalog, etf_symbol
+from app.etf_profiles import ProfileBatchError, collect_profiles
 from app.providers.akshare_etf import AkShareEtfProvider
 
 LOGGER = logging.getLogger(__name__)
@@ -19,8 +21,8 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class ProfilesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     symbols: list[str]
-    asOfDate: str
 
 
 class AllocationRequest(BaseModel):
@@ -30,6 +32,7 @@ class AllocationRequest(BaseModel):
 
 def create_etf_router(
     settings: Settings, *, provider_factory: Callable[[], Any] | None = None,
+    redis_factory: Callable[[], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/internal/etf-monitor/v1", tags=["ETF 内部同步"])
 
@@ -69,7 +72,7 @@ def create_etf_router(
             LOGGER.warning("ETF 字典同步失败，异常 %s", type(exc).__name__)
             raise HTTPException(status_code=502, detail="ETF 字典同步失败") from exc
 
-    @router.post("/profiles", summary="同步交易所 ETF 资料")
+    @router.post("/profiles", summary="同步同花顺 ETF 基本资料")
     def profile_list(
         request: ProfilesRequest,
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
@@ -77,28 +80,29 @@ def create_etf_router(
         authorize(x_internal_token)
         symbols = [etf_symbol(value) for value in request.symbols]
         if (not symbols or len(symbols) > 10 or None in symbols
-                or len(set(symbols)) != len(symbols)
-                or not valid_day(request.asOfDate)):
-            raise HTTPException(status_code=422, detail="ETF 代码或统计日期不正确")
-        source = provider()
-        states = {}
-        rows: dict[str, list[dict[str, Any]]] = {}
-        for exchange, method in (("sse", lambda: source.sse_scale(request.asOfDate)),
-                                 ("szse", source.szse_scale)):
-            try:
-                rows[exchange] = method()
-                states[exchange] = "OK"
-            except Exception as exc:
-                LOGGER.warning("ETF %s 资料源失败，异常 %s", exchange, type(exc).__name__)
-                rows[exchange] = []
-                states[exchange] = "ERROR"
-        if all(state == "ERROR" for state in states.values()):
-            raise HTTPException(status_code=502, detail="ETF 资料源均不可用")
-        return {
-            "schemaVersion": 1, "sourceStatus": states,
-            "collectedAt": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
-            "profiles": profiles(rows["sse"], rows["szse"], symbols),
-        }
+                or len(set(symbols)) != len(symbols)):
+            LOGGER.warning(
+                "ETF 资料代码列表校验失败，数量 %d，无效代码 %d，重复代码 %s",
+                len(symbols), symbols.count(None), len(set(symbols)) != len(symbols),
+            )
+            raise HTTPException(status_code=422, detail="ETF 代码列表必须为 1 至 10 个不重复代码")
+        client = None
+        try:
+            client = redis_factory() if redis_factory else redis.Redis.from_url(
+                settings.redis_url.get_secret_value(), decode_responses=True,
+                socket_timeout=5, socket_connect_timeout=5,
+            )
+            return collect_profiles(provider(), client, symbols)
+        except ProfileBatchError as exc:
+            raise HTTPException(status_code=exc.status_code, detail={
+                "message": str(exc), "sourceStatus": exc.states,
+            }) from exc
+        except Exception as exc:
+            LOGGER.warning("ETF 资料批次基础设施失败，异常 %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="ETF 资料批次基础设施不可用") from exc
+        finally:
+            if client is not None:
+                client.close()
 
     @router.post("/asset-allocation", summary="同步雪球基金资产配置")
     def allocation(

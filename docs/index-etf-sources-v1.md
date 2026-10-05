@@ -6,11 +6,10 @@
 | --- | --- | --- | --- |
 | 五只核心指数 | `stock_zh_index_spot_sina` | `vip.stock.finance.sina.com.cn` | 最新点位、涨跌、成交；无可靠逐条源时间 |
 | ETF 字典和交易价格 | `fund_etf_category_sina(symbol="ETF基金")` | `vip.stock.finance.sina.com.cn` | `最新价` 是交易价格；无可靠源时间；不提供可信的 ETF 资金流 |
-| 上交所 ETF 资料 | `fund_etf_scale_sse(date=YYYYMMDD)` | `query.sse.com.cn` | 基金份额由 AKShare 换算为份，源有统计日期 |
-| 深交所 ETF 资料 | `fund_etf_scale_szse()` | `fund.szse.cn` | 原字段“当前规模(份)”转换为基金份额；源列表无统计日期 |
+| ETF 基本资料 | `fund_info_ths(symbol=六位代码)` | `fund.10jqka.com.cn` | 基金全称、类型、投资类型、基金经理、成立日期、业绩比较基准、管理人和托管人；缺字段可空 |
 | 雪球 ETF 资产配置 | `fund_individual_detail_hold_xq` | `danjuanfunds.com` | 仅资产类型仓位比例，不是成份股；总闸默认关闭 |
 
-这五个入口的源代码与受控实测均未调用东方财富。Provider 对请求域名设白名单、超时与请求间隔。AKShare 1.18.97 的深交所接口将 XLSX 原始 bytes 传给 `pandas.read_excel`，当前 pandas 拒绝该参数；隔离子进程内将 bytes 包装成 `BytesIO`，实测返回 1062 行。上交所 2026-09-30 份额接口实测返回 920 行。接口字段和数量会随源站变化，不能视作固定总数。
+固定 AKShare 1.18.97。本地源码审计确认 `fund_info_ths` 使用 `requests.get` 请求 `https://fund.10jqka.com.cn/{symbol}/interduce.html`，返回“字段／值”两列表。Python 调用 AKShare，未修改安装包或另写网页解析器。Provider 只放行已审计域名，资料请求禁止跟随重定向，设置 HTTP 超时并在隔离子进程执行。ETF 基本资料只使用同花顺入口，不调用交易所份额、雪球 basic 或东方财富接口。源码审计与模拟验证不代表所有 ETF 在源站均有可用资料。
 
 核心指数固定为上证指数 `sh000001`、深证成指 `sz399001`、沪深300 `sh000300`、创业板指 `sz399006`、科创50 `sh000688`。五条缺任意一条时整个 `coreIndices` 模块降级，不混合不完整的新批次与旧批次。指数数据包含 `sourceTime:null`；`tradeDateBasis:CALENDAR` 表示交易日期来自日历，`collectedAt` 只表示 Python 获取时间。
 
@@ -26,6 +25,31 @@ Java 将已启用列表写入 `stock:etf-monitor:v1:enabled`，值为按显示�
 
 ## 内部同步接口
 
-所有接口使用 `X-Internal-Token`。`POST /internal/etf-monitor/v1/dictionary` 返回 ETF 字典。`POST /internal/etf-monitor/v1/profiles` 接收 `{ "symbols":["SH510050"], "asOfDate":"20260930" }`，分别查询上交所和深交所，返回已查得资料及两个源的状态；深交所来源不保证统计日期。`POST /internal/etf-monitor/v1/asset-allocation` 接收 `{ "symbol":"SH510050", "reportPeriod":"20260630" }`，仅在 `STOCK_MONITOR_XQ_ENABLED=true` 且令牌已配置时查询，返回资产类型和仓位百分比。
+所有接口使用 `X-Internal-Token`。`POST /internal/etf-monitor/v1/dictionary` 返回新浪 ETF 字典。`POST /internal/etf-monitor/v1/profiles` 只接收 `{ "symbols":["SH510050"] }`，最多 10 个不重复代码；旧 `asOfDate` 字段返回 422。资料不受雪球总闸控制，不加入 120 秒行情采集。
+
+资料响应示例（模拟）：
+
+```json
+{
+  "schemaVersion": 1, "source": "THS", "collectedAt": "2026-10-03T10:00:05+08:00",
+  "profiles": [{
+    "symbol": "SH510050", "code": "510050", "source": "THS",
+    "collectedAt": "2026-10-03T10:00:03+08:00",
+    "fullName": "上证50交易型开放式指数基金", "fundType": "股票型",
+    "investmentType": "指数型", "fundManager": null,
+    "establishedDate": "2004-12-30", "performanceBenchmark": null,
+    "manager": null, "custodian": null
+  }],
+  "sourceStatus": {"SH510050":"OK", "SZ159919":"ERROR", "SH588000":"SKIPPED"}
+}
+```
+
+源表基金代码必须与请求六位代码一致；冲突、空表、字段结构变化或全部资料字段为空时，该 symbol 为 `ERROR`。每个 profile 的 `collectedAt` 是该次获取及标准化时间；Java 使用它作为公开 `updatedAt`。顶层 `collectedAt` 是批次完成时间。成立日期仅为 `establishedDate`，基金经理仅为 `fundManager`，基金管理人是 `manager`；业绩比较基准不推断跟踪指数。资料不再提供 `listingStatus/listingDate/shareCount/shareDate`，Java 成功切换时清空旧字段，失败时保留原资料。
+
+Python 按 symbol 对资料请求限制每 30 分钟一次（失败尝试也计入），串行源请求至少间隔 2 秒，批次总预算 180 秒。未尝试的预算／限频项目标记 `SKIPPED`；部分有效返回 HTTP 200 和逐 symbol 状态。全部无有效资料返回 502，全部限频跳过返回 429，批次锁冲突返回 409，基础设施不可用返回 503，不能以空列表覆盖旧资料。
+
+Python 自己持有 `stock:etf-monitor:v1:profiles:python:lock`（210 秒）和 `stock:etf-monitor:v1:profiles:python:min-interval:SYMBOL`（1800 秒），只用于资料批次。Java 复用整体刷新锁；Python 不获取或释放 Java 的锁，防止 Java 持锁调用时自锁。行情快照、键和事件不变。Java 同步等待预算：dictionary 60 秒、profiles 210 秒、allocation 120 秒；前端整体请求 300 秒。
+
+`POST /internal/etf-monitor/v1/asset-allocation` 接收 `{ "symbol":"SH510050", "reportPeriod":"20260630" }`，仅在 `STOCK_MONITOR_XQ_ENABLED=true` 且令牌已配置时查询，返回资产类型和仓位百分比。
 
 手动任务为 `POST /internal/jobs/v1/etf/refresh`，在交易窗口内遵守交易日历、Redis 锁、120 秒间隔与源冷却。可直接运行 `python -m app etf-collect` 作同等采样。交易时间外返回跳过，不用工作日猜测交易日。

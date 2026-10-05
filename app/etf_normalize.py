@@ -1,4 +1,4 @@
-"""新浪 ETF 行情、交易所份额和雪球资产配置的纯转换。"""
+"""新浪 ETF 行情、同花顺基金资料和雪球资产配置的纯转换。"""
 
 import math
 import re
@@ -20,14 +20,21 @@ def _number(raw: Any) -> float | None:
 
 def _text(raw: Any) -> str | None:
     value = str(raw).strip() if raw is not None else ""
-    return value if value and value.lower() not in {"nan", "nat", "none", "<na>"} else None
+    return value if value and value.lower() not in {
+        "nan", "nat", "none", "<na>", "-", "--", "暂无", "暂无数据",
+    } else None
 
 
 def _date(raw: Any) -> str | None:
     if raw is None:
         return None
     try:
-        return date.fromisoformat(str(raw)[:10]).isoformat()
+        value = str(raw).strip().replace("年", "-").replace("月", "-").replace("日", "")
+        value = value.replace("/", "-").replace(".", "-")
+        parts = value.split("-")
+        if len(parts) == 3:
+            return date(*map(int, parts)).isoformat()
+        return date.fromisoformat(value).isoformat()
     except ValueError:
         return None
 
@@ -91,32 +98,35 @@ def quote_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return quotes
 
 
-def profiles(sse_rows: list[dict[str, Any]], szse_rows: list[dict[str, Any]],
-             symbols: list[str]) -> list[dict[str, Any]]:
-    requested = set(symbols)
-    result: dict[str, dict[str, Any]] = {}
-    for exchange, rows in (("SSE", sse_rows), ("SZSE", szse_rows)):
-        for row in rows:
-            code = _text(row.get("基金代码"))
-            if not code or not re.fullmatch(r"\d{6}", code):
-                continue
-            symbol = ("SH" if exchange == "SSE" else "SZ") + code
-            if symbol not in requested:
-                continue
-            result[symbol] = {
-                "symbol": symbol, "code": code, "name": _text(row.get("基金简称")),
-                "exchange": exchange,
-                "etfType": _text(row.get("ETF类型") or row.get("基金类别")),
-                "shareCount": _number(row.get("基金份额")),
-                "shareDate": _date(row.get("统计日期")),
-                "manager": _text(row.get("基金管理人")),
-                "custodian": _text(row.get("基金托管人")),
-                "listingDate": _date(row.get("上市日期")),
-                "trackingIndexCode": None, "trackingIndexName": None,
-                "source": "AKShare.fund_etf_scale_sse" if exchange == "SSE"
-                          else "AKShare.fund_etf_scale_szse",
-            }
-    return [result[symbol] for symbol in symbols if symbol in result]
+def ths_profile(rows: list[dict[str, Any]], symbol: str,
+                collected_at: str) -> dict[str, Any]:
+    """转换同花顺字段/值表，先核实源基金代码，再接受可空资料。"""
+    if not rows or any("字段" not in row or "值" not in row for row in rows):
+        raise ValueError("同花顺基金资料字段变化或为空")
+    fields: dict[str, str | None] = {}
+    for row in rows:
+        key = (_text(row["字段"]) or "").rstrip(":：").strip()
+        value = _text(row["值"])
+        if key in fields and fields[key] != value:
+            raise ValueError("同花顺基金资料重复字段冲突")
+        fields[key] = value
+    if fields.get("基金代码") != symbol[2:]:
+        raise ValueError("同花顺返回基金代码不匹配")
+    profile = {
+        "symbol": symbol, "code": symbol[2:], "source": "THS",
+        "collectedAt": collected_at,
+        "fullName": fields.get("基金全称"), "fundType": fields.get("基金类型"),
+        "investmentType": fields.get("投资类型"), "fundManager": fields.get("基金经理"),
+        "establishedDate": _date(fields.get("成立日期")),
+        "performanceBenchmark": fields.get("业绩比较基准"),
+        "manager": fields.get("基金管理人"), "custodian": fields.get("基金托管人"),
+    }
+    if not any(profile[field] is not None for field in (
+        "fullName", "fundType", "investmentType", "fundManager", "establishedDate",
+        "performanceBenchmark", "manager", "custodian",
+    )):
+        raise ValueError("同花顺基金资料无有效字段")
+    return profile
 
 
 def asset_allocation(rows: list[dict[str, Any]], symbol: str,

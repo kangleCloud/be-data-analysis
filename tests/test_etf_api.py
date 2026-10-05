@@ -4,8 +4,14 @@ from fastapi.testclient import TestClient
 
 from app.core.config import load_settings
 from app.main import create_app
+from tests.test_snapshot import FakeRedis
 
 HEADERS = {"X-Internal-Token": "service-secret"}
+
+
+class RedisClient(FakeRedis):
+    def close(self):
+        pass
 
 
 class Source:
@@ -16,14 +22,12 @@ class Source:
         self.calls.append("quotes")
         return [{"代码": "sh510050", "名称": "50ETF", "最新价": "2.5"}]
 
-    def sse_scale(self, date):
-        self.calls.append(("sse", date))
-        return [{"基金代码": "510050", "基金简称": "50ETF", "ETF类型": "股票型",
-                 "统计日期": "2026-09-30", "基金份额": 120000}]
-
-    def szse_scale(self):
-        self.calls.append("szse")
-        return []
+    def profile(self, code, *, budget_seconds):
+        self.calls.append(("ths", code))
+        assert 0 < budget_seconds <= 180
+        return [{"字段": "基金代码", "值": code},
+                {"字段": "基金全称", "值": "上证50交易型开放式指数基金"},
+                {"字段": "成立日期", "值": "2004-12-30"}]
 
     def asset_allocation(self, code, period):
         self.calls.append(("allocation", code, period))
@@ -34,7 +38,7 @@ def test_etf_dictionary_and_profiles_use_audited_fields():
     source = Source()
     settings = load_settings({"STOCK_MONITOR_INTERNAL_TOKEN": "service-secret"})
     client = TestClient(create_app(scheduler_enabled=False, settings=settings,
-                                   etf_factory=lambda: source))
+                                   etf_factory=lambda: source, redis_factory=RedisClient))
     assert client.post("/internal/etf-monitor/v1/dictionary").status_code == 401
     response = client.post("/internal/etf-monitor/v1/dictionary", headers=HEADERS)
     assert response.status_code == 200
@@ -43,12 +47,17 @@ def test_etf_dictionary_and_profiles_use_audited_fields():
     assert etf["listingStatus"] is None
     assert etf["trackingIndexCode"] is None
     response = client.post("/internal/etf-monitor/v1/profiles", headers=HEADERS,
-                           json={"symbols": ["SH510050"], "asOfDate": "20260930"})
+                           json={"symbols": ["SH510050"]})
     assert response.status_code == 200
     profile = response.json()["profiles"][0]
-    assert profile["shareCount"] == 120000
+    assert profile["fullName"] == "上证50交易型开放式指数基金"
+    assert profile["establishedDate"] == "2004-12-30"
+    assert profile["source"] == "THS"
+    assert profile["collectedAt"].endswith("+08:00")
+    assert response.json()["sourceStatus"] == {"SH510050": "OK"}
+    assert not {"listingDate", "listingStatus", "shareCount", "shareDate"} & profile.keys()
     assert "price" not in profile
-    assert source.calls == ["quotes", ("sse", "20260930"), "szse"]
+    assert source.calls == ["quotes", ("ths", "510050")]
 
 
 def test_asset_allocation_disabled_gate_does_not_call_source():

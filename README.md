@@ -19,6 +19,8 @@ python -m app serve
 
 交易日历通过 AKShare 新浪接口独立刷新后缓存在 Redis DB 2；启动时补建，每月 1 日北京时间 00:10 常规刷新，失败自动重试每天最多一次。缓存未覆盖当天时不会凭工作日推断交易日，市场快照降级、个股跳过。`python -m app calendar-refresh` 可手动触发受限频保护的自动刷新。受保护的同步手动任务接口见 [交易日历与内部任务 V1](docs/trading-calendar-jobs-v1.md)。
 
+本机 scheduler 使用 `/scheduler/api/local/market-data/v1` 下的八个固定 POST 业务入口，真实回环直连无需令牌；Java 调用 Python 内部接口仍需 `X-Internal-Token`。八项映射、同步结果与等待上限见上述文档。
+
 ## 服务器容器部署
 
 在服务器的 `be-data-analysis` 目录准备 `.env`（参考 `.env.example`），其中 `REDIS_URL` 必须是容器可访问的地址；宿主机 Redis 可使用 `redis://host.docker.internal`，并通过 `REDIS_PORT`、`REDIS_DB` 指定端口和库。然后执行：
@@ -40,7 +42,7 @@ tail -f /data/logs/be-data-analysis/service.log
 
 个股监控 V1 使用独立的交易所股票字典和雪球资料/报价。`STOCK_MONITOR_XQ_ENABLED` 默认 `false`；关闭时自动调度和手动 `python -m app monitor-sample` 均不访问雪球，资料接口也拒绝调用。明确开启且配置 `XUEQIU_TOKEN` 后，服务在交易日盘中每两分钟对 Redis enabled 清单中的最多 10 只股票采样。配置、接口样例、Redis 键及频控见 [个股监控 V1](docs/stock-monitor-v1.md)。
 
-市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、交易所基金资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/index-etf-sources-v1.md)。
+市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、同花顺基金基本资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。同花顺资料独立同步，不受雪球总闸限制，采用 30 分钟资料限频与 180 秒批次预算。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/index-etf-sources-v1.md)。
 
 同花顺三组即时接口没有可靠源交易日期或源时间；快照的 `tradeDate` 仅依据交易日历，`lastSuccessAt` 和市场曲线的 `collectedAt` 是采集时间。
 

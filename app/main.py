@@ -1,10 +1,13 @@
 """健康接口与服务内采集调度。"""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 
 from app.core import msg
 from app.core.config import Settings, get_settings
@@ -16,6 +19,7 @@ from app.scheduler import run_scheduler
 from app.stock_monitor_api import create_monitor_router
 from app.stock_monitor_scheduler import run_monitor_scheduler
 
+LOGGER = logging.getLogger(__name__)
 
 def create_app(
     *, scheduler_enabled: bool = True, settings: Settings | None = None,
@@ -48,11 +52,28 @@ def create_app(
                         await running
 
     application = FastAPI(title="be-data-analysis", version="1.0.0", lifespan=lifespan)
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path == "/internal/etf-monitor/v1/profiles":
+            reasons = []
+            for error in exc.errors():
+                location = ".".join(
+                    str(part) if isinstance(part, int) or part in {"body", "symbols", "asOfDate"}
+                    else "<其他字段>"
+                    for part in error["loc"]
+                )
+                reasons.append(f"{location}: {error['type']}")
+            LOGGER.warning("ETF 资料请求格式校验失败，%s", "; ".join(reasons))
+        return await request_validation_exception_handler(request, exc)
+
     application.include_router(create_monitor_router(
         configured, exchange_factory=exchange_factory,
         xq_factory=xq_factory, redis_factory=redis_factory,
     ))
-    application.include_router(create_etf_router(configured, provider_factory=etf_factory))
+    application.include_router(create_etf_router(
+        configured, provider_factory=etf_factory, redis_factory=redis_factory,
+    ))
     application.include_router(create_jobs_router(
         configured, redis_factory=redis_factory, runner=job_runner,
     ))

@@ -22,7 +22,7 @@ AKShare 全量日期在写入前逐项严格验证，然后只保留 `year` 对�
 
 ## 内部手动任务
 
-所有接口均要求现有 `X-Internal-Token`。`kind` 只接受 `calendar`、`market`、`monitor`：
+Python 内部接口均要求现有 `X-Internal-Token`。`kind` 只接受 `calendar`、`market`、`monitor`、`etf`；该内部路由供 Java 调用，与本机 scheduler 的固定业务路径不同：
 
 ```http
 POST /internal/jobs/v1/market/refresh
@@ -37,6 +37,27 @@ X-Internal-Token: <内部令牌>
 
 终态为 `SUCCEEDED`、`PARTIAL`、`SKIPPED` 或 `FAILED`；`outcome` 记录 `published`、`partial`、`skipped`、`throttled`、`locked`、`cooldown`、`disabled`、`failed` 等具体业务结果。同类任务运行中再次触发不排队，立即返回 HTTP 409，响应体为相同结构且 `state=SKIPPED,outcome=locked`。日历限频、市场冷却等返回 HTTP 200、`SKIPPED` 及对应 `outcome`；源刷新失败返回 HTTP 200、`FAILED`。子进程、Redis 或运行超时等基础设施故障返回 HTTP 500 或 503、`FAILED`，不会伪装成成功。接口不提供任务号或状态查询。
 
-市场任务在独立 Python 进程中执行，避免 AKShare 的 `SIGALRM` 超时逻辑在线程池运行。服务等待三个同花顺源的最坏超时和日历开销，上限 1260 秒；日历与个股任务分别限制为 60 秒和 300 秒。调用方的请求超时应高于 1260 秒。
+市场任务在独立 Python 进程中执行，避免 AKShare 的 `SIGALRM` 超时逻辑在线程池运行。服务等待同花顺和新浪指数源及日历开销，上限 1380 秒；日历、个股行情与 ETF 行情任务分别限制为 60、300、120 秒。调用方的请求超时应高于对应上限，市场请求建议至少等待 1440 秒。
 
-三个手动任务与 CLI/自动调度调用同一业务流程。市场与个股手动触发不能绕过交易时段、日历缓存、分布式锁、120 秒请求间隔、源冷却或雪球总闸；日历可在任意时间手动刷新，但受独立锁和间隔限制。
+四个手动任务与 CLI/自动调度调用同一业务流程。市场、个股及 ETF 行情手动触发不能绕过交易时段、日历缓存、分布式锁、120 秒请求间隔或源冷却；个股雪球行情另受总闸控制，新浪 ETF 行情不受雪球总闸影响。日历可在任意时间手动刷新，但受独立锁和 10 分钟间隔限制。
+
+## 本机 scheduler 与 Python 业务映射
+
+Java 本机入口前缀为 `POST /scheduler/api/local/market-data/v1`，下挂八个固定路径；HTTP 不通过 `kind` 参数选择任务。本机入口仅接受真实回环直连并拒绝转发头，无需登录或令牌。Java 调用以下 Python 内部入口时仍须携带 `X-Internal-Token`。本机访问控制由 Java 实现，不能据此省略 Python 的认证。
+
+| scheduler 后缀 | Python POST 路径 | Python 方法与同步结果 |
+| --- | --- | --- |
+| `/stock/dictionary/refresh` | `/internal/stock-monitor/v1/exchange-dictionary` | `ExchangeStockProvider.all_a_stocks()`；`{schemaVersion,stocks}` |
+| `/stock/profiles/refresh` | `/internal/stock-monitor/v1/profiles` | `XueqiuProvider.profile()`，必要时 `quote()` 补市值；`{schemaVersion,profiles}` |
+| `/calendar/refresh` | `/internal/jobs/v1/calendar/refresh` | `run_calendar(manual=True)`；任务终态包；60 秒 |
+| `/market/refresh` | `/internal/jobs/v1/market/refresh` | `run_market()`；任务终态包；1380 秒 |
+| `/stock/quotes/refresh` | `/internal/jobs/v1/monitor/refresh` | `run_monitor()`；任务终态包；300 秒 |
+| `/etf/dictionary/refresh` | `/internal/etf-monitor/v1/dictionary` | `AkShareEtfProvider.quotes()` → `catalog()`；`{schemaVersion,source,collectedAt,etfs}` |
+| `/etf/profiles/refresh` | `/internal/etf-monitor/v1/profiles` | `fund_info_ths(六位代码)` → `ths_profile()`；`{schemaVersion,source:THS,sourceStatus,collectedAt,profiles}` |
+| `/etf/quotes/refresh` | `/internal/jobs/v1/etf/refresh` | `run_etf()`；任务终态包；120 秒 |
+
+字典／资料接口同步返回数据包，由 Java 业务服务完成持久化并返回业务结果；它们不返回 `kind/state/outcome`。四个任务接口返回前述终态包，不创建 `jobId`。资料请求只传 `symbols`，最多 10 个。ETF 同花顺资料不受雪球总闸控制。ETF 资产配置是独立内部接口 `/internal/etf-monitor/v1/asset-allocation`，不属于这八个固定入口；只有雪球总闸开启且令牌已配置时才可调用。
+
+交易所股票字典每个 HTTP 请求使用 `SOURCE_TIMEOUT_SECONDS`；股票资料最多逐只调用 profile 和 quote，调用间隔至少一秒。ETF 同花顺资料批次总预算 180 秒、逐 symbol 30 分钟限频、源请求至少间隔 2 秒，Java 等待 210 秒；ETF 字典及资产配置等待预算分别为 60、120 秒。Java 的数据同步等待时间须覆盖整个批次，不能套用单次 HTTP 请求超时。资料批次锁由 Python 独立持有，Java 整体刷新锁归 Java，两者不竞争同一个键。
+
+字典和同花顺 ETF 资料同步不写行情快照、曲线或发布行情事件；普通大屏 GET 刷新仅读快照，实时更新继续使用 SSE 和自动重同步。管理端与定时整体刷新仍可复用这些业务方法。
