@@ -13,7 +13,7 @@
 ## 构建、测试与开发命令
 
 - `python3 -m venv .venv && source .venv/bin/activate`：创建并激活虚拟环境。
-- `pip install -r requirements.txt`：安装运行与测试依赖。
+- `pip install -r requirements-dev.txt`：安装本地运行与测试依赖；生产镜像只安装 `requirements.txt`。
 - `set -a && source .env.example && set +a`：加载本地示例配置。
 - `python -m app collect`：执行一轮采集并退出。
 - `python -m app probe`：只读检查大盘资金流源数据日期。

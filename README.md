@@ -6,7 +6,7 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 
 - Python 3.12
 - Redis，需与 `be-vita` 连接同一个实例和 DB 2
-- `pip install -r requirements.txt`
+- 本地开发与测试：`pip install -r requirements-dev.txt`；生产镜像只安装 `requirements.txt` 中的运行依赖
 - 配置参考 `.env.example`。本地可在被 Git 忽略的 `.env` 中分别设置 `REDIS_URL`、`REDIS_PASSWORD`、`REDIS_PORT` 和 `REDIS_DB`；生产连接参数通过运行环境注入
 
 ```bash
@@ -23,7 +23,7 @@ python -m app serve
 
 ## 服务器容器部署
 
-在服务器的 `be-data-analysis` 目录准备 `.env`（参考 `.env.example`），其中 `REDIS_URL` 必须是容器可访问的地址；宿主机 Redis 可使用 `redis://host.docker.internal`，并通过 `REDIS_PORT`、`REDIS_DB` 指定端口和库。然后执行：
+在服务器的 `be-data-analysis` 目录准备 `.env.prod`（参考 `.env.example`），其中 `REDIS_URL` 必须是容器可访问的地址；宿主机 Redis 可使用 `redis://host.docker.internal`，并通过 `REDIS_PORT`、`REDIS_DB` 指定端口和库。Compose 通过 `env_file` 自动将 `.env.prod` 配置注入运行容器；配置文件由 `.dockerignore` 排除，不进入镜像。然后执行：
 
 ```bash
 sudo install -d -o 10001 -g 10001 -m 0755 /data/logs/be-data-analysis
@@ -33,6 +33,8 @@ tail -f /data/logs/be-data-analysis/service.log
 ```
 
 `compose.yaml` 将宿主机 `/data/logs/be-data-analysis/` 挂载到容器 `/app/logs/`。服务与定时采集子进程的标准输出、错误和 Uvicorn 日志都写入 `service.log`。容器以 UID/GID 10001 运行，因此宿主机日志目录须对该用户可写。应用端口映射为宿主机 18000 到容器 8000；`compose.yaml` 中的 `SERVICE_PORT` 固定容器监听端口为 8000。查看服务状态用 `docker compose ps`，重启用 `docker compose restart`。
+
+生产镜像不安装 `pytest/httpx` 测试依赖，测试目录也不进入构建上下文。修改 `.env.prod` 后执行 `docker compose up -d` 重新创建容器以加载新配置；`restart` 不重新读取 env 文件。
 
 日志轮转配置见 `deploy/logrotate.conf`，可复制到服务器 `/etc/logrotate.d/be-data-analysis`。配置使用 `copytruncate`，无需重启服务即可轮转正在写入的文件。
 

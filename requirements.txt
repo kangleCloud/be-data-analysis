@@ -4,5 +4,3 @@ requests
 fastapi
 uvicorn
 pydantic
-pytest
-httpx
