@@ -26,8 +26,17 @@ python -m app serve
 在服务器的 `be-data-analysis` 目录准备 `.env.prod`（参考 `.env.example`），其中 `REDIS_URL` 必须是容器可访问的地址；宿主机 Redis 可使用 `redis://host.docker.internal`，并通过 `REDIS_PORT`、`REDIS_DB` 指定端口和库。Compose 通过 `env_file` 自动将 `.env.prod` 配置注入运行容器；配置文件由 `.dockerignore` 排除，不进入镜像。然后执行：
 
 ```bash
-sudo install -d -o 10001 -g 10001 -m 0755 /data/logs/be-data-analysis
-docker compose up -d --build
+# 允许构建阶段使用宿主机网络，并加载镜像到本地
+docker buildx bake \
+  -f docker-compose.yml \
+  --allow=network.host \
+  --load \
+  --progress=plain \
+  be-data-analysis
+
+# 使用构建好的镜像启动
+docker compose up -d --no-build
+
 curl -f http://127.0.0.1:18000/health
 tail -f /data/logs/be-data-analysis/service.log
 ```
