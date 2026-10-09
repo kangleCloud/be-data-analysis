@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+from tests.test_snapshot import FakeRedis
 
 import app.main as main_module
 from app.scheduler import launch_slot, next_slot
@@ -51,6 +52,27 @@ def test_serve_lifespan_starts_and_stops_scheduler(monkeypatch):
 
     monkeypatch.setattr(main_module, "run_scheduler", fake_scheduler)
     monkeypatch.setattr(main_module, "run_calendar_scheduler", lambda _settings: fake_scheduler())
-    with TestClient(main_module.create_app()) as client:
+    with TestClient(main_module.create_app(redis_factory=FakeRedis)) as client:
         assert client.get("/health").status_code == 200
     assert events == ["start", "start", "stop", "stop"]
+
+
+def test_cancelled_worker_is_terminated_killed_and_reaped(monkeypatch):
+    from app.process_wait import wait_worker
+    events = []
+    class Process:
+        async def wait(self):
+            events.append('wait')
+            if len(events) == 1:
+                raise asyncio.CancelledError()
+            if 'kill' not in events:
+                raise asyncio.TimeoutError()
+            return -9
+        def terminate(self):
+            events.append('term')
+        def kill(self):
+            events.append('kill')
+    import pytest
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(wait_worker(Process()))
+    assert events == ['wait', 'term', 'wait', 'kill', 'wait']

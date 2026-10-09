@@ -5,12 +5,15 @@ import logging
 import math
 import re
 import time
-from datetime import date, datetime, time as day_time
+from datetime import date, datetime, timedelta, time as day_time
 from typing import Any, Protocol
+from contextlib import closing
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from app.providers.xueqiu import XueqiuSourceError
+from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, completed, source_batch
+import redis
 from app.monitor_events import monitor_event_lock
 
 
@@ -177,7 +180,7 @@ class MonitorStore:
         return bool(self.client.exists(XQ_COOLDOWN_KEY))
 
     def start_cooldown(self) -> None:
-        self.client.set(XQ_COOLDOWN_KEY, "1", ex=COOLDOWN_SECONDS)
+        self.client.set(XQ_COOLDOWN_KEY, "1", ex=COOLDOWN_SECONDS, nx=True)
 
     def quote(self, symbol: str) -> dict[str, Any] | None:
         raw = self.client.get(f"{QUOTE_PREFIX}{symbol}")
@@ -236,12 +239,12 @@ class TradingCalendar(Protocol):
 
 class StockMonitorSampler:
     def __init__(self, store: MonitorStore, source: QuoteSource, calendar: TradingCalendar,
-                 *, xq_enabled: bool = False, request_interval_seconds: float = 1.0) -> None:
+                 *, xq_enabled: bool = False) -> None:
         self.store, self.source, self.calendar = store, source, calendar
         self.xq_enabled = xq_enabled
-        self.request_interval_seconds = request_interval_seconds
 
     def sample(self, at: datetime) -> str:
+        started = time.monotonic()
         if not self.xq_enabled:
             return "disabled"
         local = at.astimezone(SHANGHAI)
@@ -268,64 +271,80 @@ class StockMonitorSampler:
                             self._mark_failed(stock["symbol"], local)
                 return "cooldown"
             failures = 0
-            last_request: float | None = None
-            for index, stock in enumerate(stocks):
+            candidates = []
+            for stock in stocks:
                 symbol = stock["symbol"]
                 if close_retry and self._close_confirmed(symbol, local.date()):
                     continue
-                if last_request is not None:
-                    remaining = self.request_interval_seconds - (time.monotonic() - last_request)
-                    if remaining > 0:
-                        time.sleep(remaining)
-                if not self.store.reserve_request(symbol):
+                if getattr(self.source, "executor", None) is None and not self.store.reserve_request(symbol):
                     if close_retry:
                         self._mark_failed(symbol, local)
                     continue
-                last_request = time.monotonic()
-                try:
-                    quote = normalize_quote(symbol, self.source.quote(symbol), local)
-                    source_time = datetime.fromisoformat(quote["sourceTime"])
-                    previous = self.store.quote(symbol)
-                    previous_time = _source_time(previous.get("sourceTime")) if previous else None
-                    if source_time.date() > local.date():
-                        raise QuoteValidationError("source_date_in_future", "time")
-                    if source_time.date() < local.date():
-                        self._preserve_stale(
-                            symbol, quote, previous, local, "source_previous_date"
-                        )
+                def fetch(code: str = symbol) -> dict[str, Any]:
+                    if self.store.cooldown_active():
+                        raise SourceCoolingError(self.store.client.ttl(XQ_COOLDOWN_KEY))
+                    return self.source.quote(code)
+                candidates.append((symbol, "xq", fetch))
+            with source_batch(self.source, (SAMPLE_LOCK_KEY, token), started+300), closing(
+                completed(candidates, source=self.source)
+            ) as results:
+                for symbol, raw, error, finished_at in results:
+                    if self.store.client.get(SAMPLE_LOCK_KEY) != token:
+                        raise SourceControlError("业务任务锁已失效")
+                    try:
+                        if error:
+                            raise error
+                        completed_at = local + timedelta(seconds=finished_at-started)
+                        quote = normalize_quote(symbol, raw, completed_at)
+                        source_time = datetime.fromisoformat(quote["sourceTime"])
+                        previous = self.store.quote(symbol)
+                        previous_time = _source_time(previous.get("sourceTime")) if previous else None
+                        if source_time.date() > local.date():
+                            raise QuoteValidationError("source_date_in_future", "time")
+                        if source_time.date() < local.date():
+                            self._preserve_stale(symbol, quote, previous, local, "source_previous_date")
+                            continue
+                        if previous_time and previous_time > source_time:
+                            self._preserve_stale(symbol, quote, previous, local, "source_older_than_cache")
+                            continue
+                        if close_retry and source_time.time() <= day_time(15):
+                            self._preserve_stale(symbol, quote, previous, local, "close_not_confirmed")
+                            continue
+                        if previous_time == source_time:
+                            self._preserve_stale(symbol, quote, previous, local, "source_unchanged")
+                            continue
+                    except SourceThrottledError as exc:
+                        LOGGER.info("雪球报价 %s 限频跳过，剩余 TTL %d 秒", symbol, exc.ttl)
+                        if close_retry:
+                            self._mark_failed(symbol, local)
                         continue
-                    if previous_time and previous_time > source_time:
-                        self._preserve_stale(
-                            symbol, quote, previous, local, "source_older_than_cache"
-                        )
+                    except SourceNotStartedError:
+                        failures += 1
+                        LOGGER.info("雪球报价 %s 预算结束，未发起源请求", symbol)
+                        self._mark_failed(symbol, local)
                         continue
-                    if close_retry and source_time.time() <= day_time(15):
-                        self._preserve_stale(
-                            symbol, quote, previous, local, "close_not_confirmed"
-                        )
+                    except SourceCoolingError as exc:
+                        failures += 1
+                        LOGGER.info("雪球报价 %s 冷却跳过，剩余 TTL %d 秒", symbol, exc.ttl)
+                        self._mark_failed(symbol, local)
                         continue
-                    if previous_time == source_time:
-                        self._preserve_stale(
-                            symbol, quote, previous, local, "source_unchanged"
-                        )
+                    except Exception as exc:
+                        if isinstance(exc, (SourceControlError, redis.RedisError)):
+                            raise
+                        failures += 1
+                        reason = exc.reason if isinstance(exc, QuoteValidationError) else (
+                            "source_error" if isinstance(exc, XueqiuSourceError) else "unexpected_error")
+                        field = exc.field if isinstance(exc, QuoteValidationError) else "none"
+                        LOGGER.warning("雪球报价 %s 失败，原因 %s，字段 %s，异常 %s，采集日期 %s",
+                                       symbol, reason, field, type(exc).__name__, local.date().isoformat())
+                        self._mark_failed(symbol, local)
+                        if isinstance(exc, XueqiuSourceError) and exc.cooldown:
+                            self.store.start_cooldown()
                         continue
+                    # 业务写入失败直接退出，关闭结果迭代器后回收在途源进程。
+                    if self.store.client.get(SAMPLE_LOCK_KEY) != token:
+                        raise SourceControlError("业务任务锁已失效")
                     self.store.write_quote(quote, append_point=True)
-                except Exception as exc:
-                    failures += 1
-                    reason = exc.reason if isinstance(exc, QuoteValidationError) else (
-                        "source_error" if isinstance(exc, XueqiuSourceError) else "unexpected_error"
-                    )
-                    field = exc.field if isinstance(exc, QuoteValidationError) else "none"
-                    LOGGER.warning(
-                        "雪球报价 %s 失败，原因 %s，字段 %s，异常 %s，采集日期 %s",
-                        symbol, reason, field, type(exc).__name__, local.date().isoformat(),
-                    )
-                    self._mark_failed(symbol, local)
-                    if isinstance(exc, XueqiuSourceError) and exc.cooldown:
-                        self.store.start_cooldown()
-                        for pending in stocks[index + 1:]:
-                            self._mark_failed(pending["symbol"], local)
-                        break
             return "partial" if failures else "published"
         finally:
             self.store.release(token)

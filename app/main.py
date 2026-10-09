@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Callable
 
@@ -11,6 +14,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 
 from app.core import msg
 from app.core.config import Settings, get_settings
+from app.core.logging import log_failure
 from app.calendar_scheduler import run_calendar_scheduler
 from app.etf_api import create_etf_router
 from app.etf_scheduler import run_etf_scheduler
@@ -80,7 +84,22 @@ def create_app(
 
     @application.get("/health", tags=["系统接口"], summary="服务健康检查")
     def health():
-        return msg.ok({"status": "ok"}, message="服务正常")
+        client = None
+        try:
+            client = redis_factory() if redis_factory else redis.Redis.from_url(
+                configured.redis_url.get_secret_value(), decode_responses=True,
+                socket_timeout=1, socket_connect_timeout=1, retry_on_timeout=False,
+                retry=Retry(NoBackoff(), 0),
+            )
+            if not client.ping():
+                return msg.fail(503, "Redis 不可用", {"status": "unavailable"})
+            return msg.ok({"status": "ok"}, message="服务正常")
+        except Exception as exc:
+            log_failure(LOGGER, "health", exc)
+            return msg.fail(503, "Redis 不可用", {"status": "unavailable"})
+        finally:
+            if client is not None:
+                client.close()
 
     return application
 

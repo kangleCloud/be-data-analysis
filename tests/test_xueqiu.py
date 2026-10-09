@@ -46,8 +46,8 @@ def test_akshare_quote_and_profile_pass_explicit_token_timeout_and_map_fields():
     }
     assert source.profile("SH600000") == {"industry": "银行", "list_date": "1999-11-10"}
     assert calls == [
-        ("spot", {"symbol": "SH600000", "token": "private-token", "timeout": 13}),
-        ("basic", {"symbol": "SH600000", "token": "private-token", "timeout": 13}),
+        ("spot", {"symbol": "SH600000", "token": "private-token", "timeout": (5, 13)}),
+        ("basic", {"symbol": "SH600000", "token": "private-token", "timeout": (5, 13)}),
     ]
     assert "private-token" not in repr(source)
 

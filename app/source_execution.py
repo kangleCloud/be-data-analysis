@@ -1,0 +1,475 @@
+"""独立源进程、跨入口配额与 HTTP 启动间隔；业务写入始终由调用父进程完成。"""
+
+import logging
+import multiprocessing as mp
+import os
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from queue import Empty
+from typing import Any, Callable, Iterator
+from uuid import uuid4
+from urllib.parse import urlparse
+
+import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+
+from app.providers.http import bounded_timeout, error_metadata, quiet_progress
+
+LOGGER = logging.getLogger(__name__)
+PREFIX = "stock:source-control:v1:"
+LEASE_SECONDS = 30
+RENEW_SECONDS = 10
+CLEANUP_SECONDS = 2
+GROUPS = {"ths", "sina", "xq", "sse", "szse", "bse"}
+ACQUIRE_SCRIPT = """
+local g, s = nil, nil
+for i=1,4 do if redis.call('exists', KEYS[i]) == 0 then g=i; break end end
+for i=5,6 do if redis.call('exists', KEYS[i]) == 0 then s=i; break end end
+if not g or not s then return {} end
+redis.call('set', KEYS[g], ARGV[1], 'EX', ARGV[2])
+redis.call('set', KEYS[s], ARGV[1], 'EX', ARGV[2])
+return {g,s}
+"""
+RENEW_SCRIPT = """
+if redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('get', KEYS[2]) ~= ARGV[1] then return 0 end
+redis.call('expire', KEYS[1], ARGV[2]); redis.call('expire', KEYS[2], ARGV[2]); return 1
+"""
+RELEASE_SCRIPT = """
+for i=1,2 do if redis.call('get', KEYS[i]) == ARGV[1] then redis.call('del', KEYS[i]) end end
+return 1
+"""
+TASK_RENEW_SCRIPT = """
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('expire', KEYS[1], ARGV[2])
+"""
+RATE_SCRIPT = """
+if redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('get', KEYS[2]) ~= ARGV[1] then return {-1,0} end
+if ARGV[4] ~= '' and redis.call('get', KEYS[5]) ~= ARGV[4] then return {-1,0} end
+for i=7,#KEYS do if redis.call('exists', KEYS[i]) == 1 then return {-2,redis.call('ttl', KEYS[i])} end end
+local interval = tonumber(ARGV[5])
+local owner = interval > 0 and redis.call('get', KEYS[6]) or false
+if owner and owner ~= ARGV[1] then return {-3,redis.call('ttl', KEYS[6])} end
+local t=redis.call('TIME'); local now=t[1]*1000+math.floor(t[2]/1000)
+local a=tonumber(redis.call('get', KEYS[3]) or '0')
+local b=tonumber(redis.call('get', KEYS[4]) or '0')
+local remaining=math.max(a,b)-now
+if remaining > 0 then return {0,remaining} end
+if interval > 0 and not owner then redis.call('set', KEYS[6], ARGV[1], 'EX', interval) end
+redis.call('set', KEYS[3], now+tonumber(ARGV[2]), 'PX', 30000)
+redis.call('set', KEYS[4], now+tonumber(ARGV[3]), 'PX', 30000)
+return {1,0}
+"""
+
+
+class SourceControlError(RuntimeError):
+    """配额、业务锁或 Redis 控制失效；停止整轮而不是继续源请求。"""
+
+
+class SourceCoolingError(RuntimeError):
+    def __init__(self, ttl: int) -> None:
+        self.ttl = ttl
+        super().__init__("数据源冷却中")
+
+
+class SourceNotStartedError(TimeoutError):
+    """尚未发起实际 HTTP 请求即耗尽预算；跳过而不是源失败。"""
+
+
+class SourceThrottledError(RuntimeError):
+    def __init__(self, ttl: int) -> None:
+        self.ttl = ttl
+        super().__init__("当前代码请求间隔未满足")
+
+
+class SourceCallError(RuntimeError):
+    """跨进程仅传递可脱敏的异常类别，不传原始响应或 Token。"""
+    def __init__(self, metadata: dict[str, Any]) -> None:
+        self.exception_type = metadata["exception_type"]
+        self.root_type = metadata["root_type"]
+        self.http_status = metadata["http_status"]
+        self.category = metadata["category"]
+        super().__init__(f"type={self.exception_type} root={self.root_type} "
+                         f"http={self.http_status} category={self.category}")
+
+
+@dataclass(frozen=True)
+class SourceCall:
+    function: str
+    group: str
+    parameters: dict[str, Any] = field(default_factory=dict, repr=False)
+    budget_seconds: float = 32
+    domains: tuple[str, ...] = ()
+    cooldown_keys: tuple[str, ...] = ()
+    cooldown_policy: str = "none"
+    fund_profile: bool = False
+    interval_key: str | None = None
+    interval_seconds: int = 120
+
+
+class SourceControl:
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def acquire(self, group: str, token: str) -> tuple[str, str] | None:
+        keys = [f"{PREFIX}slot:global:{i}" for i in range(4)] + [
+            f"{PREFIX}slot:{group}:{i}" for i in range(2)]
+        result = self.client.eval(ACQUIRE_SCRIPT, len(keys), *keys, token, LEASE_SECONDS)
+        return (keys[result[0]-1], keys[result[1]-1]) if result else None
+
+    def renew(self, keys: tuple[str, str], token: str) -> None:
+        if not self.client.eval(RENEW_SCRIPT, 2, *keys, token, LEASE_SECONDS):
+            raise SourceControlError("源调用配额已失效")
+
+    def release(self, keys: tuple[str, str], token: str) -> None:
+        self.client.eval(RELEASE_SCRIPT, 2, *keys, token)
+
+    def check(self, keys: tuple[str, str], token: str,
+              guard: tuple[str, str] | None = None) -> None:
+        if any(self.client.get(key) != token for key in keys):
+            raise SourceControlError("源调用配额已失效")
+        if guard is not None and self.client.get(guard[0]) != guard[1]:
+            raise SourceControlError("业务任务锁已失效")
+
+    def request_turn(self, call: SourceCall, keys: tuple[str, str], token: str,
+                     guard: tuple[str, str] | None, deadline: float) -> None:
+        interval = 0.2 if call.group == "sina" else 1
+        rate_keys = [f"{PREFIX}rate:{call.group}",
+                     f"{PREFIX}rate:ths:fund" if call.fund_profile else f"{PREFIX}rate:{call.group}"]
+        all_keys = [*keys, *rate_keys, guard[0] if guard else f"{PREFIX}no-guard",
+                    call.interval_key or f"{PREFIX}no-interval", *call.cooldown_keys]
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("源调用预算已耗尽")
+            status, value = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
+                                             int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
+                                             guard[1] if guard else "", call.interval_seconds if call.interval_key else 0)
+            if status == -1:
+                raise SourceControlError("源配额或业务锁已失效")
+            if status == -2:
+                raise SourceCoolingError(value)
+            if status == -3:
+                raise SourceThrottledError(value)
+            if status == 1:
+                return
+            time.sleep(min(0.1, value / 1000, max(0, deadline-time.monotonic())))
+
+    def cool(self, call: SourceCall, metadata: dict[str, Any]) -> None:
+        status = metadata["http_status"]
+        seconds = None
+        if call.cooldown_policy == "market" and (
+            status in {403, 429} or metadata["category"] in {"NETWORK", "TIMEOUT"}
+            or call.group == "ths" and metadata["exception_type"] in {"AttributeError", "IndexError"}
+        ):
+            seconds = 7200
+        elif call.cooldown_policy == "etf":
+            seconds = 7200 if status in {403, 429} else 300
+        elif call.cooldown_policy == "stock" and (status in {401, 403, 429}
+                or metadata["exception_type"] == "RateLimitError" or metadata["category"] == "AUTH_REJECTED"):
+            seconds = 7200
+        if seconds and call.cooldown_keys:
+            self.client.set(call.cooldown_keys[0], "1", ex=seconds, nx=True)
+
+
+def _client(url: str) -> redis.Redis:
+    return redis.Redis.from_url(url, decode_responses=True, socket_timeout=1,
+                                socket_connect_timeout=1, retry=Retry(NoBackoff(), 0))
+
+
+@contextmanager
+def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, str], token: str,
+                    guard: tuple[str, str] | None, deadline: float, read_seconds: float,
+                    started_event: Any = None) -> Iterator[None]:
+    """Session.send 覆盖 get/post、雪球会话、重定向，每次物理 HTTP 都先取共享速率许可。"""
+    import requests
+    original = requests.Session.send
+    def send(session: Any, request: Any, **kwargs: Any) -> Any:
+        if urlparse(request.url).hostname not in call.domains:
+            raise SourceControlError("源请求域名不在审计清单中")
+        control.request_turn(call, keys, token, guard, deadline)
+        remaining = max(0.001, deadline - time.monotonic())
+        connect, read = bounded_timeout(kwargs.get("timeout"), read_seconds)
+        kwargs["timeout"] = (min(connect, remaining), min(read, remaining))
+        if call.fund_profile:
+            kwargs["allow_redirects"] = False
+        try:
+            if started_event is not None:
+                started_event.set()
+            response = original(session, request, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            control.cool(call, error_metadata(exc))
+            raise
+    requests.Session.send = send
+    try:
+        yield
+    finally:
+        requests.Session.send = original
+
+
+def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str], token: str,
+                   guard: tuple[str, str] | None, deadline: float, read_seconds: float, parent_pid: int,
+                   started_event: Any) -> None:
+    client = _client(url)
+    control = SourceControl(client)
+    stopped = threading.Event()
+    def watchdog() -> None:
+        while not stopped.wait(0.5):
+            try:
+                if os.getppid() != parent_pid or time.monotonic() >= deadline:
+                    os._exit(70)
+                control.check(keys, token, guard)
+            except Exception:
+                os._exit(70)
+    watcher = threading.Thread(target=watchdog, daemon=True)
+    watcher.start()
+    try:
+        # 初始化、等待和清理均在父进程确定的同一个截止时间内。
+        import akshare
+        os.environ["TZ"] = "Asia/Shanghai"
+        time.tzset()
+        with controlled_http(control, call, keys, token, guard, deadline, read_seconds, started_event), quiet_progress():
+            function = getattr(akshare, call.function)
+            clear = getattr(function, "cache_clear", None)
+            if clear:
+                clear()
+            frame = function(**call.parameters)
+        queue.put(("ok", frame))
+    except SourceThrottledError as exc:
+        queue.put(("throttled", exc.ttl))
+    except SourceCoolingError as exc:
+        queue.put(("cooldown", exc.ttl))
+    except SourceControlError:
+        queue.put(("control", None))
+    except redis.RedisError:
+        queue.put(("control", None))
+    except Exception as exc:
+        metadata = error_metadata(exc)
+        # AKShare 的 APIError/NetworkError 可能没有 requests.response。
+        if isinstance(getattr(exc, "status_code", None), int):
+            metadata["http_status"] = exc.status_code
+            metadata["category"] = "HTTP_REJECTED" if exc.status_code in {401,403,429} else "HTTP_ERROR"
+        if type(exc).__name__ == "APIError" and any(word in str(exc).lower() for word in ("token", "login")):
+            metadata["category"] = "AUTH_REJECTED"
+        if type(exc).__name__ == "NetworkError":
+            metadata["category"] = "NETWORK"
+        try:
+            if started_event.is_set() or metadata["category"] != "TIMEOUT":
+                control.cool(call, metadata)
+        except redis.RedisError:
+            queue.put(("control", None))
+        else:
+            queue.put(("error", metadata))
+    finally:
+        stopped.set()
+        watcher.join(timeout=0.6)
+        client.close()
+
+
+class SourceExecutor:
+    """父进程等待/续租/回收独立 spawn 源进程，不写任何业务快照。"""
+    def __init__(self, redis_url: str, read_seconds: float = 15, *, client: Any = None,
+                 context: Any = None, worker: Callable[..., None] = _source_worker) -> None:
+        self.redis_url, self.read_seconds = redis_url, read_seconds
+        self.control = SourceControl(client if client is not None else _client(redis_url))
+        self.context = context or mp.get_context("spawn")
+        self.worker = worker
+        self.cancelled = threading.Event()
+        self.guard: tuple[str, str] | None = None
+        self.deadline: float | None = None
+
+    @classmethod
+    def configured(cls, read_seconds: float | None = None) -> "SourceExecutor":
+        from app.core.config import get_settings
+        settings = get_settings()
+        return cls(settings.redis_url.get_secret_value(),
+                   settings.source_timeout_seconds if read_seconds is None else read_seconds)
+
+    @contextmanager
+    def batch(self, guard: tuple[str, str] | None = None,
+              deadline: float | None = None) -> Iterator[None]:
+        self.cancelled.clear()
+        self.guard, self.deadline = guard, deadline
+        stop_renewal = threading.Event()
+        thread = None
+        if guard is not None:
+            seconds = self.control.client.ttl(guard[0])
+            if seconds <= 0 or self.control.client.get(guard[0]) != guard[1]:
+                raise SourceControlError("业务任务锁已失效")
+            def renew_task() -> None:
+                while not stop_renewal.wait(RENEW_SECONDS):
+                    try:
+                        if not self.control.client.eval(TASK_RENEW_SCRIPT, 1, guard[0], guard[1], seconds):
+                            self.cancelled.set()
+                            return
+                    except Exception:
+                        self.cancelled.set()
+                        return
+            thread = threading.Thread(target=renew_task, daemon=True)
+            thread.start()
+        try:
+            yield
+        finally:
+            self.cancelled.set()
+            stop_renewal.set()
+            if thread is not None:
+                thread.join(timeout=1.2)
+            self.guard, self.deadline = None, None
+
+    def stop(self) -> None:
+        self.cancelled.set()
+
+    def _check(self) -> None:
+        if self.cancelled.is_set():
+            raise SourceControlError("源批次已取消")
+        if self.guard and self.control.client.get(self.guard[0]) != self.guard[1]:
+            raise SourceControlError("业务任务锁已失效")
+
+    def call(self, call: SourceCall) -> Any:
+        if call.group not in GROUPS:
+            raise ValueError("未知来源组")
+        started = time.monotonic()
+        deadline = started + call.budget_seconds
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
+        request_deadline = deadline - CLEANUP_SECONDS
+        token = uuid4().hex
+        keys = None
+        queue = process = None
+        requested = self.context.Event()
+        try:
+            while keys is None:
+                self._check()
+                if time.monotonic() >= request_deadline:
+                    raise SourceNotStartedError("等待源配额超过预算，尚未发起请求")
+                for key in call.cooldown_keys:
+                    if self.control.client.exists(key):
+                        raise SourceCoolingError(self.control.client.ttl(key))
+                keys = self.control.acquire(call.group, token)
+                if keys is None:
+                    time.sleep(min(0.1, max(0, request_deadline-time.monotonic())))
+            queue = self.context.Queue()
+            process = self.context.Process(target=self.worker, args=(queue, self.redis_url, call, keys, token,
+                self.guard, request_deadline, self.read_seconds, os.getpid(), requested), daemon=True)
+            process.start()
+            renewed = time.monotonic()
+            while True:
+                self._check()
+                self.control.check(keys, token, self.guard)
+                now = time.monotonic()
+                if now >= request_deadline:
+                    if not requested.is_set():
+                        raise SourceNotStartedError("源预算结束，尚未发起请求")
+                    raise TimeoutError("源调用超过预算")
+                if now - renewed >= RENEW_SECONDS:
+                    self.control.renew(keys, token)
+                    renewed = now
+                try:
+                    status, result = queue.get(timeout=min(0.1, request_deadline-now))
+                    break
+                except Empty:
+                    if not process.is_alive():
+                        if time.monotonic() >= request_deadline:
+                            if not requested.is_set():
+                                raise SourceNotStartedError("源预算结束，尚未发起请求")
+                            raise TimeoutError("源调用超过预算")
+                        raise SourceControlError("源子进程提前退出")
+            self._check()
+            self.control.check(keys, token, self.guard)
+            if status == "throttled":
+                raise SourceThrottledError(result)
+            if status == "cooldown":
+                raise SourceCoolingError(result)
+            if status == "control":
+                raise SourceControlError("源请求控制失效")
+            if status != "ok":
+                if result["category"] == "TIMEOUT" and not requested.is_set():
+                    raise SourceNotStartedError("源预算结束，尚未发起请求")
+                raise SourceCallError(result)
+            return result
+        except BaseException:
+            if process is not None:
+                self._reap(process, deadline)
+                process = None
+            raise
+        finally:
+            if process is not None:
+                self._reap(process, deadline)
+            if queue is not None:
+                queue.close()
+            if keys is not None:
+                self.control.release(keys, token)
+            LOGGER.info("源 %s 总耗时 %.2f 秒", call.function, time.monotonic()-started)
+
+    @staticmethod
+    def _reap(process: Any, deadline: float) -> None:
+        if getattr(process, "pid", None) is None:
+            return
+        deadline = min(deadline, time.monotonic() + CLEANUP_SECONDS)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=max(0, deadline-time.monotonic()-1))
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=max(0, deadline-time.monotonic()))
+        if process.is_alive():
+            raise SourceControlError("源进程未完成回收，拒绝释放名额")
+        process.join(timeout=0)
+
+
+@contextmanager
+def source_batch(source: Any, guard: tuple[str, str] | None = None,
+                 deadline: float | None = None) -> Iterator[None]:
+    executor = getattr(source, "executor", None)
+    if executor is None:
+        yield
+    else:
+        with executor.batch(guard, deadline):
+            yield
+
+
+def completed(actions: list[tuple[str, str, Callable[[], Any]]], *, source: Any = None,
+              limit: int = 4) -> Iterator[tuple[str, Any, Exception | None, float]]:
+    """有限候选按配置顺序准入，来源最多两路；只在父线程交付完成结果。"""
+    def invoke(function: Callable[[], Any]) -> tuple[Any, Exception | None, float]:
+        try:
+            return function(), None, time.monotonic()
+        except Exception as exc:
+            return None, exc, time.monotonic()
+    candidates = list(actions)
+    running = {}
+    executor = getattr(source, "executor", None)
+    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="source-wait") as pool:
+        try:
+            while candidates or running:
+                groups = [group for _, group in running.values()]
+                for action in list(candidates):
+                    key, group, function = action
+                    if len(running) >= limit:
+                        break
+                    if groups.count(group) >= 2:
+                        continue
+                    candidates.remove(action)
+                    running[pool.submit(invoke, function)] = (key, group)
+                    groups.append(group)
+                if not running:
+                    break
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                # 同一轮多个已完成结果仍按配置顺序，避免不可复现的合并顺序。
+                for future in sorted(done, key=lambda item: next(i for i,a in enumerate(actions) if a[0] == running[item][0])):
+                    if executor is not None:
+                        executor._check()
+                    key, _ = running.pop(future)
+                    value, error, finished_at = future.result()
+                    if isinstance(error, (SourceControlError, redis.RedisError)):
+                        raise error
+                    yield key, value, error, finished_at
+        finally:
+            if executor is not None:
+                executor.stop()
+            for future in running:
+                future.cancel()

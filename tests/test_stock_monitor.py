@@ -133,7 +133,8 @@ def test_cooldown_stops_remaining_symbols_and_keeps_stale_data(monkeypatch):
     source.fail = True
     client.advance(120)
     assert sampler.sample(AT.replace(minute=34)) == "partial"
-    assert source.calls == ["SH600000"]
+    assert set(source.calls) <= {"SH600000", "SZ000001"}
+    assert "SH600000" in source.calls
     for stock in STOCKS:
         quote = json.loads(client.get(f"{QUOTE_PREFIX}{stock['symbol']}"))
         assert quote["status"] == "STALE"
@@ -230,7 +231,8 @@ def test_close_retries_throttle_same_symbol_and_expire_at_1510(monkeypatch):
     monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
     assert sampler.sample(AT.replace(hour=15, minute=2)) == "published"
     assert sampler.sample(AT.replace(hour=15, minute=2, second=30)) == "published"
-    assert source.calls == ["SH600000"]
+    assert set(source.calls) <= {"SH600000", "SZ000001"}
+    assert "SH600000" in source.calls
     for minute in (4, 6, 8, 10):
         client.advance(120)
         assert sampler.sample(AT.replace(hour=15, minute=minute)) == "published"
@@ -466,3 +468,58 @@ def test_1456_quote_does_not_confirm_close_at_1502():
     assert quote["status"] == "STALE"
     assert not sampler._close_confirmed("SH600000", AT.date())
     assert client.get(f"{SERIES_PREFIX}2026-09-28:SH600000") is None
+
+
+def test_collected_at_includes_calendar_and_candidate_preparation(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr('app.stock_monitor.time.monotonic', lambda: clock[0])
+    class SlowCalendar:
+        def day_status(self, today, at):
+            clock[0] += 7
+            return True
+    class SlowSource(QuoteSource):
+        def quote(self, symbol):
+            clock[0] += 3
+            return super().quote(symbol)
+    client, source = RedisClient(), SlowSource()
+    client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
+    store = MonitorStore(client)
+    assert StockMonitorSampler(store, source, SlowCalendar(), xq_enabled=True).sample(AT) == 'published'
+    assert store.quote(STOCKS[0]['symbol'])['collectedAt'] == '2026-09-28T09:32:10+08:00'
+
+
+def test_mid_batch_cooldown_is_partial_not_false_published():
+    from app.source_execution import SourceCoolingError
+    class CoolingSource(QuoteSource):
+        def quote(self, symbol):
+            raise SourceCoolingError(7080)
+    client = RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS))
+    assert StockMonitorSampler(MonitorStore(client), CoolingSource(), Calendar(), xq_enabled=True).sample(AT) == 'partial'
+    assert not any(key.startswith(SERIES_PREFIX) for key in client.values)
+
+
+def test_quote_business_write_failure_stops_later_candidates():
+    import threading
+    import pytest
+    entered, release = threading.Event(), threading.Event()
+    class Source(QuoteSource):
+        def quote(self, symbol):
+            self.calls.append(symbol)
+            if symbol == STOCKS[0]['symbol']:
+                assert entered.wait(timeout=2)
+            else:
+                entered.set()
+                assert release.wait(timeout=2)
+            return {'time':self.time, 'current':10.2, 'percent':1.2, 'amount':100}
+    source, client = Source(), RedisClient()
+    client.set(ENABLED_KEY, json.dumps(STOCKS+[{'symbol':'SH600001','code':'600001','name':'测试','market':'SH'}]))
+    store = MonitorStore(client)
+    def fail_write(*args, **kwargs):
+        release.set()
+        raise ConnectionError('业务事务失败')
+    store.write_quote = fail_write
+    with pytest.raises(ConnectionError):
+        StockMonitorSampler(store, source, Calendar(), xq_enabled=True).sample(AT)
+    assert set(source.calls) == {item['symbol'] for item in STOCKS}
+    assert not any(event[0] == 'publish' for event in client.events)

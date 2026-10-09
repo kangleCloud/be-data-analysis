@@ -2,12 +2,7 @@
 
 import argparse
 import logging
-
-import redis
-import uvicorn
-
-from app.core.config import get_settings
-from app.workflows import run_calendar, run_etf, run_market, run_monitor
+import time
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,14 +16,28 @@ def main() -> int:
     subparsers.add_parser("monitor-sample", help="执行一次个股采样")
     subparsers.add_parser("etf-collect", help="执行一次 ETF 行情采集")
     subparsers.add_parser("serve", help="启动健康接口与调度")
+    sources = subparsers.add_parser("sources", help="只读输出第三方数据源说明，不检测源健康")
+    sources.add_argument("--json", action="store_true", help="输出完整静态元数据 JSON")
     args = parser.parse_args()
+    if args.command == "sources":
+        from app.source_catalog import render_sources
+        print(render_sources(as_json=args.json))
+        return 0
+
+    import redis
+    import uvicorn
+    from app.core.config import get_settings
+    from app.core.logging import configure_logging, log_failure, server_log_config
+    from app.workflows import run_calendar, run_etf, run_market, run_monitor
+
     settings = get_settings()
-    logging.basicConfig(level=settings.service_log_level.upper())
+    configure_logging(settings.service_log_level, args.command)
 
     if args.command == "serve":
         uvicorn.run(
             "app.main:app", host=settings.service_host,
             port=settings.service_port, log_level=settings.service_log_level,
+            log_config=server_log_config(),
         )
         return 0
 
@@ -36,11 +45,13 @@ def main() -> int:
         LOGGER.info("雪球生产采集已关闭，跳过个股采样")
         return 0
 
-    client = redis.Redis.from_url(
-        settings.redis_url.get_secret_value(), decode_responses=True,
-        socket_timeout=5, socket_connect_timeout=5,
-    )
+    started = time.monotonic()
+    client = None
     try:
+        client = redis.Redis.from_url(
+            settings.redis_url.get_secret_value(), decode_responses=True,
+            socket_timeout=5, socket_connect_timeout=5,
+        )
         if args.command == "calendar-refresh":
             outcome = run_calendar(settings, client)
         elif args.command == "monitor-sample":
@@ -54,8 +65,10 @@ def main() -> int:
             "refreshed", "published", "skipped", "throttled", "locked",
             "cooldown", "disabled",
         } else 1
-    except Exception:
-        LOGGER.exception("%s 失败", args.command)
+    except Exception as exc:
+        log_failure(LOGGER, args.command, exc)
         return 1
     finally:
-        client.close()
+        if client is not None:
+            client.close()
+        LOGGER.info("任务 %s 总耗时 %.2f 秒", args.command, time.monotonic() - started)

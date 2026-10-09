@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest
 httpx
+fakeredis[lua]>=2,<3

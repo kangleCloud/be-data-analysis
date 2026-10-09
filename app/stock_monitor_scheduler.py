@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import sys
+
+from app.process_wait import wait_worker
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,5 +41,5 @@ async def run_monitor_scheduler() -> None:
             LOGGER.info("跳过错过的个股采样时段: %s", slot.isoformat())
             continue
         process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app", "monitor-sample")
-        code = await process.wait()
+        code = await wait_worker(process)
         LOGGER.info("个股采样时段 %s 子进程退出: %s", slot.isoformat(), code)

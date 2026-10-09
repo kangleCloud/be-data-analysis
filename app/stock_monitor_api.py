@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Any, Callable
+from contextlib import closing
 from zoneinfo import ZoneInfo
 
 import redis
@@ -12,6 +13,8 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from app.core.config import Settings
+from app.source_execution import SourceExecutor, completed, source_batch
+from app.stock_monitor import SAMPLE_LOCK_KEY
 from app.providers.exchange_stocks import ExchangeStockProvider
 from app.providers.xueqiu import XueqiuProvider, XueqiuSourceError
 from app.stock_monitor import MonitorStore, normalize_profile, valid_symbol
@@ -56,7 +59,8 @@ def create_monitor_router(
     ) -> dict[str, Any]:
         authorize(x_internal_token)
         source = exchange_factory() if exchange_factory else ExchangeStockProvider(
-            settings.source_timeout_seconds
+            settings.source_timeout_seconds,
+            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
         )
         try:
             return {"schemaVersion": 1, "stocks": source.all_a_stocks()}
@@ -89,30 +93,26 @@ def create_monitor_router(
                 raise HTTPException(status_code=409, detail="雪球采集任务正在运行")
             try:
                 source = xq_factory() if xq_factory else XueqiuProvider(
-                    token, settings.source_timeout_seconds
+                    token, settings.source_timeout_seconds,
+                    executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
                 )
-                result = []
-                last_call: float | None = None
-
-                def pace() -> None:
-                    nonlocal last_call
-                    if last_call is not None:
-                        remaining = 1 - (time.monotonic() - last_call)
-                        if remaining > 0:
-                            time.sleep(remaining)
-                    last_call = time.monotonic()
-
-                for symbol in symbols:
-                    pace()
+                def fetch(symbol: str) -> dict[str, Any]:
                     raw_profile = source.profile(symbol)
                     updated_at = datetime.now(SHANGHAI)
                     profile = normalize_profile(symbol, raw_profile, None, updated_at)
                     if profile["marketCap"] is None:
-                        pace()
-                        profile = normalize_profile(
-                            symbol, raw_profile, source.quote(symbol), updated_at
-                        )
-                    result.append(profile)
+                        profile = normalize_profile(symbol, raw_profile, source.quote(symbol), datetime.now(SHANGHAI))
+                    return profile
+                actions = [(symbol, "xq", lambda code=symbol: fetch(code)) for symbol in symbols]
+                profiles_by_symbol = {}
+                with source_batch(source, (SAMPLE_LOCK_KEY, lock), time.monotonic()+600), closing(
+                    completed(actions, source=source)
+                ) as results:
+                    for symbol, profile, error, finished_at in results:
+                        if error:
+                            raise error
+                        profiles_by_symbol[symbol] = profile
+                result = [profiles_by_symbol[symbol] for symbol in symbols]
                 return {"schemaVersion": 1, "profiles": result}
             finally:
                 store.release(lock)

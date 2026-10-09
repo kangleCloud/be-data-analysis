@@ -3,12 +3,15 @@
 import asyncio
 import logging
 import sys
+
+from app.process_wait import wait_worker
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import redis
 
 from app.core.config import Settings
+from app.core.logging import log_failure
 from app.workflows import calendar_service
 
 LOGGER = logging.getLogger(__name__)
@@ -42,8 +45,8 @@ def _bootstrap(settings: Settings) -> None:
 async def run_calendar_scheduler(settings: Settings) -> None:
     try:
         await asyncio.to_thread(_bootstrap, settings)
-    except Exception:
-        LOGGER.exception("交易日历启动检查失败")
+    except Exception as exc:
+        log_failure(LOGGER, "calendar-bootstrap", exc)
     while True:
         now = datetime.now(SHANGHAI)
         slot = next_monthly_slot(now)
@@ -54,5 +57,5 @@ async def run_calendar_scheduler(settings: Settings) -> None:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "app", "calendar-refresh"
         )
-        code = await process.wait()
+        code = await wait_worker(process)
         LOGGER.info("交易日历月初刷新退出: %s", code)

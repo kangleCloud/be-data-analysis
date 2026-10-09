@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import sys
+
+from app.process_wait import wait_worker
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -23,5 +25,5 @@ async def run_etf_scheduler() -> None:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "app", "etf-collect"
         )
-        code = await process.wait()
+        code = await wait_worker(process)
         LOGGER.info("ETF 采样时段 %s 子进程退出: %s", slot.isoformat(), code)

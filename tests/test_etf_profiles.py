@@ -84,7 +84,7 @@ def test_partial_success_spacing_and_30minute_per_symbol_limit(clock):
     source.fail.add("159919")
     result = collect_profiles(source, client, ["SH510050", "SZ159919"])
     assert result["sourceStatus"] == {"SH510050": "OK", "SZ159919": "ERROR"}
-    assert [call[1] for call in source.calls] == [0, 2]
+    assert [call[1] for call in source.calls] == [0, 0]
     assert [row["symbol"] for row in result["profiles"]] == ["SH510050"]
     assert client.get(LOCK_KEY) is None
     with pytest.raises(ProfileBatchError) as error:
@@ -167,3 +167,19 @@ def test_422_logs_field_and_reason_without_request_values(caplog):
     assert response.status_code == 422
     assert "数量 1，无效代码 1，重复代码 False" in caplog.text
     assert "invalid-symbol" not in caplog.text
+
+
+def test_no_http_budget_skip_releases_code_reservation_and_preserves_order(clock):
+    from app.source_execution import SourceNotStartedError
+    class NoRequestSource(Source):
+        def profile(self, code, *, budget_seconds):
+            if code == '510050':
+                raise SourceNotStartedError('quota wait ended')
+            return rows(code)
+    client = RedisClient()
+    result = collect_profiles(NoRequestSource(clock), client, ['SH510050', 'SZ159919'])
+    assert list(result['sourceStatus']) == ['SH510050','SZ159919']
+    assert result['sourceStatus'] == {'SH510050':'SKIPPED','SZ159919':'OK'}
+    assert client.get(INTERVAL_PREFIX+'SH510050') is None
+    assert client.get(INTERVAL_PREFIX+'SZ159919') is not None
+    assert [item['symbol'] for item in result['profiles']] == ['SZ159919']

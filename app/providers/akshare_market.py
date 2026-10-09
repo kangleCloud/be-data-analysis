@@ -1,157 +1,60 @@
-"""AKShare 市场看板接口适配。"""
+"""市场源调用在独立进程中执行；标准化及发布由采集父进程完成。"""
 
-import signal
-import time
 import logging
-from contextlib import contextmanager, nullcontext
-from typing import Any, Iterator, Protocol
-from urllib.parse import urlparse
+import time
+from typing import Any, Protocol
 
-import requests
+from app.providers.http import error_metadata
+from app.source_execution import SourceCall, SourceExecutor, SourceCoolingError
 
 LOGGER = logging.getLogger(__name__)
 THS_SECTOR_TIMEOUT_SECONDS = 120
 THS_INDIVIDUAL_TIMEOUT_SECONDS = 900
-THS_REQUEST_INTERVAL_SECONDS = 1
 SINA_INDEX_TIMEOUT_SECONDS = 120
-SINA_REQUEST_INTERVAL_SECONDS = 0.2
-
-
-def _root_exception_name(exc: BaseException) -> str:
-    """只记录底层异常类型，避免把请求参数写进日志。"""
-    seen: set[int] = set()
-    while id(exc) not in seen:
-        seen.add(id(exc))
-        nested = exc.__cause__ or exc.__context__
-        if nested is None:
-            nested = next((arg for arg in exc.args if isinstance(arg, BaseException)), None)
-        if nested is None:
-            break
-        exc = nested
-    return type(exc).__name__
 
 
 class MarketSource(Protocol):
     def sector_fund_flow(self, sector_type: str) -> Any: ...
-
     def market_fund_flow(self) -> Any: ...
-
     def index_spot(self) -> Any: ...
 
 
-@contextmanager
-def _deadline(seconds: int) -> Iterator[None]:
-    """限制单次 AKShare 调用时长，避免采集无限占用锁。"""
-    def timeout_handler(_signum: int, _frame: Any) -> None:
-        raise TimeoutError("数据源调用超时")
-
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    old_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, *old_timer)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
 class AkShareMarketProvider:
-    """只暴露 V1 需要的 AKShare 接口，便于测试替换。"""
-
-    def __init__(self, timeout_seconds: int) -> None:
-        import akshare
-
-        self._akshare = akshare
+    def __init__(self, timeout_seconds: int, *, executor: Any = None, api: Any = None) -> None:
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds))
+        self._akshare = api
         self._timeout_seconds = timeout_seconds
-        self._last_ths_request_at: float | None = None
-        self._last_sina_request_at: float | None = None
 
-    @contextmanager
-    def _paced_ths(self) -> Iterator[None]:
-        """只在独立采集进程内约束同花顺分页请求间隔。"""
-        original_get = requests.get
-
-        def paced_get(url: str, *args: Any, **kwargs: Any) -> Any:
-            if "data.10jqka.com.cn" in url:
-                if self._last_ths_request_at is not None:
-                    remaining = THS_REQUEST_INTERVAL_SECONDS - (
-                        time.monotonic() - self._last_ths_request_at
-                    )
-                    if remaining > 0:
-                        time.sleep(remaining)
-                self._last_ths_request_at = time.monotonic()
-                kwargs.setdefault("timeout", self._timeout_seconds)
-            return original_get(url, *args, **kwargs)
-
-        requests.get = paced_get
-        try:
-            yield
-        finally:
-            requests.get = original_get
-
-    @contextmanager
-    def _paced_sina(self) -> Iterator[None]:
-        """指数分页仅放行已审计的新浪域名，并限制请求速率。"""
-        original_get = requests.get
-
-        def paced_get(url: str, *args: Any, **kwargs: Any) -> Any:
-            if urlparse(url).hostname != "vip.stock.finance.sina.com.cn":
-                raise RuntimeError("指数源请求了未审计域名")
-            if self._last_sina_request_at is not None:
-                remaining = SINA_REQUEST_INTERVAL_SECONDS - (
-                    time.monotonic() - self._last_sina_request_at
-                )
-                if remaining > 0:
-                    time.sleep(remaining)
-            self._last_sina_request_at = time.monotonic()
-            kwargs.setdefault("timeout", self._timeout_seconds)
-            return original_get(url, *args, **kwargs)
-
-        requests.get = paced_get
-        try:
-            yield
-        finally:
-            requests.get = original_get
-
-    def _call(
-        self, function: Any, *, timeout_seconds: int | None = None,
-        pace_ths: bool = False, pace_sina: bool = False, **kwargs: str
-    ) -> Any:
+    def _call(self, function: str, *, budget: float, group: str,
+              module: str, **parameters: Any) -> Any:
         started = time.monotonic()
-        name = getattr(function, "__name__", "unknown")
         try:
-            pacing = self._paced_ths() if pace_ths else self._paced_sina() if pace_sina else nullcontext()
-            with _deadline(timeout_seconds or self._timeout_seconds), pacing:
-                result = function(**kwargs)
-            LOGGER.info("接口 %s 成功，耗时 %.2f 秒", name, time.monotonic() - started)
+            if self._akshare is not None:
+                result = getattr(self._akshare, function)(**parameters)
+            else:
+                source = "ths" if group == "ths" else "sina-index"
+                result = self.executor.call(SourceCall(function, group, parameters, budget,
+                    ("data.10jqka.com.cn",) if group == "ths" else ("vip.stock.finance.sina.com.cn",),
+                    (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{module}"), "market"))
+            LOGGER.info("接口 %s 成功，耗时 %.2f 秒", function, time.monotonic()-started)
             return result
+        except SourceCoolingError as exc:
+            LOGGER.info("接口 %s 冷却跳过，剩余 TTL %d 秒", function, exc.ttl)
+            raise
         except Exception as exc:
-            LOGGER.warning(
-                "接口 %s 失败，耗时 %.2f 秒，异常 %s，底层异常 %s",
-                name, time.monotonic() - started, type(exc).__name__,
-                _root_exception_name(exc),
-            )
+            metadata = error_metadata(exc)
+            LOGGER.warning("接口 %s 失败，耗时 %.2f 秒，异常 %s，底层异常 %s，HTTP %s，分类 %s",
+                           function, time.monotonic()-started, metadata["exception_type"],
+                           metadata["root_type"], metadata["http_status"], metadata["category"])
             raise
 
     def sector_fund_flow(self, sector_type: str) -> Any:
-        function = (
-            self._akshare.stock_fund_flow_industry
-            if sector_type == "industry"
-            else self._akshare.stock_fund_flow_concept
-        )
-        return self._call(
-            function, symbol="即时", timeout_seconds=THS_SECTOR_TIMEOUT_SECONDS,
-            pace_ths=True,
-        )
+        function = "stock_fund_flow_industry" if sector_type == "industry" else "stock_fund_flow_concept"
+        return self._call(function, budget=THS_SECTOR_TIMEOUT_SECONDS, group="ths",
+                          module="industrySectors" if sector_type == "industry" else "conceptSectors", symbol="即时")
 
     def market_fund_flow(self) -> Any:
-        return self._call(
-            self._akshare.stock_fund_flow_individual, symbol="即时",
-            timeout_seconds=THS_INDIVIDUAL_TIMEOUT_SECONDS,
-            pace_ths=True,
-        )
+        return self._call("stock_fund_flow_individual", budget=THS_INDIVIDUAL_TIMEOUT_SECONDS, group="ths", module="marketFundFlow", symbol="即时")
 
     def index_spot(self) -> Any:
-        return self._call(
-            self._akshare.stock_zh_index_spot_sina,
-            timeout_seconds=SINA_INDEX_TIMEOUT_SECONDS, pace_sina=True,
-        )
+        return self._call("stock_zh_index_spot_sina", budget=SINA_INDEX_TIMEOUT_SECONDS, group="sina", module="coreIndices")

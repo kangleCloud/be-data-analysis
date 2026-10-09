@@ -1,65 +1,43 @@
 """从三家交易所清单构造统一 A 股字典。"""
 
-import threading
-from contextlib import contextmanager
-from typing import Any, Iterator
-
-import requests
-
-
-_REQUEST_PATCH_LOCK = threading.Lock()
+from contextlib import closing
+from typing import Any
+from app.source_execution import SourceCall, SourceExecutor, completed, source_batch
 
 
 class ExchangeStockProvider:
-    def __init__(self, timeout_seconds: int = 15, source: Any = None) -> None:
-        if source is None:
-            import akshare
-
-            source = akshare
+    def __init__(self, timeout_seconds: int = 15, source: Any = None, *, executor: Any = None) -> None:
         self._source = source
+        self.executor = executor if executor is not None else (None if source is not None else SourceExecutor.configured(timeout_seconds))
         self._timeout_seconds = timeout_seconds
 
-    @contextmanager
-    def _bounded_requests(self) -> Iterator[None]:
-        """AKShare 部分交易所函数未传超时，仅在互斥调用期间补齐。"""
-        with _REQUEST_PATCH_LOCK:
-            original_get, original_post = requests.get, requests.post
-
-            def bounded_get(*args: Any, **kwargs: Any) -> Any:
-                kwargs.setdefault("timeout", self._timeout_seconds)
-                response = original_get(*args, **kwargs)
-                response.raise_for_status()
-                return response
-
-            def bounded_post(*args: Any, **kwargs: Any) -> Any:
-                kwargs.setdefault("timeout", self._timeout_seconds)
-                response = original_post(*args, **kwargs)
-                response.raise_for_status()
-                return response
-
-            requests.get, requests.post = bounded_get, bounded_post
-            try:
-                yield
-            finally:
-                requests.get, requests.post = original_get, original_post
+    def _frame(self, function: str, group: str, parameters: dict) -> Any:
+        if self._source is not None:
+            method = getattr(self._source, function)
+            clear_cache = getattr(method, "cache_clear", None)
+            if clear_cache:
+                clear_cache()
+            return method(**parameters)
+        host = {"sse": "query.sse.com.cn", "szse": "www.szse.cn", "bse": "www.bse.cn"}[group]
+        return self.executor.call(SourceCall(function, group, parameters, 60, (host,)))
 
     def all_a_stocks(self) -> list[dict[str, str]]:
-        with self._bounded_requests():
-            # AKShare 交易所清单函数有进程内 lru_cache；每日同步必须重新读取源站。
-            for function in (
-                self._source.stock_info_sh_name_code,
-                self._source.stock_info_sz_name_code,
-                self._source.stock_info_bj_name_code,
-            ):
-                clear_cache = getattr(function, "cache_clear", None)
-                if clear_cache is not None:
-                    clear_cache()
-            frames = (
-                ("SH", self._source.stock_info_sh_name_code(symbol="主板A股"), "证券代码", "证券简称"),
-                ("SH", self._source.stock_info_sh_name_code(symbol="科创板"), "证券代码", "证券简称"),
-                ("SZ", self._source.stock_info_sz_name_code(symbol="A股列表"), "A股代码", "A股简称"),
-                ("BJ", self._source.stock_info_bj_name_code(), "证券代码", "证券简称"),
-            )
+        combinations = (
+            ("main", "sse", "stock_info_sh_name_code", {"symbol": "主板A股"}, "SH", "证券代码", "证券简称"),
+            ("star", "sse", "stock_info_sh_name_code", {"symbol": "科创板"}, "SH", "证券代码", "证券简称"),
+            ("sz", "szse", "stock_info_sz_name_code", {"symbol": "A股列表"}, "SZ", "A股代码", "A股简称"),
+            ("bj", "bse", "stock_info_bj_name_code", {}, "BJ", "证券代码", "证券简称"),
+        )
+        actions = [(key, group, lambda f=function,g=group,p=parameters: self._frame(f,g,p))
+                   for key,group,function,parameters,*_ in combinations]
+        results = {}
+        with source_batch(self), closing(completed(actions, source=self)) as completed_results:
+            for key, frame, error, finished_at in completed_results:
+                if error:
+                    raise error
+                results[key] = frame
+        frames = [(market, results[key], code, name)
+                  for key,_,_,_,market,code,name in combinations]
         stocks: dict[str, dict[str, str]] = {}
         for market, frame, code_field, name_field in frames:
             rows = frame.to_dict("records")

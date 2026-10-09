@@ -58,3 +58,22 @@ def test_stock_monitor_is_disabled_by_default_and_tokens_are_secret():
 def test_invalid_number(key, value):
     with pytest.raises(ValueError, match=key):
         load_settings({key: value})
+
+
+@pytest.mark.parametrize("environment", ["dev", "prod"])
+def test_environment_file_selection_and_environment_override(monkeypatch, environment):
+    paths = []
+    def fake_values(path, **kwargs):
+        paths.append(path.name)
+        assert kwargs == {"interpolate": False}
+        return {"REDIS_URL": "file-cache", "REDIS_PORT": "6379", "REDIS_DB": "2",
+                "REDIS_PASSWORD": "literal-$password"}
+    monkeypatch.setattr("app.core.config.dotenv_values", fake_values)
+    monkeypatch.setenv("APP_ENV", environment)
+    monkeypatch.setenv("REDIS_URL", "runtime-cache")
+    for key in ("REDIS_PORT", "REDIS_DB", "REDIS_PASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+    parsed = urlparse(load_settings().redis_url.get_secret_value())
+    assert paths == [f".env.{environment}"]
+    assert parsed.hostname == "runtime-cache"
+    assert unquote(parsed.password) == "literal-$password"

@@ -107,10 +107,10 @@ def test_individual_numeric_code_keeps_leading_zero_stock(market_rows):
 
 def test_individual_partial_amount_or_conflicting_duplicate_is_error(market_rows):
     bad = market_rows.copy()
-    bad.loc[1, "净额"] = "-"
+    bad.loc[1, "流入资金"] = "-"
     with pytest.raises(SourceDataError, match="部分汇总"):
         normalize_individual_aggregate(bad, COLLECTED_AT)
-    conflicting = pd.concat([market_rows, market_rows.iloc[[0]].assign(净额="2亿")])
+    conflicting = pd.concat([market_rows, market_rows.iloc[[0]].assign(流入资金="2亿")])
     with pytest.raises(SourceDataError, match="冲突"):
         normalize_individual_aggregate(conflicting, COLLECTED_AT)
 
@@ -154,3 +154,55 @@ def test_individual_zero_flow_is_valid_and_missing_flow_rejects_batch(market_row
     rows.loc[rows.index[0], "流入资金"] = None
     with pytest.raises(SourceDataError, match="部分汇总"):
         normalize_individual_aggregate(rows, COLLECTED_AT)
+
+
+@pytest.mark.parametrize("net", [None, "-", "not-a-number", float("nan"), float("inf")])
+def test_source_net_is_optional_and_does_not_change_effective_batch(market_rows, net):
+    expected = normalize_individual_aggregate(market_rows, COLLECTED_AT)
+    assert normalize_individual_aggregate(market_rows.assign(净额=net), COLLECTED_AT) == expected
+    assert normalize_individual_aggregate(market_rows.drop(columns="净额"), COLLECTED_AT) == expected
+
+
+def test_source_net_audit_compares_only_same_valid_subset(market_rows, caplog):
+    rows = market_rows.copy()
+    rows.loc[1, "净额"] = "-"
+    with caplog.at_level("INFO"):
+        normalize_individual_aggregate(rows, COLLECTED_AT)
+    assert "源净额与流入减流出存在差异" not in caplog.text
+    rows.loc[0, "净额"] = "0.5亿"
+    with caplog.at_level("INFO"):
+        normalize_individual_aggregate(rows, COLLECTED_AT)
+    assert "样本数 1，差额 -10000000.00 元" in caplog.text
+
+
+@pytest.mark.parametrize("field", ["涨跌幅", "流入资金", "流出资金"])
+def test_required_values_reject_whole_batch_with_safe_diagnostic(market_rows, field):
+    rows = market_rows.astype(object).copy()
+    rows.loc[1, field] = "secret-raw-source"
+    with pytest.raises(SourceDataError) as caught:
+        normalize_individual_aggregate(rows, COLLECTED_AT)
+    error = caught.value
+    assert (error.reason, error.fields, error.code, error.bad_rows) == (
+        "INVALID_VALUES", (field,), "000001", 1,
+    )
+    assert "secret-raw-source" not in error.diagnostic()
+    with pytest.raises(SourceDataError) as caught:
+        normalize_individual_aggregate(rows.drop(columns=field), COLLECTED_AT)
+    assert caught.value.reason == "MISSING_COLUMNS"
+    assert caught.value.fields == (field,)
+    assert caught.value.bad_rows == 2
+
+
+def test_source_net_only_duplicate_difference_is_ignored(market_rows):
+    rows = pd.concat([market_rows, market_rows.iloc[[0]].assign(净额="999亿")])
+    assert normalize_individual_aggregate(rows, COLLECTED_AT) == normalize_individual_aggregate(
+        market_rows, COLLECTED_AT,
+    )
+
+
+def test_overflowing_required_money_rejects_batch(market_rows):
+    rows = market_rows.copy()
+    rows.loc[0, "流入资金"] = "1e308亿"
+    with pytest.raises(SourceDataError) as caught:
+        normalize_individual_aggregate(rows, COLLECTED_AT)
+    assert caught.value.fields == ("流入资金",)

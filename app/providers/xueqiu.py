@@ -4,9 +4,10 @@ import os
 import time
 from typing import Any
 
-import akshare
 import pandas as pd
 from akshare.exceptions import APIError, NetworkError, RateLimitError
+from app.providers.http import bounded_timeout
+from app.source_execution import SourceCall, SourceCallError, SourceExecutor
 
 
 class XueqiuSourceError(RuntimeError):
@@ -23,7 +24,8 @@ def _items(frame: pd.DataFrame) -> dict[str, Any]:
     return dict(zip(frame["item"], frame["value"]))
 
 
-def _call(function: Any, *, symbol: str, token: str, timeout: int) -> dict[str, Any]:
+def _call(function: Any, *, symbol: str, token: str,
+          timeout: tuple[float, float]) -> dict[str, Any]:
     try:
         return _items(function(symbol=symbol, token=token, timeout=timeout))
     except XueqiuSourceError:
@@ -44,21 +46,34 @@ def _call(function: Any, *, symbol: str, token: str, timeout: int) -> dict[str, 
 
 
 class XueqiuProvider:
-    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None) -> None:
+    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None, sample_quotes: bool = False) -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
         # AKShare 1.18.97 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
+        self.sample_quotes = sample_quotes
         self._token = token
-        self._timeout = timeout_seconds
-        self._api = api if api is not None else akshare
+        self._timeout = bounded_timeout(None, timeout_seconds)
+        self._api = api
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds))
+
+    def _frame(self, function: str, symbol: str) -> dict[str, Any]:
+        if self._api is not None:
+            return _call(getattr(self._api, function), symbol=symbol, token=self._token, timeout=self._timeout)
+        try:
+            frame = self.executor.call(SourceCall(function, "xq", {
+                "symbol": symbol, "token": self._token, "timeout": self._timeout,
+            }, 300, ("xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
+                interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
+                if self.sample_quotes and function == "stock_individual_spot_xq" else None))
+            return _items(frame)
+        except SourceCallError as exc:
+            raise XueqiuSourceError("雪球接口请求失败", cooldown=exc.http_status in {401,403,429}
+                                   or exc.exception_type == "RateLimitError" or exc.category == "AUTH_REJECTED") from exc
 
     def quote(self, symbol: str) -> dict[str, Any]:
-        rows = _call(
-            self._api.stock_individual_spot_xq,
-            symbol=symbol, token=self._token, timeout=self._timeout,
-        )
+        rows = self._frame("stock_individual_spot_xq", symbol)
         return {
             field: rows.get(item)
             for field, item in {
@@ -72,10 +87,7 @@ class XueqiuProvider:
         }
 
     def profile(self, symbol: str) -> dict[str, Any]:
-        rows = _call(
-            self._api.stock_individual_basic_info_xq,
-            symbol=symbol, token=self._token, timeout=self._timeout,
-        )
+        rows = self._frame("stock_individual_basic_info_xq", symbol)
         affiliate = rows.get("affiliate_industry")
         industry = rows.get("affiliate_industry.ind_name")
         if industry is None and isinstance(affiliate, dict):

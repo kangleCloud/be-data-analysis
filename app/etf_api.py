@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from app.core.config import Settings
+from app.source_execution import SourceExecutor
 from app.etf_normalize import asset_allocation, catalog, etf_symbol
 from app.etf_profiles import ProfileBatchError, collect_profiles
 from app.providers.akshare_etf import AkShareEtfProvider
@@ -45,7 +46,8 @@ def create_etf_router(
 
     def provider() -> Any:
         return provider_factory() if provider_factory else AkShareEtfProvider(
-            settings.source_timeout_seconds
+            settings.source_timeout_seconds,
+            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
         )
 
     def valid_day(value: str) -> bool:

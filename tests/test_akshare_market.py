@@ -21,7 +21,7 @@ def test_adapter_uses_expected_akshare_functions():
             return pd.DataFrame([{"trade_date": date(2026, 9, 23)}])
         return invoke
 
-    provider = AkShareMarketProvider(2)
+    provider = AkShareMarketProvider(2, api=SimpleNamespace())
     provider._akshare = SimpleNamespace(
         stock_fund_flow_industry=capture("ths_industry"),
         stock_fund_flow_concept=capture("ths_concept"),
@@ -68,50 +68,26 @@ def test_connection_failure_logs_root_type_without_request_details(caplog):
     assert "sensitive request details" not in caplog.text
 
 
-def test_ths_long_pagination_deadlines(monkeypatch):
-    deadlines = []
-
-    @contextmanager
-    def fake_deadline(seconds):
-        deadlines.append(seconds)
-        yield
-
-    monkeypatch.setattr("app.providers.akshare_market._deadline", fake_deadline)
-    provider = AkShareMarketProvider(15)
-    provider._akshare = SimpleNamespace(
-        stock_fund_flow_industry=lambda **_kwargs: pd.DataFrame(),
-        stock_fund_flow_individual=lambda **_kwargs: pd.DataFrame(),
-    )
-    provider.sector_fund_flow("industry")
+def test_shared_executor_preserves_deadlines_parameters_and_cooldown_keys():
+    calls = []
+    executor = SimpleNamespace(call=lambda call: calls.append(call) or pd.DataFrame())
+    provider = AkShareMarketProvider(15, executor=executor)
     provider.market_fund_flow()
-    assert deadlines == [120, 900]
-
-
-def test_ths_pagination_requests_are_spaced_in_collect_process(monkeypatch):
-    virtual_time = [0.0]
-    sleeps = []
-    requests_seen = []
-
-    def fake_sleep(seconds):
-        sleeps.append(seconds)
-        virtual_time[0] += seconds
-
-    def fake_get(url, **kwargs):
-        requests_seen.append((url, virtual_time[0], kwargs.get("timeout")))
-        return object()
-
-    monkeypatch.setattr("app.providers.akshare_market.time.monotonic", lambda: virtual_time[0])
-    monkeypatch.setattr("app.providers.akshare_market.time.sleep", fake_sleep)
-    monkeypatch.setattr(requests, "get", fake_get)
-
-    def fetch(**_kwargs):
-        requests.get("http://data.10jqka.com.cn/funds/hyzjl/page/1")
-        requests.get("http://data.10jqka.com.cn/funds/hyzjl/page/2")
-        return pd.DataFrame()
-
-    provider = AkShareMarketProvider(15)
-    provider._akshare = SimpleNamespace(stock_fund_flow_industry=fetch)
     provider.sector_fund_flow("industry")
-    assert [(at, timeout) for _url, at, timeout in requests_seen] == [(0.0, 15), (1.0, 15)]
-    assert sleeps == [1.0]
-    assert requests.get is fake_get
+    provider.sector_fund_flow("concept")
+    provider.index_spot()
+    assert [call.budget_seconds for call in calls] == [900,120,120,120]
+    assert [call.group for call in calls] == ["ths","ths","ths","sina"]
+    assert all(call.parameters == {"symbol":"即时"} for call in calls[:3])
+    assert calls[-1].parameters == {}
+
+
+def test_cooling_provider_logs_only_info_with_ttl(caplog):
+    from app.source_execution import SourceCoolingError
+    def cool(call):
+        raise SourceCoolingError(300)
+    provider = AkShareMarketProvider(15, executor=SimpleNamespace(call=cool))
+    with caplog.at_level("INFO"), pytest.raises(SourceCoolingError):
+        provider.market_fund_flow()
+    assert "剩余 TTL 300 秒" in caplog.text
+    assert all(record.levelno < 30 for record in caplog.records)

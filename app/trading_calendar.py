@@ -2,13 +2,13 @@
 
 import json
 import logging
-import multiprocessing as mp
+import redis
 import re
-from queue import Empty
 from datetime import date, datetime, time, timedelta
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+from app.source_execution import SourceCall, SourceExecutor, source_batch, SourceControlError
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -30,50 +30,15 @@ class CalendarSource(Protocol):
     def dates(self) -> list[Any]: ...
 
 
-def _source_worker(queue: Any, timeout_seconds: int) -> None:
-    """将无 timeout 参数的 AKShare 调用隔离在子进程内。"""
-    import akshare
-    import requests
-
-    original_get = requests.get
-
-    def bounded_get(*args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("timeout", timeout_seconds)
-        return original_get(*args, **kwargs)
-
-    requests.get = bounded_get
-    try:
-        frame = akshare.tool_trade_date_hist_sina()
-        queue.put(("ok", [str(value) for value in frame["trade_date"]]))
-    except Exception as exc:
-        queue.put(("error", type(exc).__name__))
-
-
 class AkShareCalendarSource:
-    def __init__(self, timeout_seconds: int = 15,
-                 *, worker: Callable[[Any, int], None] = _source_worker) -> None:
+    def __init__(self, timeout_seconds: int = 15, *, executor: Any = None) -> None:
         self.timeout_seconds = timeout_seconds
-        self._worker = worker
+        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds)
 
     def dates(self) -> list[str]:
-        context = mp.get_context("spawn")
-        queue = context.Queue()
-        process = context.Process(target=self._worker, args=(queue, self.timeout_seconds))
-        process.start()
-        try:
-            # 大量日期可能填满管道；先读取，再 join 子进程，避免双向等待。
-            outcome, value = queue.get(timeout=self.timeout_seconds + 10)
-        except Empty as exc:
-            raise TimeoutError("交易日历源调用超时或未返回数据") from exc
-        finally:
-            process.join(timeout=2)
-            if process.is_alive():
-                process.terminate()
-                process.join()
-            queue.close()
-        if outcome != "ok":
-            raise RuntimeError(f"交易日历源调用失败: {value}")
-        return value
+        frame = self.executor.call(SourceCall("tool_trade_date_hist_sina", "sina", {},
+            self.timeout_seconds+12, ("finance.sina.com.cn",)))
+        return [str(value) for value in frame["trade_date"]]
 
 
 def normalize_dates(values: list[Any], refreshed_at: datetime) -> dict[str, Any]:
@@ -182,15 +147,22 @@ class CalendarService:
                 return "throttled"
             old = self.load()
             try:
-                payload = normalize_dates(self.source.dates(), local)
+                with source_batch(self.source, (LOCK_KEY, token)):
+                    payload = normalize_dates(self.source.dates(), local)
                 if payload["lastDate"] < local.date().isoformat():
                     raise ValueError("交易日历未覆盖当前日期")
                 if (old is not None and old["year"] == payload["year"]
                         and payload["lastDate"] < old["lastDate"]):
                     raise ValueError("交易日历源范围倒退")
+                if self.client.get(LOCK_KEY) != token:
+                    raise SourceControlError("业务任务锁已失效")
                 if not self.client.set(CACHE_KEY, json.dumps(payload, ensure_ascii=False)):
                     raise RuntimeError("交易日历缓存写入失败")
                 return "refreshed"
+            except SourceControlError:
+                raise
+            except redis.RedisError:
+                raise
             except Exception as exc:
                 LOGGER.warning("交易日历刷新失败，异常 %s", type(exc).__name__)
                 return "failed"

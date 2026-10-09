@@ -3,10 +3,12 @@
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Mapping
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from pydantic import SecretStr
+from dotenv import dotenv_values
 
 
 @dataclass(frozen=True)
@@ -39,8 +41,17 @@ def _integer(environ: Mapping[str, str], name: str, default: int) -> int:
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
-    """从环境变量加载配置。"""
-    values = os.environ if environ is None else environ
+    """本地默认 .env.dev；生产 .env.prod；环境变量覆盖文件值。"""
+    if environ is None:
+        environment = os.environ.get("APP_ENV", "dev")
+        if environment not in {"dev", "prod"}:
+            raise ValueError("APP_ENV 必须为 dev 或 prod")
+        path = Path(__file__).resolve().parents[2] / f".env.{environment}"
+        values = {key: value for key, value in dotenv_values(path, interpolate=False).items()
+                  if value is not None}
+        values.update(os.environ)
+    else:
+        values = environ
     parsed = urlparse(values.get("REDIS_URL", "redis://localhost").strip())
     redis_port = values.get("REDIS_PORT")
     if redis_port is None:

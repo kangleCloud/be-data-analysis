@@ -29,12 +29,18 @@ class Source:
         return self.values
 
 
-def large_fake_worker(queue, _timeout):
-    queue.put(("ok", ["2026-10-02"] * 9000))
+def large_fake_worker(queue, url, call, keys, token, guard, deadline, read, parent, started):
+    import pandas as pd
+    queue.put(("ok", pd.DataFrame({"trade_date": ["2026-10-02"] * 9000})))
 
 
 def test_calendar_source_reads_large_child_result_before_join():
-    assert len(AkShareCalendarSource(1, worker=large_fake_worker).dates()) == 9000
+    from app.source_execution import SourceExecutor
+    from tests.test_source_execution import ControlRedis
+    backend = ControlRedis()
+    executor = SourceExecutor('redis://offline', client=backend, worker=large_fake_worker)
+    assert len(AkShareCalendarSource(1, executor=executor).dates()) == 9000
+    assert backend.metrics()[-1] == []
 
 
 def test_normalize_validates_every_date_and_sorts_unique():

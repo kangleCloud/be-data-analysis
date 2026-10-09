@@ -79,8 +79,9 @@ def test_snapshot_has_new_three_modules_and_calendar_basis(flow_rows, market_row
                for module in snapshot["modules"].values())
     assert snapshot["modules"]["industrySectors"]["data"]["items"][0]["name"] == "半导体"
     assert snapshot["modules"]["marketFundFlow"]["data"]["source"] == "THS_INDIVIDUAL_AGGREGATE"
-    assert provider.calls == ["calendar", "flow:industry", "flow:concept", "market", "index"]
-    assert [event[1] for event in client.events if event[0] == "publish"] == [UPDATES_CHANNEL]
+    assert provider.calls[0] == "calendar"
+    assert set(provider.calls[1:]) == {"flow:industry", "flow:concept", "market", "index"}
+    assert [event[1] for event in client.events if event[0] == "publish"] == [UPDATES_CHANNEL] * 4
 
 
 def test_two_minute_interval_and_force_keep_safety_gates(flow_rows, market_rows):
@@ -131,7 +132,7 @@ def test_module_failure_retains_only_that_module_valid_history(flow_rows, market
     assert modules["industrySectors"]["status"] == "STALE"
     assert modules["industrySectors"]["data"] == old["data"]
     assert modules["conceptSectors"]["status"] == "STALE"
-    assert modules["marketFundFlow"]["status"] == "STALE"
+    assert modules["marketFundFlow"]["status"] == "FRESH"
     assert provider.calls.count("flow:concept") == 1
 
 
@@ -153,7 +154,7 @@ def test_invalid_one_module_does_not_block_other_two(flow_rows, market_rows):
 
 def test_partial_individual_data_is_not_published_as_market_success(flow_rows, market_rows):
     provider, _, store, collector = setup(flow_rows, market_rows)
-    provider.market = market_rows.assign(净额=None)
+    provider.market = market_rows.assign(流入资金=None)
     assert collector.collect(TRADING_AT) == "partial"
     module = store.load()["modules"]["marketFundFlow"]
     assert module["status"] == "ERROR" and module["data"] is None
@@ -197,7 +198,7 @@ def test_old_top5_and_eastmoney_data_are_not_reused(flow_rows, market_rows):
     assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     modules = store.load()["modules"]
     assert modules["industrySectors"]["status"] == "ERROR"
-    assert modules["marketFundFlow"]["status"] == "ERROR"
+    assert modules["marketFundFlow"]["data"]["source"] == "THS_INDIVIDUAL_AGGREGATE"
 
 
 def test_old_float_company_count_is_not_republished_on_failure(flow_rows, market_rows):
@@ -263,7 +264,7 @@ def test_same_market_batch_writes_only_enabled_fund_points(flow_rows, market_row
         "collectedAt": "2026-09-23T10:00:00+08:00",
         "inflow": 0, "outflow": 0, "netAmount": 0,
     }
-    assert len(client.transactions) == 1
+    assert len(client.transactions) == 4
     assert ("set", SNAPSHOT_KEY) in [command[:2] for command in client.transactions[0]]
     assert client.transactions[0][-1][:2] == ("publish", UPDATES_CHANNEL)
 
@@ -285,9 +286,9 @@ def test_market_source_failure_leaves_fund_series_and_snapshot_stale(flow_rows, 
     assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     assert client.get(key) == first
     assert store.load()["modules"]["marketFundFlow"]["status"] == "STALE"
-    assert len(client.transactions) == 2
+    assert len(client.transactions) == 8
     assert not any(command[:2] == ("publish", "stock:monitor:v1:updates")
-                   for command in client.transactions[1])
+                   for transaction in client.transactions[4:] for command in transaction)
 
 
 def test_fund_history_keeps_two_data_days_and_holiday_does_not_prune(flow_rows, market_rows):
@@ -363,3 +364,145 @@ def test_enabled_stock_missing_from_next_batch_leaves_fund_gap(flow_rows, market
     assert len(first) == 2
     assert len(missing) == 1
     assert store.load()["modules"]["marketFundFlow"]["data"]["latest"]["stockCount"] == 1
+
+
+def test_data_failure_cools_only_failed_module_and_recovers(flow_rows, market_rows, caplog):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    prior = store.load()["modules"]["marketFundFlow"]["data"]
+    provider.market = market_rows.assign(流入资金=None)
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    assert store.cooldown_remaining("module:marketFundFlow") == 300
+    assert not store.cooldown_active("ths")
+    assert "reason=INVALID_VALUES" in caplog.text
+    failed = store.load()["modules"]["marketFundFlow"]
+    assert failed["status"] == "STALE" and failed["data"] == prior
+    provider.market = market_rows
+    before = provider.calls.count("market")
+    client.advance(120)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        assert collector.collect(TRADING_AT.replace(minute=4)) == "partial"
+    assert provider.calls.count("market") == before
+    assert store.cooldown_remaining("module:marketFundFlow") == 180
+    assert "冷却跳过，剩余 TTL 180 秒" in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= 30]
+    modules = store.load()["modules"]
+    assert all(modules[key]["status"] == "FRESH" for key in (
+        "industrySectors", "conceptSectors", "coreIndices",
+    ))
+    assert modules["marketFundFlow"]["data"] == prior
+    client.advance(180)
+    assert collector.collect(TRADING_AT.replace(minute=7)) == "published"
+    assert len(store.load()["modules"]["marketFundFlow"]["data"]["series"]) == 2
+
+
+@pytest.mark.parametrize("kind", ["403", "429", "network", "timeout", "parser"])
+def test_ths_source_protection_stays_two_hours(flow_rows, market_rows, monkeypatch, caplog, kind):
+    import requests
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    if kind.isdigit():
+        response = requests.Response()
+        response.status_code = int(kind)
+        error = requests.HTTPError("private-url", response=response)
+    else:
+        error = {"network": requests.ConnectionError, "timeout": requests.Timeout,
+                 "parser": AttributeError}[kind]("private-url")
+    def fail(_kind):
+        provider.calls.append("failure")
+        raise error
+    monkeypatch.setattr(provider, "sector_fund_flow", fail)
+    assert collector.collect(TRADING_AT) == "partial"
+    assert store.cooldown_remaining("ths") == 7200
+    assert provider.calls.count("failure") == 1
+    assert provider.calls.count("market") == 1 and "index" in provider.calls
+    caplog.clear()
+    client.advance(120)
+    with caplog.at_level("INFO"):
+        assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    assert provider.calls.count("failure") == 1
+    assert store.cooldown_remaining("ths") == 7080
+    assert not [record for record in caplog.records if record.levelno >= 30]
+
+
+def test_market_unexpected_program_error_keeps_redacted_traceback(flow_rows, market_rows, monkeypatch, caplog):
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == "published"
+    prior = store.load()["modules"]["marketFundFlow"]["data"]
+    private_value = "private-raw-response-or-password"
+    def bug():
+        raise RuntimeError(private_value)
+    monkeypatch.setattr(provider, "market_fund_flow", bug)
+    client.advance(120)
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
+    record = next(record for record in caplog.records if "非预期程序异常" in record.message)
+    assert record.levelname == "ERROR" and record.exc_info is not None
+    assert "Traceback" in caplog.text and "in bug" in caplog.text
+    assert "private-raw-response-or-password" not in caplog.text
+    module = store.load()["modules"]["marketFundFlow"]
+    assert module["status"] == "STALE" and module["data"] == prior
+    assert not store.cooldown_active("ths")
+
+
+def test_fast_module_publishes_before_slow_and_versions_chain(flow_rows, market_rows):
+    import json
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from app.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor import ENABLED_KEY, MONITOR_UPDATES_CHANNEL
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    assert collector.collect(TRADING_AT) == 'published'
+    old = store.load()['modules']['marketFundFlow']
+    client.advance(120)
+    client.set(ENABLED_KEY, json.dumps([{'symbol':'SH600000', 'code':'600000','name':'浦发银行','market':'SH'}]))
+    entered, release, published = threading.Event(), threading.Event(), threading.Event()
+    market = provider.market_fund_flow
+    def slow_market():
+        entered.set()
+        assert release.wait(timeout=5)
+        return market()
+    provider.market_fund_flow = slow_market
+    snapshots = []
+    original_save = store.save
+    def save(snapshot, **kwargs):
+        original_save(snapshot, **kwargs)
+        snapshots.append(json.loads(client.get(SNAPSHOT_KEY)))
+        published.set()
+    store.save = save
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(collector.collect, TRADING_AT.replace(minute=2))
+        try:
+            assert entered.wait(timeout=2) and published.wait(timeout=2)
+            assert not future.done()
+            pending = snapshots[0]['modules']['marketFundFlow']
+            assert pending == old  # 等待期间不填造新时间/数据/状态。
+        finally:
+            release.set()
+        assert future.result(timeout=3) == 'published'
+    assert len(snapshots) == 4
+    notices = [json.loads(event[2]) for event in client.events if event[:2] == ('publish',UPDATES_CHANNEL)]
+    for previous, current in zip(notices, notices[1:]):
+        assert current['previousSnapshotId'] == previous['snapshotId']
+    assert len({item['snapshotId'] for item in notices}) == 8
+    assert len(json.loads(client.get(FUND_SERIES_PREFIX+'2026-09-23:SH600000'))) == 1
+    assert len([event for event in client.events if event[:2] == ('publish',MONITOR_UPDATES_CHANNEL)]) == 1
+
+
+def test_business_write_failure_stops_admitting_later_modules(flow_rows, market_rows):
+    import threading
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    waiting = threading.Event()
+    market = provider.market_fund_flow
+    def delayed_market():
+        assert waiting.wait(timeout=2)
+        return market()
+    provider.market_fund_flow = delayed_market
+    def fail_save(*args, **kwargs):
+        waiting.set()
+        raise ConnectionError('业务事务失败')
+    store.save = fail_save
+    with pytest.raises(ConnectionError):
+        collector.collect(TRADING_AT)
+    assert 'flow:concept' not in provider.calls
+    assert not [event for event in client.events if event[0] == 'publish']

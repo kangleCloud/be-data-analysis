@@ -10,6 +10,17 @@ from typing import Any
 class SourceDataError(ValueError):
     """源字段不完整或结果不可用。"""
 
+    def __init__(self, message: str, *, reason: str = "NO_VALID_DATA",
+                 fields: tuple[str, ...] = (), code: str | None = None,
+                 bad_rows: int = 0) -> None:
+        super().__init__(message)
+        self.reason, self.fields, self.bad_rows = reason, fields, bad_rows
+        self.code = code if code and re.fullmatch(r"\d{6}", code) else None
+
+    def diagnostic(self) -> str:
+        return (f"reason={self.reason} fields={','.join(self.fields) or '-'} "
+                f"code={self.code or '-'} badRows={self.bad_rows}")
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +35,11 @@ def _rows(frame: Any) -> list[dict[str, Any]]:
 
 
 def _require(rows: list[dict[str, Any]], *columns: str) -> None:
-    if not all(set(columns).issubset(row) for row in rows):
-        raise SourceDataError("数据源字段变化")
+    bad = [row for row in rows if not set(columns).issubset(row)]
+    if bad:
+        missing = tuple(column for column in columns if any(column not in row for row in bad))
+        raise SourceDataError("数据源字段变化", reason="MISSING_COLUMNS",
+                              fields=missing, bad_rows=len(bad))
 
 
 def _number(raw: Any) -> float | None:
@@ -50,11 +64,13 @@ def _money(raw: Any, *, numeric_factor: float) -> float | None:
         for suffix, factor in (("亿元", 1e8), ("亿", 1e8), ("万元", 1e4), ("万", 1e4), ("元", 1.0)):
             if value.endswith(suffix):
                 number = _number(value.removesuffix(suffix))
-                return number * factor if number is not None else None
+                amount = number * factor if number is not None else None
+                return amount if amount is not None and math.isfinite(amount) else None
         if value.endswith("%"):
             return None
     number = _number(raw)
-    return number * numeric_factor if number is not None else None
+    amount = number * numeric_factor if number is not None else None
+    return amount if amount is not None and math.isfinite(amount) else None
 
 
 def _count(raw: Any) -> int | None:
@@ -112,8 +128,11 @@ def normalize_individual_batch(
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     """从同一批去重股票构造市场汇总与个股资金点。"""
     rows = _rows(frame)
-    _require(rows, "股票代码", "股票简称", "涨跌幅", "流入资金", "流出资金", "净额")
-    stocks: dict[str, tuple[str, tuple[float, float, float, float]]] = {}
+    _require(rows, "股票代码", "股票简称", "涨跌幅", "流入资金", "流出资金")
+    stocks: dict[str, tuple[str, tuple[float, float, float]]] = {}
+    audit: dict[str, float | None] = {}
+    invalid: list[tuple[str, tuple[str, ...]]] = []
+    conflicts: list[str] = []
     for row in rows:
         raw_code = row["股票代码"]
         if isinstance(raw_code, (int, float)) and not isinstance(raw_code, bool):
@@ -132,24 +151,45 @@ def normalize_individual_batch(
         change = _number(row["涨跌幅"])
         inflow = _money(row["流入资金"], numeric_factor=1.0)
         outflow = _money(row["流出资金"], numeric_factor=1.0)
-        source_net = _money(row["净额"], numeric_factor=1.0)
-        if any(value is None for value in (change, inflow, outflow, source_net)):
-            raise SourceDataError("个股资金行缺少必要数值，拒绝部分汇总")
-        values = (change, inflow, outflow, source_net)
+        source_net = _money(row.get("净额"), numeric_factor=1.0)
+        missing = tuple(field for field, value in zip(
+            ("涨跌幅", "流入资金", "流出资金"), (change, inflow, outflow),
+        ) if value is None)
+        if missing:
+            invalid.append((code, missing))
+            continue
+        values = (change, inflow, outflow)
         if code in stocks and stocks[code] != (name, values):
-            raise SourceDataError("个股资金重复行互相冲突")
+            conflicts.append(code)
+            continue
+        if code in audit and audit[code] != source_net:
+            # 相同有效资金行的源净额不一致时放弃该代码审计，不影响实算资金。
+            audit[code] = None
+        elif code not in audit:
+            audit[code] = source_net
         stocks[code] = (name, values)
+    if invalid:
+        raise SourceDataError("个股资金行缺少必要数值，拒绝部分汇总", reason="INVALID_VALUES",
+            fields=tuple(field for field in ("涨跌幅", "流入资金", "流出资金")
+                         if any(field in missing for _, missing in invalid)),
+            code=invalid[0][0], bad_rows=len(invalid))
+    if conflicts:
+        raise SourceDataError("个股资金重复行互相冲突", reason="DUPLICATE_CONFLICT",
+                              fields=("股票代码",), code=conflicts[0], bad_rows=len(conflicts))
     if not stocks:
         raise SourceDataError("无有效同花顺个股资金流数据")
     values = [entry[1] for entry in stocks.values()]
     inflow_total = sum(row[1] for row in values)
     outflow_total = sum(row[2] for row in values)
-    source_net_total = sum(row[3] for row in values)
     net_total = inflow_total - outflow_total
-    if not math.isclose(source_net_total, net_total, rel_tol=0, abs_tol=max(1.0, len(values))):
+    audited = [code for code, source_net in audit.items() if source_net is not None]
+    source_net_total = sum(audit[code] for code in audited)
+    audited_net = sum(stocks[code][1][1] - stocks[code][1][2] for code in audited)
+    if audited and not math.isclose(source_net_total, audited_net, rel_tol=0,
+                                    abs_tol=max(1.0, len(audited))):
         LOGGER.info(
             "同花顺个股源净额与流入减流出存在差异：样本数 %d，差额 %.2f 元",
-            len(values), source_net_total - net_total,
+            len(audited), source_net_total - audited_net,
         )
     latest = {
         "collectedAt": collected_at,
@@ -200,7 +240,8 @@ def normalize_core_indices(frame: Any, collected_at: str) -> dict[str, Any]:
             continue
         price = _number(row["最新价"])
         if price is None or price <= 0:
-            raise SourceDataError("核心指数缺少有效点位")
+            raise SourceDataError("核心指数缺少有效点位", reason="INVALID_VALUES",
+                                  fields=("最新价",), code=code[2:], bad_rows=1)
         item = {
             "code": code, "name": CORE_INDICES[code], "price": price,
             "change": _number(row["涨跌额"]),
@@ -212,9 +253,11 @@ def normalize_core_indices(frame: Any, collected_at: str) -> dict[str, Any]:
             "series": [{"collectedAt": collected_at, "price": price}],
         }
         if code in selected and selected[code] != item:
-            raise SourceDataError("核心指数重复行互相冲突")
+            raise SourceDataError("核心指数重复行互相冲突", reason="DUPLICATE_CONFLICT",
+                                  fields=("代码",), code=code[2:], bad_rows=1)
         selected[code] = item
     if set(selected) != set(CORE_INDICES):
-        raise SourceDataError("核心指数批次不完整")
+        raise SourceDataError("核心指数批次不完整", reason="INCOMPLETE_BATCH",
+                              fields=("代码",), bad_rows=len(set(CORE_INDICES) - set(selected)))
     return {"source": "SINA_INDEX", "sourceTime": None,
             "items": [selected[code] for code in CORE_INDICES]}

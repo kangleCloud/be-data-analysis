@@ -6,10 +6,15 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 from uuid import uuid4
+from contextlib import ExitStack
 from zoneinfo import ZoneInfo
 
 from app.collector import _in_collection_window
+from app.core.logging import log_failure, redis_failure_kind
 from app.etf_normalize import etf_symbol, quote_rows
+from app.providers.akshare_etf import EtfSourceError
+from app.providers.http import error_metadata
+from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, source_batch
 from app.trading_calendar import CalendarService
 
 LOGGER = logging.getLogger(__name__)
@@ -74,8 +79,11 @@ class EtfStore:
     def cooldown_active(self) -> bool:
         return bool(self.client.exists(COOLDOWN_KEY))
 
-    def start_cooldown(self) -> None:
-        self.client.set(COOLDOWN_KEY, "1", ex=2 * 60 * 60)
+    def cooldown_remaining(self) -> int:
+        return self.client.ttl(COOLDOWN_KEY)
+
+    def start_cooldown(self, seconds: int = 300) -> None:
+        self.client.set(COOLDOWN_KEY, "1", ex=seconds, nx=True)
 
     def load(self) -> dict[str, Any] | None:
         raw = self.client.get(SNAPSHOT_KEY)
@@ -145,65 +153,100 @@ class EtfCollector:
             return "locked"
         started = time.monotonic()
         try:
-            if not self.store.reserve_slot():
-                return "throttled"
-            if self.calendar.day_status(local.date(), local) is not True:
-                return "skipped"
-            enabled = self.store.enabled()
-            if not enabled:
-                return "skipped"
-            symbols = [entry["symbol"] for entry in enabled]
-            previous = self.store.load() or {}
-            old_items = {item["symbol"]: item for item in previous.get("items", [])}
-            collected_at = (local + timedelta(seconds=time.monotonic() - started)).isoformat(
-                timespec="seconds"
-            )
-            failed = 0
-            try:
-                if self.store.cooldown_active():
-                    raise RuntimeError("ETF 新浪源冷却中")
-                quotes = quote_rows(self.source.quotes())
-            except Exception as exc:
-                LOGGER.warning("ETF 行情批次失败，异常 %s", type(exc).__name__)
-                if not self.store.cooldown_active():
-                    self.store.start_cooldown()
-                quotes = {}
-                failed = len(symbols)
-            items = []
-            for entry in enabled:
-                symbol = entry["symbol"]
-                quote = quotes.get(symbol)
-                if quote is None:
-                    if quotes:
-                        failed += 1
-                    old = old_items.get(symbol)
-                    if old and isinstance(old.get("quote"), dict):
-                        items.append({**old, **entry,
-                                      "quote": {**old["quote"], "status": "STALE"}})
-                    else:
-                        items.append({**entry, "quote": None, "priceSeries": [],
-                                      "fundSeries": [],
-                                      "fundFlowStatus": "NO_RELIABLE_SOURCE"})
-                    continue
-                point = {"collectedAt": collected_at, "price": quote["price"]}
-                series = [entry for entry in self.store.series(local.date().isoformat(), symbol)
-                          if entry.get("collectedAt") != collected_at]
-                series.append(point)
-                series.sort(key=lambda entry: entry["collectedAt"])
-                items.append({
-                    **entry,
-                    "quote": {key: value for key, value in quote.items()
-                              if key not in {"symbol", "code", "name", "market", "closeConfirmed"}}
-                    | {"source": "SINA_ETF", "tradeDate": local.date().isoformat(),
-                       "collectedAt": collected_at, "status": "FRESH"},
-                    "priceSeries": series, "fundSeries": [],
-                    "fundFlowStatus": "NO_RELIABLE_SOURCE",
-                })
-            self.store.publish({
-                "schemaVersion": 1, "source": "AKShare.fund_etf_category_sina",
-                "generatedAt": collected_at, "tradeDate": local.date().isoformat(),
-                "items": items,
-            })
-            return "partial" if failed else "published"
+            with ExitStack() as stack:
+                stack.enter_context(source_batch(self.source, (LOCK_KEY, token), started+120))
+                return self._collect_locked(local, started, token)
         finally:
             self.store.release(token)
+            LOGGER.info("ETF 采集总耗时 %.2f 秒", time.monotonic() - started)
+
+    def _collect_locked(self, local: datetime, started: float, token: str) -> str:
+        if not self.store.reserve_slot():
+            return "throttled"
+        if self.calendar.day_status(local.date(), local) is not True:
+            return "skipped"
+        enabled = self.store.enabled()
+        if not enabled:
+            return "skipped"
+        symbols = [entry["symbol"] for entry in enabled]
+        previous = self.store.load() or {}
+        old_items = {item["symbol"]: item for item in previous.get("items", [])}
+        failed = 0
+        source_finished = None
+        cooling = self.store.cooldown_active()
+        if cooling:
+            LOGGER.info("ETF 新浪源冷却跳过，剩余 TTL %d 秒", self.store.cooldown_remaining())
+            quotes = {}
+            failed = len(symbols)
+        else:
+            try:
+                rows = self.source.quotes()
+                source_finished = time.monotonic()
+                quotes = quote_rows(rows)
+            except SourceNotStartedError:
+                cooling = True
+                LOGGER.info("ETF 行情预算结束，未发起源请求")
+                quotes, failed = {}, len(symbols)
+            except SourceCoolingError as exc:
+                cooling = True
+                LOGGER.info("ETF 新浪源冷却跳过，剩余 TTL %d 秒", exc.ttl)
+                quotes, failed = {}, len(symbols)
+            except Exception as exc:
+                if isinstance(exc, SourceControlError) or redis_failure_kind(exc):
+                    raise
+                metadata = ({"exception_type": exc.exception_type, "root_type": exc.root_type,
+                             "http_status": exc.http_status, "category": exc.category}
+                            if isinstance(exc, EtfSourceError) else error_metadata(exc))
+                if redis_failure_kind(exc) or metadata["category"] == "UNEXPECTED":
+                    log_failure(LOGGER, (
+                        f"etf type={metadata['exception_type']} root={metadata['root_type']} "
+                        f"http={metadata['http_status']} category={metadata['category']}"
+                    ), exc)
+                else:
+                    LOGGER.warning("ETF 行情批次失败，类型 %s，底层 %s，HTTP %s，分类 %s",
+                                   metadata["exception_type"], metadata["root_type"],
+                                   metadata["http_status"], metadata["category"])
+                self.store.start_cooldown(7200 if metadata["http_status"] in {403, 429} else 300)
+                quotes = {}
+                failed = len(symbols)
+        collected_at = (local + timedelta(seconds=(source_finished if source_finished is not None else time.monotonic()) - started)).isoformat(
+            timespec="seconds"
+        )
+        items = []
+        for entry in enabled:
+            symbol = entry["symbol"]
+            quote = quotes.get(symbol)
+            if quote is None:
+                if quotes:
+                    failed += 1
+                old = old_items.get(symbol)
+                if old and isinstance(old.get("quote"), dict):
+                    items.append({**old, **entry,
+                                  "quote": {**old["quote"], "status": "STALE"}})
+                else:
+                    items.append({**entry, "quote": None, "priceSeries": [],
+                                  "fundSeries": [],
+                                  "fundFlowStatus": "NO_RELIABLE_SOURCE"})
+                continue
+            point = {"collectedAt": collected_at, "price": quote["price"]}
+            series = [entry for entry in self.store.series(local.date().isoformat(), symbol)
+                      if entry.get("collectedAt") != collected_at]
+            series.append(point)
+            series.sort(key=lambda entry: entry["collectedAt"])
+            items.append({
+                **entry,
+                "quote": {key: value for key, value in quote.items()
+                          if key not in {"symbol", "code", "name", "market", "closeConfirmed"}}
+                | {"source": "SINA_ETF", "tradeDate": local.date().isoformat(),
+                   "collectedAt": collected_at, "status": "FRESH"},
+                "priceSeries": series, "fundSeries": [],
+                "fundFlowStatus": "NO_RELIABLE_SOURCE",
+            })
+        if self.store.client.get(LOCK_KEY) != token:
+            raise SourceControlError("业务任务锁已失效")
+        self.store.publish({
+            "schemaVersion": 1, "source": "AKShare.fund_etf_category_sina",
+            "generatedAt": collected_at, "tradeDate": local.date().isoformat(),
+            "items": items,
+        })
+        return "cooldown" if cooling else "partial" if failed else "published"

@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import sys
+
+from app.process_wait import wait_worker
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -38,7 +40,7 @@ async def launch_slot(slot: datetime, now: datetime) -> bool:
         LOGGER.info("跳过错过的采集时段: %s", slot.isoformat())
         return False
     process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app", "collect")
-    exit_code = await process.wait()
+    exit_code = await wait_worker(process)
     LOGGER.info("采集时段 %s 子进程退出: %s", slot.isoformat(), exit_code)
     return True
 

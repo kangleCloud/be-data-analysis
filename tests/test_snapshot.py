@@ -26,8 +26,19 @@ class FakeRedis:
             self.expiry.pop(key, None)
         return self.values.get(key)
 
+    def ping(self):
+        return True
+
+    def close(self):
+        pass
+
     def exists(self, *keys):
         return sum(self.get(key) is not None for key in keys)
+
+    def ttl(self, key):
+        if self.get(key) is None:
+            return -2
+        return max(0, self.expiry[key] - self.now) if key in self.expiry else -1
 
     def advance(self, seconds):
         self.now += seconds

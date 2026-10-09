@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from app.monitor_events import monitor_event_lock
+from app.core.logging import log_failure
 
 SNAPSHOT_KEY = "stock:market:v1:snapshot"
 UPDATES_CHANNEL = "stock:market:v1:updates"
@@ -56,7 +57,9 @@ class SnapshotStore(Protocol):
 
     def cooldown_active(self, source: str) -> bool: ...
 
-    def start_cooldown(self, source: str) -> None: ...
+    def cooldown_remaining(self, source: str) -> int: ...
+
+    def start_cooldown(self, source: str, seconds: int = SOURCE_COOLDOWN_SECONDS) -> None: ...
 
 
 class RedisSnapshotStore:
@@ -89,8 +92,8 @@ class RedisSnapshotStore:
                     if not self.renew(token):
                         LOGGER.error("市场采集锁已失效，停止续租")
                         return
-                except Exception:
-                    LOGGER.exception("市场采集锁续租失败")
+                except Exception as exc:
+                    log_failure(LOGGER, "market-lock-renewal", exc)
                     return
 
         self._renew_thread = threading.Thread(target=keep_alive, daemon=True)
@@ -111,9 +114,12 @@ class RedisSnapshotStore:
     def cooldown_active(self, source: str) -> bool:
         return bool(self._client.exists(f"{COOLDOWN_KEY_PREFIX}{source}"))
 
-    def start_cooldown(self, source: str) -> None:
+    def cooldown_remaining(self, source: str) -> int:
+        return self._client.ttl(f"{COOLDOWN_KEY_PREFIX}{source}")
+
+    def start_cooldown(self, source: str, seconds: int = SOURCE_COOLDOWN_SECONDS) -> None:
         self._client.set(
-            f"{COOLDOWN_KEY_PREFIX}{source}", "1", ex=SOURCE_COOLDOWN_SECONDS
+            f"{COOLDOWN_KEY_PREFIX}{source}", "1", ex=seconds, nx=True,
         )
 
     def load(self) -> dict[str, Any] | None:

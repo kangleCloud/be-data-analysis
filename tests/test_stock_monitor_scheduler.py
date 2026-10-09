@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+from tests.test_snapshot import FakeRedis
 
 import app.main as main_module
 import app.cli as cli_module
@@ -40,10 +41,10 @@ def test_serve_starts_monitor_scheduler_only_when_enabled(monkeypatch):
     monkeypatch.setattr(main_module, "run_scheduler", fake_market)
     monkeypatch.setattr(main_module, "run_calendar_scheduler", lambda _settings: fake_market())
     monkeypatch.setattr(main_module, "run_monitor_scheduler", fake_monitor)
-    with TestClient(main_module.create_app(settings=load_settings({}))) as client:
+    with TestClient(main_module.create_app(settings=load_settings({}), redis_factory=FakeRedis)) as client:
         assert client.get("/health").status_code == 200
     assert events == []
-    with TestClient(main_module.create_app(settings=load_settings({"STOCK_MONITOR_XQ_ENABLED": "true"}))) as client:
+    with TestClient(main_module.create_app(settings=load_settings({"STOCK_MONITOR_XQ_ENABLED": "true"}), redis_factory=FakeRedis)) as client:
         assert client.get("/health").status_code == 200
     assert events == ["started", "stopped"]
 
@@ -52,7 +53,7 @@ def test_manual_monitor_sample_does_not_construct_xueqiu_when_disabled(monkeypat
     import sys
 
     monkeypatch.setattr(sys, "argv", ["app", "monitor-sample"])
-    monkeypatch.setattr(cli_module, "get_settings", lambda: load_settings({}))
+    monkeypatch.setattr("app.core.config.get_settings", lambda: load_settings({}))
     monkeypatch.setattr(workflows_module, "XueqiuProvider", lambda *_args: (_ for _ in ()).throw(
         AssertionError("关闭开关时不得创建雪球客户端")
     ))

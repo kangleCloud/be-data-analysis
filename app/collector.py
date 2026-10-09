@@ -4,13 +4,18 @@ import logging
 import math
 import time as clock
 from datetime import datetime, time, timedelta
-from typing import Any, Callable
+from typing import Any
+from contextlib import closing
 from zoneinfo import ZoneInfo
 
 import requests
 
-from app.normalize import normalize_core_indices, normalize_individual_batch, normalize_sectors
+from app.normalize import SourceDataError, normalize_core_indices, normalize_individual_batch, normalize_sectors
+from app.core.logging import log_failure, redis_failure_kind
 from app.providers.akshare_market import MarketSource
+from app.providers.http import error_metadata
+from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch
+from app.snapshot import LOCK_KEY
 from app.snapshot import SnapshotStore
 from app.trading_calendar import CalendarService
 
@@ -30,10 +35,6 @@ MARKET_POINT_FIELDS = {"collectedAt", "inflow", "outflow", "netAmount"}
 MARKET_LATEST_FIELDS = MARKET_POINT_FIELDS | {
     "riseCount", "fallCount", "flatCount", "stockCount",
 }
-
-
-class SourceCooldownError(RuntimeError):
-    """源接口仍处于 Redis 共享冷却期。"""
 
 
 def _finite(value: Any) -> bool:
@@ -98,11 +99,12 @@ def _reusable_prior(key: str, prior: Any) -> bool:
 
 
 def _needs_cooldown(exc: Exception, source: str) -> bool:
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout, TimeoutError)):
+    metadata = error_metadata(exc)
+    if metadata["category"] in {"NETWORK", "TIMEOUT"} or metadata["http_status"] in {403, 429}:
         return True
     if isinstance(exc, requests.HTTPError):
         return exc.response is not None and exc.response.status_code in {403, 429}
-    return source == "ths" and isinstance(exc, (AttributeError, IndexError))
+    return source == "ths" and metadata["exception_type"] in {"AttributeError", "IndexError"}
 
 
 def _in_collection_window(at: datetime) -> bool:
@@ -160,6 +162,8 @@ class MarketCollector:
             try:
                 trading_status = self._calendar.day_status(local.date(), local)
             except Exception as exc:
+                if isinstance(exc, SourceControlError) or redis_failure_kind(exc):
+                    raise
                 LOGGER.warning("交易日历失败，异常 %s", type(exc).__name__)
                 trading_status = None
             if trading_status is None:
@@ -172,67 +176,75 @@ class MarketCollector:
             if not trading_status:
                 return "skipped"
             day = local.date().isoformat()
-            modules: dict[str, Any] = {}
+            modules = {key: old_modules.get(key) if _reusable_prior(key, old_modules.get(key))
+                       else _error_module(timestamp, "暂无可用数据") for key in MODULE_KEYS}
             failures = 0
-            fund_points: dict[str, dict[str, Any]] = {}
-
-            def update(
-                key: str, action: Callable[[], dict[str, Any]], source: str = "ths",
-            ) -> None:
-                nonlocal failures
-                module_started = clock.monotonic()
-                try:
-                    if self._store.cooldown_active(source):
-                        raise SourceCooldownError("数据源冷却中")
-                    data = action()
-                    if key == "marketFundFlow":
-                        data = self._append_market_series(data, old_modules.get(key), day)
-                    elif key == "coreIndices":
-                        data = self._append_index_series(data, old_modules.get(key), day)
-                    success_at = collected_time()
-                    modules[key] = {
-                        "status": "FRESH", "tradeDate": day,
-                        "tradeDateBasis": "CALENDAR", "lastSuccessAt": success_at,
-                        "lastAttemptAt": timestamp, "message": None, "data": data,
-                    }
-                    LOGGER.info("模块 %s 成功，耗时 %.2f 秒", key, clock.monotonic() - module_started)
-                except Exception as exc:
-                    failures += 1
-                    if _needs_cooldown(exc, source):
-                        self._store.start_cooldown(source)
-                    LOGGER.warning(
-                        "模块 %s 失败，耗时 %.2f 秒，异常 %s",
-                        key, clock.monotonic() - module_started, type(exc).__name__,
-                    )
-                    modules[key] = _fallback(
-                        key, old_modules.get(key), timestamp, "本轮采集失败，展示上次成功数据"
-                    )
-
-            update("industrySectors", lambda: normalize_sectors(
-                self._provider.sector_fund_flow("industry"), "industry"
-            ))
-            update("conceptSectors", lambda: normalize_sectors(
-                self._provider.sector_fund_flow("concept"), "concept"
-            ))
-            def market_action() -> dict[str, Any]:
-                nonlocal fund_points
-                data, by_code = normalize_individual_batch(
-                    self._provider.market_fund_flow(), collected_time()
-                )
-                selected = self._store.enabled_symbols()
-                fund_points = {
-                    symbol: by_code[symbol[2:]]
-                    for symbol in selected if symbol[2:] in by_code
-                }
-                return data
-
-            update("marketFundFlow", market_action)
-            update("coreIndices", lambda: normalize_core_indices(
-                self._provider.index_spot(), collected_time()
-            ), source="sina-index")
-            if modules["marketFundFlow"]["status"] != "FRESH":
-                fund_points = {}
-            self._publish(token, collected_time(), modules, day, fund_points)
+            actions = [
+                ("marketFundFlow", "ths", self._provider.market_fund_flow),
+                ("industrySectors", "ths", lambda: self._provider.sector_fund_flow("industry")),
+                ("conceptSectors", "ths", lambda: self._provider.sector_fund_flow("concept")),
+                ("coreIndices", "sina", self._provider.index_spot),
+            ]
+            def fetch(key: str, group: str, function: Any) -> Any:
+                source = "ths" if group == "ths" else "sina-index"
+                for scope in (source, f"module:{key}"):
+                    if self._store.cooldown_active(scope):
+                        raise SourceCoolingError(self._store.cooldown_remaining(scope))
+                return function()
+            guarded = [(key, group, lambda k=key,g=group,f=function: fetch(k,g,f))
+                       for key,group,function in actions]
+            with source_batch(self._provider, (LOCK_KEY, token), started+1380), closing(
+                completed(guarded, source=self._provider)
+            ) as results:
+                for key, frame, error, finished_at in results:
+                    source = "sina-index" if key == "coreIndices" else "ths"
+                    fund_points = None
+                    try:
+                        if error:
+                            raise error
+                        source_finished = (local + timedelta(seconds=finished_at-started)).isoformat(timespec="seconds")
+                        if key in {"industrySectors", "conceptSectors"}:
+                            data = normalize_sectors(frame, "industry" if key == "industrySectors" else "concept")
+                        elif key == "marketFundFlow":
+                            data, by_code = normalize_individual_batch(frame, source_finished)
+                            selected = self._store.enabled_symbols()
+                            fund_points = {symbol: by_code[symbol[2:]] for symbol in selected if symbol[2:] in by_code}
+                            data = self._append_market_series(data, old_modules.get(key), day)
+                        else:
+                            data = self._append_index_series(normalize_core_indices(frame, source_finished),
+                                                             old_modules.get(key), day)
+                        modules[key] = {"status": "FRESH", "tradeDate": day, "tradeDateBasis": "CALENDAR",
+                                        "lastSuccessAt": source_finished, "lastAttemptAt": timestamp,
+                                        "message": None, "data": data}
+                        LOGGER.info("模块 %s 成功，批次已耗时 %.2f 秒", key, clock.monotonic()-started)
+                    except SourceNotStartedError:
+                        failures += 1
+                        LOGGER.info("模块 %s 预算结束，未发起源请求", key)
+                        modules[key] = _fallback(key, old_modules.get(key), timestamp,
+                                                 "本轮源预算结束，展示上次成功数据")
+                    except SourceCoolingError as exc:
+                        failures += 1
+                        LOGGER.info("模块 %s 冷却跳过，剩余 TTL %d 秒", key, exc.ttl)
+                        modules[key] = _fallback(key, old_modules.get(key), timestamp,
+                                                 "数据源冷却中，展示上次成功数据")
+                    except Exception as exc:
+                        if isinstance(exc, SourceControlError) or redis_failure_kind(exc):
+                            raise
+                        failures += 1
+                        if _needs_cooldown(exc, source):
+                            self._store.start_cooldown(source)
+                        elif isinstance(exc, SourceDataError):
+                            self._store.start_cooldown(f"module:{key}", seconds=300)
+                        if not isinstance(exc, SourceDataError) and error_metadata(exc)["category"] == "UNEXPECTED":
+                            log_failure(LOGGER, key, exc)
+                        else:
+                            LOGGER.warning("模块 %s 失败，异常 %s，诊断 %s", key, type(exc).__name__,
+                                           exc.diagnostic() if isinstance(exc, SourceDataError) else error_metadata(exc))
+                        modules[key] = _fallback(key, old_modules.get(key), timestamp,
+                                                 "本轮采集失败，展示上次成功数据")
+                        fund_points = None
+                    # 每个完成模块仅发布一次；尚未完成模块保持原数据/时间。
+                    self._publish(token, collected_time(), modules, day, fund_points)
             return "partial" if failures else "published"
         finally:
             self._store.stop_renewal()

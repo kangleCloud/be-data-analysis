@@ -94,3 +94,31 @@ def test_enabled_profiles_return_only_limited_basic_fields(monkeypatch):
     assert profile["updatedAt"].endswith("+08:00")
     assert set(profile) == {"symbol", "industry", "listingDate", "marketCap", "updatedAt"}
     assert calls == [("profile", "SH600000"), ("quote", "SH600000")]
+
+
+def test_profiles_keep_request_order_and_reject_entire_batch_on_one_failure():
+    import threading
+    class Source:
+        def profile(self, symbol):
+            if symbol == 'SH600000':
+                assert second.wait(timeout=2)
+            else:
+                second.set()
+            return {'industry':'银行', 'list_date':19991110}
+        def quote(self, symbol):
+            if fail and symbol == 'SZ000001':
+                raise ValueError('无效资料')
+            return {'market_capital':100}
+    second, fail = threading.Event(), False
+    settings = load_settings({'STOCK_MONITOR_INTERNAL_TOKEN':'service-secret',
+                              'STOCK_MONITOR_XQ_ENABLED':'true','XUEQIU_TOKEN':'fake'})
+    client = TestClient(create_app(scheduler_enabled=False, settings=settings,
+                                 xq_factory=Source, redis_factory=RedisClient))
+    kwargs = dict(json={'symbols':['SH600000','SZ000001']}, headers={'X-Internal-Token':'service-secret'})
+    response = client.post('/internal/stock-monitor/v1/profiles', **kwargs)
+    assert response.status_code == 200
+    assert [item['symbol'] for item in response.json()['profiles']] == ['SH600000','SZ000001']
+    fail = True
+    response = client.post('/internal/stock-monitor/v1/profiles', **kwargs)
+    assert response.status_code == 502
+    assert 'profiles' not in response.json()

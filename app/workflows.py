@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from app.collector import MarketCollector
 from app.core.config import Settings
+from app.source_execution import SourceExecutor
 from app.providers.akshare_market import AkShareMarketProvider
 from app.providers.akshare_etf import AkShareEtfProvider
 from app.etf_monitor import EtfCollector, EtfStore
@@ -18,7 +19,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def calendar_service(settings: Settings, client: Any) -> CalendarService:
-    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds))
+    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)))
 
 
 def run_calendar(settings: Settings, client: Any, *, manual: bool = False,
@@ -30,7 +31,7 @@ def run_calendar(settings: Settings, client: Any, *, manual: bool = False,
 
 def run_market(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
     return MarketCollector(
-        AkShareMarketProvider(settings.source_timeout_seconds),
+        AkShareMarketProvider(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
         RedisSnapshotStore(client, settings.redis_lock_seconds),
         calendar_service(settings, client),
     ).collect(at or datetime.now(SHANGHAI))
@@ -44,7 +45,7 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) 
         return "missing_token"
     return StockMonitorSampler(
         MonitorStore(client),
-        XueqiuProvider(token, settings.source_timeout_seconds),
+        XueqiuProvider(token, settings.source_timeout_seconds, sample_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
         calendar_service(settings, client),
         xq_enabled=True,
     ).sample(at or datetime.now(SHANGHAI))
@@ -52,6 +53,6 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) 
 
 def run_etf(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
     return EtfCollector(
-        AkShareEtfProvider(settings.source_timeout_seconds),
+        AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
         EtfStore(client), calendar_service(settings, client),
     ).collect(at or datetime.now(SHANGHAI))
