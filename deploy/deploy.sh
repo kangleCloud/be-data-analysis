@@ -2,7 +2,7 @@
 set -e
 
 docker buildx bake \
-  -f docker-compose.yml \
+  -f -ompose.yaml \
   --allow=network.host \
   --load \
   --progress=plain \
