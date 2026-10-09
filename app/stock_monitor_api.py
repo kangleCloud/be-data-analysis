@@ -2,6 +2,7 @@
 
 import hmac
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -13,7 +14,9 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from app.core.config import Settings
-from app.source_execution import SourceExecutor, completed, source_batch
+from app.source_execution import SourceExecutor, completed, source_batch, SourceBusyError, SourceThrottledError, SourceCoolingError
+from app.collection_gate import collection_entry
+from app.resources import SourceResourceError
 from app.stock_monitor import SAMPLE_LOCK_KEY
 from app.providers.exchange_stocks import ExchangeStockProvider
 from app.providers.xueqiu import XueqiuProvider, XueqiuSourceError
@@ -26,6 +29,26 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 class ProfileRequest(BaseModel):
     symbols: list[str]
+
+
+def fresh_profile_quote(quote,symbol,now):
+    if not isinstance(quote,dict) or quote.get('symbol') != symbol or quote.get('source') != 'XQ' or quote.get('status') != 'FRESH':
+        return None
+    try:
+        collected = datetime.fromisoformat(quote['collectedAt'])
+        if collected.tzinfo is None or not 0 <= (now-collected).total_seconds() <= 120:
+            return None
+    except (ValueError,KeyError,TypeError):
+        return None
+    capital = quote.get('marketCap')
+    if isinstance(capital,bool):
+        return None
+    try:
+        if capital is not None and (not math.isfinite(float(capital)) or float(capital) < 0):
+            return None
+    except (TypeError,ValueError):
+        return None
+    return quote
 
 
 def create_monitor_router(
@@ -62,11 +85,21 @@ def create_monitor_router(
             settings.source_timeout_seconds,
             executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
         )
+        store = new_store()
         try:
-            return {"schemaVersion": 1, "stocks": source.all_a_stocks()}
+            with collection_entry(store.client) as entered:
+                if not entered:
+                    raise HTTPException(status_code=409,detail='采集入口忙碌')
+                return {"schemaVersion":1,"stocks":source.all_a_stocks()}
+        except HTTPException:
+            raise
+        except SourceResourceError as exc:
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
         except Exception as exc:
             LOGGER.warning("交易所股票字典同步失败，异常 %s", type(exc).__name__)
             raise HTTPException(status_code=502, detail="交易所股票字典同步失败") from exc
+        finally:
+            store.client.close()
 
     @router.post("/profiles", summary="刷新已监控股票雪球资料")
     def profiles(
@@ -97,27 +130,41 @@ def create_monitor_router(
                     executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
                 )
                 def fetch(symbol: str) -> dict[str, Any]:
+                    cached = fresh_profile_quote(store.quote(symbol),symbol,datetime.now(SHANGHAI))
+                    if cached and all(cached.get(field) is not None for field in ('industry','listingDate','marketCap')):
+                        return normalize_profile(symbol,{'industry':cached['industry'],'listing_date':cached['listingDate'],
+                            'market_capital':cached['marketCap']},None,datetime.now(SHANGHAI))
                     raw_profile = source.profile(symbol)
                     updated_at = datetime.now(SHANGHAI)
                     profile = normalize_profile(symbol, raw_profile, None, updated_at)
                     if profile["marketCap"] is None:
-                        profile = normalize_profile(symbol, raw_profile, source.quote(symbol), datetime.now(SHANGHAI))
+                        profile = normalize_profile(symbol,raw_profile,
+                            {'market_capital':cached['marketCap']} if cached and cached.get('marketCap') is not None else source.quote(symbol),datetime.now(SHANGHAI))
                     return profile
                 actions = [(symbol, "xq", lambda code=symbol: fetch(code)) for symbol in symbols]
                 profiles_by_symbol = {}
-                with source_batch(source, (SAMPLE_LOCK_KEY, lock), time.monotonic()+600), closing(
-                    completed(actions, source=source)
-                ) as results:
-                    for symbol, profile, error, finished_at in results:
-                        if error:
-                            raise error
-                        profiles_by_symbol[symbol] = profile
+                with collection_entry(store.client) as entered:
+                    if not entered:
+                        raise HTTPException(status_code=409,detail="采集入口忙碌")
+                    with source_batch(source, (SAMPLE_LOCK_KEY, lock), time.monotonic()+600), closing(
+                        completed(actions, source=source)
+                    ) as results:
+                        for symbol, profile, error, finished_at in results:
+                            if error:
+                                raise error
+                            profiles_by_symbol[symbol] = profile
                 result = [profiles_by_symbol[symbol] for symbol in symbols]
                 return {"schemaVersion": 1, "profiles": result}
             finally:
                 store.release(lock)
         except HTTPException:
             raise
+        except SourceBusyError as exc:
+            raise HTTPException(status_code=409,detail='采集入口忙碌') from exc
+        except (SourceThrottledError,SourceCoolingError) as exc:
+            raise HTTPException(status_code=429,detail='源保护或请求间隔未满足') from exc
+        except SourceResourceError as exc:
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
         except XueqiuSourceError as exc:
             if exc.cooldown:
                 store.start_cooldown()

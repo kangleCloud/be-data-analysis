@@ -1,52 +1,59 @@
-"""慢采集子进程等待完成，只启动后续时段，不补跑或重叠。"""
+"""自动轮短任务优先，失效截止时间停止当前源任务。"""
 
 import asyncio
-from datetime import datetime, timedelta
-from importlib import import_module
-from zoneinfo import ZoneInfo
+import threading
+
 import pytest
+from app.core.config import load_settings
+from tests.test_snapshot import FakeRedis
 
 
-@pytest.mark.parametrize("module_name,function_name,command", [
-    ("app.scheduler", "run_scheduler", "collect"),
-    ("app.etf_scheduler", "run_etf_scheduler", "etf-collect"),
-    ("app.stock_monitor_scheduler", "run_monitor_scheduler", "monitor-sample"),
-])
-def test_slow_child_skips_missed_slots_without_overlap(monkeypatch, module_name, function_name, command):
-    module = import_module(module_name)
-    clock = [datetime(2026, 10, 8, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))]
-    starts = []
-    running = [False]
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return clock[0]
-    class FinishedSimulation(Exception):
-        pass
-    async def sleep(seconds):
-        assert not running[0]
-        clock[0] += timedelta(seconds=seconds)
-    class Process:
-        async def wait(self):
-            assert running[0]
-            # 三分钟任务覆盖一个两分钟时段，下一次只能等未来时段。
-            clock[0] += timedelta(minutes=3)
-            running[0] = False
-            if len(starts) == 2:
-                raise FinishedSimulation()
-            return 0
-    async def create(*args):
-        assert not running[0]
-        assert args[-1] == command
-        starts.append(clock[0].strftime("%H:%M"))
-        running[0] = True
-        return Process()
-    monkeypatch.setattr(module, "datetime", Clock)
-    if module_name == "app.scheduler":
-        monkeypatch.setattr(module.clock, "monotonic", lambda: clock[0].timestamp())
-    monkeypatch.setattr(module.asyncio, "sleep", sleep)
-    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", create)
-    with pytest.raises(FinishedSimulation):
-        asyncio.run(getattr(module, function_name)())
-    assert starts == (["10:02", "10:05"] if module_name == "app.scheduler" else ["10:02", "10:06"])
-    assert not running[0]
+def test_round_order_short_tasks_first_with_one_parent(monkeypatch):
+    import app.workflows as module
+    calls = []
+    for name in ('run_monitor','run_etf','run_market'):
+        monkeypatch.setattr(module,name,lambda *a,_name=name,**kw:calls.append(_name) or 'published')
+    assert module.run_auto(load_settings({}),FakeRedis()) == {
+        'monitor':'published','etf':'published','market':'published'}
+    assert calls == ['run_monitor','run_etf','run_market']
+
+
+def test_scheduler_shutdown_cancels_and_waits_current_round(monkeypatch):
+    import app.scheduler as module
+    entered,stopped = threading.Event(),threading.Event()
+    def work(settings,cancel):
+        entered.set()
+        assert cancel.wait(2)
+        stopped.set()
+    async def run():
+        async def no_sleep(seconds):
+            return None
+        monkeypatch.setattr(module.asyncio,'sleep',no_sleep)
+        monkeypatch.setattr(module,'MAX_START_LAG_SECONDS',86400)
+        monkeypatch.setattr(module,'_round',work)
+        task = asyncio.create_task(module.run_scheduler(load_settings({})))
+        assert await asyncio.to_thread(entered.wait,1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(run())
+    assert stopped.is_set()
+
+
+def test_calendar_shutdown_cancels_and_waits_source(monkeypatch):
+    from app.calendar_scheduler import _run_cancellable
+    entered,stopped=threading.Event(),threading.Event()
+    def work(settings,cancel):
+        entered.set()
+        assert cancel.wait(2)
+        stopped.set()
+        from app.source_execution import SourceControlError
+        raise SourceControlError('已取消源进程')
+    async def run():
+        task=asyncio.create_task(_run_cancellable(work,load_settings({})))
+        assert await asyncio.to_thread(entered.wait,1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(run())
+    assert stopped.is_set()

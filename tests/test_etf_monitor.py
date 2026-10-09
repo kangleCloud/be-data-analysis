@@ -230,3 +230,36 @@ def test_mid_call_cooldown_is_info_and_keeps_original_ttl(monkeypatch, caplog):
     assert all(record.levelno < 30 for record in caplog.records)
     item = json.loads(client.get(SNAPSHOT_KEY))['items'][0]
     assert item['quote']['status'] == 'STALE' and len(item['priceSeries']) == 1
+
+
+def test_one_full_sina_table_feeds_enabled_quotes_and_dictionary():
+    from app.etf_dictionary import KEY
+    client,source = _setup()
+    source.rows.append({'代码':'sz159919','名称':'300ETF','最新价':'4.1'})
+    assert EtfCollector(source,EtfStore(client),Calendar()).collect(AT)=='published'
+    assert source.calls==1
+    cached=json.loads(client.get(KEY))
+    assert [row['symbol'] for row in cached['etfs']]==['SH510050','SZ159919']
+    assert client.ttl(KEY)==86400 and cached['source']=='SINA'
+    assert set(cached['etfs'][0])=={'symbol','code','name','market'}
+    assert len(json.loads(client.get(SNAPSHOT_KEY))['items'])==1
+
+
+def test_dictionary_redis_failure_preserves_previous_snapshot_without_source_cooldown():
+    import redis
+    from app.etf_dictionary import KEY
+    from app.etf_monitor import COOLDOWN_KEY
+    client,source=_setup()
+    collector=EtfCollector(source,EtfStore(client),Calendar())
+    assert collector.collect(AT)=='published'
+    previous=client.get(SNAPSHOT_KEY)
+    client.advance(120)
+    old_set=client.set
+    def fail(key,*args,**kwargs):
+        if key==KEY:
+            raise redis.TimeoutError('private-password')
+        return old_set(key,*args,**kwargs)
+    client.set=fail
+    with pytest.raises(redis.TimeoutError):
+        collector.collect(AT.replace(minute=34))
+    assert client.get(SNAPSHOT_KEY)==previous and client.get(COOLDOWN_KEY) is None

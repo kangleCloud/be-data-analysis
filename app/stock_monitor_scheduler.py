@@ -1,15 +1,9 @@
 """个股监控每两分钟盘中采样调度。"""
 
-import asyncio
-import logging
-import sys
-
-from app.process_wait import wait_worker
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 
-LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SAMPLE_TIMES = tuple(
     time(hour, minute)
@@ -30,16 +24,3 @@ def next_sample_slot(after: datetime) -> datetime:
             if candidate > local:
                 return candidate
     raise AssertionError("未找到后续个股采样时段")
-
-
-async def run_monitor_scheduler() -> None:
-    while True:
-        now = datetime.now(SHANGHAI)
-        slot = next_sample_slot(now)
-        await asyncio.sleep(max(0, (slot - now).total_seconds()))
-        if (datetime.now(SHANGHAI) - slot).total_seconds() > 60:
-            LOGGER.info("跳过错过的个股采样时段: %s", slot.isoformat())
-            continue
-        process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app", "monitor-sample")
-        code = await wait_worker(process)
-        LOGGER.info("个股采样时段 %s 子进程退出: %s", slot.isoformat(), code)

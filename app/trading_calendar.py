@@ -1,6 +1,7 @@
 """共享交易日历缓存、刷新节流及未知日期判定。"""
 
 import json
+from app.resources import SourceResourceError
 import logging
 import redis
 import re
@@ -38,7 +39,7 @@ class AkShareCalendarSource:
     def dates(self) -> list[str]:
         frame = self.executor.call(SourceCall("tool_trade_date_hist_sina", "sina", {},
             self.timeout_seconds+12, ("finance.sina.com.cn",)))
-        return [str(value) for value in frame["trade_date"]]
+        return [str(value) for value in frame["trade_date"]] if hasattr(frame,"columns") else [str(row["trade_date"]) for row in frame]
 
 
 def normalize_dates(values: list[Any], refreshed_at: datetime) -> dict[str, Any]:
@@ -159,6 +160,8 @@ class CalendarService:
                 if not self.client.set(CACHE_KEY, json.dumps(payload, ensure_ascii=False)):
                     raise RuntimeError("交易日历缓存写入失败")
                 return "refreshed"
+            except SourceResourceError:
+                raise
             except SourceControlError:
                 raise
             except redis.RedisError:

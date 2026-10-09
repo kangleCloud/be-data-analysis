@@ -4,8 +4,6 @@ import os
 import time
 from typing import Any
 
-import pandas as pd
-from akshare.exceptions import APIError, NetworkError, RateLimitError
 from app.providers.http import bounded_timeout
 from app.source_execution import SourceCall, SourceCallError, SourceExecutor
 
@@ -16,16 +14,18 @@ class XueqiuSourceError(RuntimeError):
         self.cooldown = cooldown
 
 
-def _items(frame: pd.DataFrame) -> dict[str, Any]:
-    if not isinstance(frame, pd.DataFrame) or not {"item", "value"}.issubset(frame.columns):
-        raise XueqiuSourceError("雪球数据结构不正确")
-    if frame.empty:
+def _items(frame: Any) -> dict[str, Any]:
+    rows = frame.to_dict("records") if hasattr(frame,"to_dict") else frame
+    if not isinstance(rows,list) or not rows:
         raise XueqiuSourceError("雪球数据为空")
-    return dict(zip(frame["item"], frame["value"]))
+    if any(not isinstance(row,dict) or not {"item","value"}.issubset(row) for row in rows):
+        raise XueqiuSourceError("雪球数据结构不正确")
+    return {row["item"]:row["value"] for row in rows}
 
 
 def _call(function: Any, *, symbol: str, token: str,
           timeout: tuple[float, float]) -> dict[str, Any]:
+    from akshare.exceptions import APIError, NetworkError, RateLimitError
     try:
         return _items(function(symbol=symbol, token=token, timeout=timeout))
     except XueqiuSourceError:
@@ -46,13 +46,12 @@ def _call(function: Any, *, symbol: str, token: str,
 
 
 class XueqiuProvider:
-    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None, sample_quotes: bool = False) -> None:
+    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None) -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
         # AKShare 1.18.97 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
-        self.sample_quotes = sample_quotes
         self._token = token
         self._timeout = bounded_timeout(None, timeout_seconds)
         self._api = api
@@ -66,7 +65,7 @@ class XueqiuProvider:
                 "symbol": symbol, "token": self._token, "timeout": self._timeout,
             }, 300, ("xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
                 interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
-                if self.sample_quotes and function == "stock_individual_spot_xq" else None))
+                if function == "stock_individual_spot_xq" else None))
             return _items(frame)
         except SourceCallError as exc:
             raise XueqiuSourceError("雪球接口请求失败", cooldown=exc.http_status in {401,403,429}

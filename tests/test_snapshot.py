@@ -101,7 +101,7 @@ class FakeRedis:
         return 0
 
     def eval(self, script, count, *args):
-        if script == RENEW_LOCK_SCRIPT:
+        if script == RENEW_LOCK_SCRIPT or (count == 1 and len(args) == 3):
             key, token, seconds = args
             if self.get(key) != token:
                 return 0
@@ -305,3 +305,28 @@ def test_fund_point_market_and_monitor_events_follow_atomic_business_writes():
     assert notices[0]["stateId"] != notices[1]["stateId"]
     assert notices[1]["stateId"] == client.get(MONITOR_STATE_KEY)
     assert notices[0]["changedSymbols"] == [symbol]
+
+
+def test_fund_status_without_points_notifies_enabled_symbols_atomically_only_on_change():
+    from app.stock_monitor import ENABLED_KEY,MONITOR_STATE_KEY,MONITOR_UPDATES_CHANNEL
+    client=FakeRedis()
+    client.set(ENABLED_KEY,json.dumps([{'symbol':'SH600000','code':'600000','name':'浦发银行','market':'SH'}]))
+    store=RedisSnapshotStore(client,240)
+    module={'status':'ERROR','tradeDate':None,'lastAttemptAt':'2026-10-09T10:00:00+08:00',
+            'lastSuccessAt':None,'message':'资金源分页或数值校验失败，保留上次有效数据'}
+    def save(value):
+        store.save({'schemaVersion':1,'generatedAt':value['lastAttemptAt'],'modules':{'marketFundFlow':value}})
+    save(module)
+    first_state=client.get(MONITOR_STATE_KEY)
+    save({**module,'lastAttemptAt':'2026-10-09T10:02:00+08:00'})
+    assert client.get(MONITOR_STATE_KEY)==first_state
+    save({**module,'message':'采集资源不足或源进程退出，保留上次有效数据'})
+    assert client.get(MONITOR_STATE_KEY)!=first_state
+    notices=[json.loads(value) for action,key,value in client.events if action=='publish' and key==MONITOR_UPDATES_CHANNEL]
+    assert len(notices)==2 and notices[-1]['baseStateId']==first_state
+    assert notices[-1]['changedSymbols']==['SH600000']
+    for transaction in (client.transactions[0],client.transactions[2]):
+        names=[command[:2] for command in transaction]
+        assert ('set',SNAPSHOT_KEY) in names and ('set',MONITOR_STATE_KEY) in names
+        assert not any(command[0]=='set' and ':fund-series:' in command[1] for command in transaction)
+        assert names[-2:]==[('publish',MONITOR_UPDATES_CHANNEL),('publish',UPDATES_CHANNEL)]

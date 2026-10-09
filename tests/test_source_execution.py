@@ -14,7 +14,7 @@ import requests
 from app.source_execution import (
     ACQUIRE_SCRIPT, RENEW_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, TASK_RENEW_SCRIPT,
     GLOBAL_LIMIT, SOURCE_LIMIT, PREFIX, SourceCall, SourceCallError, SourceControl, SourceControlError, SourceCoolingError,
-    SourceExecutor, controlled_http,
+    SourceExecutor, SourceBusyError, controlled_http,
 )
 from tests.test_snapshot import FakeRedis
 
@@ -29,6 +29,10 @@ class ControlRedis(FakeRedis):
         self.renewals = 0
         self.releases = 0
         self.rate_now = lambda: time.monotonic()*1000
+
+    def set(self, *args, **kwargs):
+        with self.mutex:
+            return super().set(*args, **kwargs)
 
     def eval(self, script, count, *arguments):
         with self.mutex:
@@ -103,17 +107,21 @@ def ignore_term_worker(queue, url, call, keys, token, guard, deadline, read, par
     time.sleep(60)
 
 
-def test_cross_entry_executors_share_eight_global_and_four_group_slots():
+def test_cross_entry_executors_are_nonqueuing_and_single_source():
     backend = ControlRedis()
-    executors = [SourceExecutor('redis://offline', client=backend, worker=frame_worker) for _ in range(8)]
-    groups = ['ths']*4+['sina']*4
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda pair: pair[0].call(SourceCall('fake', pair[1], {}, 5)), zip(executors, groups)))
-    assert len(results) == 8
-    assert backend.max_global == 8
-    assert max(backend.max_groups.values()) <= 4
-    assert backend.releases == 8
-    assert not [key for key in backend.values if key.startswith(PREFIX+'slot:')]
+    ready = mp.get_context('spawn').Event()
+    executor = SourceExecutor('redis://offline', client=backend, worker=ignore_term_worker)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(executor.call, SourceCall('fake','ths',{'ready':ready},900))
+        assert ready.wait(5)
+        other = SourceExecutor('redis://offline',client=backend,worker=frame_worker)
+        with pytest.raises(SourceBusyError):
+            other.call(SourceCall('fake','sina',budget_seconds=5))
+        executor.stop()
+        with pytest.raises(SourceControlError):
+            first.result(timeout=4)
+    assert backend.max_global == 1 and backend.max_groups == {'ths':1}
+    assert backend.releases == 1 and backend.metrics()[-1] == []
 
 
 def test_http_start_spacing_covers_session_and_different_executors(monkeypatch):
@@ -210,7 +218,7 @@ def test_independent_parent_processes_share_atomic_quotas():
     context = mp.get_context('spawn')
     with RedisManager(ctx=context) as manager:
         backend = manager.ControlRedis()
-        groups = ['ths']*6+['sina']*6
+        groups = ['ths']*2+['sina']*2
         barrier, queue = context.Barrier(len(groups)), context.Queue()
         parents = [context.Process(target=parent_entry, args=(backend, barrier, queue, group)) for group in groups]
         try:
@@ -220,11 +228,11 @@ def test_independent_parent_processes_share_atomic_quotas():
             for process in parents:
                 process.join(timeout=3)
                 assert process.exitcode == 0
-            assert results == [{'name': 'fake'}] * len(groups)
+            assert results.count({'name':'fake'}) == 1
+            assert results.count('SourceBusyError') == len(groups)-1
             maximum, groups_max, releases, remaining = backend.metrics()
-            assert maximum == 8 and groups_max['ths'] == 4
-            assert max(groups_max.values()) <= 4
-            assert releases == len(groups) and remaining == []
+            assert maximum == 1 and max(groups_max.values()) == 1
+            assert releases == 1 and remaining == []
         finally:
             for process in parents:
                 if process.is_alive():
@@ -239,7 +247,7 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     control = SourceControl(client)
     first = control.acquire('ths', 'first')
     second = control.acquire('ths', 'second')
-    others = [control.acquire('ths', value) for value in ('third', 'fourth')]
+    assert second is None
     assert control.acquire('ths', 'fifth') is None
     assert all(0 < client.ttl(key) <= 30 for key in first)
     control.renew(first, 'first')
@@ -248,20 +256,17 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     fund = SourceCall('fund_info_ths', 'ths', fund_profile=True, cooldown_keys=('cool',))
     control.request_turn(fund, first, 'first', None, time.monotonic()+1)
     with pytest.raises(TimeoutError):
-        control.request_turn(fund, second, 'second', None, time.monotonic()+0.03)
+        control.request_turn(fund, first, 'first', None, time.monotonic()+0.03)
     assert int(client.get(PREFIX+'rate:ths:fund')) > int(client.get(PREFIX+'rate:ths'))
     client.set('cool', '1', ex=300)
     with pytest.raises(SourceCoolingError) as error:
-        control.request_turn(fund, second, 'second', None, time.monotonic()+1)
+        control.request_turn(fund, first, 'first', None, time.monotonic()+1)
     assert 0 < error.value.ttl <= 300
     # 已过期/被接管的旧令牌不能删除新租约。
     client.set(first[0], 'replacement', ex=30)
     control.release(first, 'first')
     assert client.get(first[0]) == 'replacement'
     assert client.get(first[1]) is None
-    control.release(second, 'second')
-    for keys, token in zip(others, ('third','fourth')):
-        control.release(keys, token)
 
 
 @pytest.mark.parametrize('group,interval', [('sina', .2), ('xq', 1), ('sse', 1), ('szse', 1), ('bse', 1)])
@@ -294,13 +299,14 @@ def test_same_symbol_interval_is_reserved_only_at_first_http(monkeypatch):
     monkeypatch.setattr('app.source_execution.time.sleep', lambda value: clock.__setitem__(0, clock[0]+value))
     control = SourceControl(backend)
     keys = control.acquire('xq', 'first')
-    second = control.acquire('xq', 'second')
     call = SourceCall('quote', 'xq', interval_key='stock:monitor:v1:sample:lastRequest:SH600000')
     assert backend.get(call.interval_key) is None
     control.request_turn(call, keys, 'first', None, 10)
     control.request_turn(call, keys, 'first', None, 10)  # 同一次函数的会话与数据请求。
     assert clock[0] == pytest.approx(1)
     assert backend.ttl(call.interval_key) == 120
+    control.release(keys,'first')
+    second = control.acquire('xq','second')
     with pytest.raises(SourceThrottledError):
         control.request_turn(call, second, 'second', None, 10)
 
@@ -308,12 +314,12 @@ def test_same_symbol_interval_is_reserved_only_at_first_http(monkeypatch):
 def test_quota_wait_budget_never_starts_worker():
     backend = ControlRedis()
     control = SourceControl(backend)
-    held = [control.acquire('ths', token) for token in ('one', 'two', 'three', 'four')]
+    held = [control.acquire('ths', 'one')]
     executor = SourceExecutor('redis://offline', client=backend, worker=frame_worker)
     with pytest.raises(SourceNotStartedError):
         executor.call(SourceCall('fake', 'ths', budget_seconds=2.05))
     assert backend.releases == 0
-    for keys, token in zip(held, ('one','two','three','four')):
+    for keys, token in zip(held, ('one',)):
         control.release(keys, token)
 
 
@@ -359,7 +365,6 @@ def test_close_completed_iterator_cancels_inflight_before_more_candidates():
     executor = SourceExecutor('redis://offline', client=backend, worker=ignore_term_worker)
     source = SimpleNamespace(executor=executor)
     def fast():
-        assert ready.wait(timeout=5)
         return 'fast'
     later = []
     actions = [('fast','ths',fast), ('slow','ths',lambda: executor.call(SourceCall('fake','ths',{'ready':ready},900))),
@@ -463,7 +468,7 @@ def test_source_watchdog_stops_on_parent_identity_loss():
     with RedisManager(ctx=context) as manager:
         backend = manager.ControlRedis()
         executor = SourceExecutor('redis://offline', client=backend, worker=lost_parent_worker)
-        with pytest.raises(SourceControlError, match='提前退出'):
+        with pytest.raises(SourceControlError, match='源控制失效'):
             executor.call(SourceCall('fake','sina',{'backend':backend},20))
         assert backend.metrics()[-1] == []
         assert not any(process.is_alive() and process.pid != manager._process.pid for process in mp.active_children())
@@ -494,12 +499,15 @@ def test_actual_http_start_gaps_across_independent_parents_and_source_children()
     context = mp.get_context('spawn')
     with RedisManager(ctx=context) as manager:
         backend = manager.ControlRedis()
-        barrier, queue = context.Barrier(3), context.Queue()
+        barrier, queue = context.Barrier(1), context.Queue()
         parents = [context.Process(target=http_parent_entry, args=(backend,barrier,queue)) for _ in range(3)]
         try:
+            points = []
             for process in parents:
                 process.start()
-            points = sorted(point for _ in parents for point in queue.get(timeout=15))
+                points.extend(queue.get(timeout=15))
+                process.join(timeout=3)
+            points.sort()
             for process in parents:
                 process.join(timeout=3)
                 assert process.exitcode == 0
@@ -540,7 +548,6 @@ def test_ordinary_market_http_failure_does_not_block_sibling_module(monkeypatch)
     backend = ControlRedis()
     control = SourceControl(backend)
     keys = control.acquire('ths','first')
-    sibling = control.acquire('ths','second')
     call = SourceCall('fake','ths',domains=('offline.test',),cooldown_keys=('ths','industry'),cooldown_policy='market')
     other = SourceCall('fake','ths',domains=('offline.test',),cooldown_keys=('ths','concept'),cooldown_policy='market')
     sends = []
@@ -558,6 +565,8 @@ def test_ordinary_market_http_failure_does_not_block_sibling_module(monkeypatch)
         with pytest.raises(SourceCoolingError):
             requests.get('https://offline.test/industry/page/2')
     assert backend.get('ths') is None and backend.ttl('industry') == 300
+    control.release(keys,'first')
+    sibling = control.acquire('ths','second')
     with controlled_http(control,other,sibling,'second',None,time.monotonic()+5,15):
         assert requests.get('https://offline.test/concept').status_code == 200
     assert len(sends) == 2

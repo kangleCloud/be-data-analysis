@@ -40,7 +40,7 @@ class ExchangeStockProvider:
                   for key,_,_,_,market,code,name in combinations]
         stocks: dict[str, dict[str, str]] = {}
         for market, frame, code_field, name_field in frames:
-            rows = frame.to_dict("records")
+            rows = frame.to_dict("records") if hasattr(frame,"to_dict") else frame
             if not rows:
                 raise ValueError(f"{market} 交易所股票清单为空")
             for row in rows:

@@ -1,13 +1,8 @@
 """受保护的同步手动任务入口。"""
 
 import hmac
-import json
 import logging
-import subprocess
-import sys
-import tempfile
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -17,6 +12,10 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.core.config import Settings
+from app.collection_gate import collection_entry
+from app.resources import SourceResourceError
+from app.source_execution import SourceBusyError
+from app.workflows import run_calendar, run_market, run_monitor, run_etf
 
 LOGGER = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -42,6 +41,7 @@ MESSAGES = {
     "disabled": "雪球采集总闸关闭",
     "missing_token": "雪球令牌未配置",
     "failed": "源刷新失败，原缓存已保留",
+    "resource": "采集资源不足，原数据已保留",
 }
 
 
@@ -59,21 +59,10 @@ def _state(outcome: str) -> str:
     return "FAILED"
 
 
-def _run_default(kind: Kind) -> str:
-    """在线程池路由外的独立进程执行，保证 SIGALRM 只在主线程使用。"""
-    with tempfile.TemporaryDirectory(prefix="stock-job-") as directory:
-        result_path = Path(directory) / "result.json"
-        process = subprocess.run(
-            [sys.executable, "-m", "app.job_worker", kind, str(result_path)],
-            timeout=JOB_TIMEOUT_SECONDS[kind], check=False,
-        )
-        if process.returncode != 0:
-            raise RuntimeError(f"任务子进程退出码 {process.returncode}")
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-        outcome = payload.get("outcome")
-        if not isinstance(outcome, str) or outcome not in MESSAGES:
-            raise ValueError("任务子进程返回无效结果")
-        return outcome
+def _run_default(kind: Kind,settings: Settings,client: Any) -> str:
+    if kind == 'calendar':
+        return run_calendar(settings,client,manual=True)
+    return {'market':run_market,'monitor':run_monitor,'etf':run_etf}[kind](settings,client)
 
 
 def create_jobs_router(
@@ -119,10 +108,24 @@ def create_jobs_router(
                 status_code, outcome, message = 409, "locked", MESSAGES["locked"]
             else:
                 try:
-                    outcome = (runner or _run_default)(kind)
+                    with collection_entry(client) as entered:
+                        if not entered:
+                            outcome = 'locked'
+                            status_code = 409
+                        else:
+                            outcome = runner(kind) if runner else _run_default(kind,settings,client)
                     if not isinstance(outcome, str) or outcome not in MESSAGES:
                         raise ValueError("任务返回无效结果")
                     message = MESSAGES[outcome]
+                    if outcome == "resource":
+                        status_code = 503
+                except SourceBusyError:
+                    status_code, outcome, message = 409, "locked", MESSAGES["locked"]
+                except SourceResourceError:
+                    status_code, outcome, message = 503, "resource", MESSAGES["resource"]
+                except redis.RedisError as exc:
+                    LOGGER.warning('手动任务 %s Redis 故障，异常 %s',kind,type(exc).__name__)
+                    status_code,outcome,message = 503,'failed','任务基础设施不可用'
                 except Exception as exc:
                     LOGGER.warning("手动任务 %s 失败，异常 %s", kind, type(exc).__name__)
                     status_code, outcome, message = 500, "failed", "任务执行失败"

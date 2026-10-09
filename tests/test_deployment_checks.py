@@ -28,7 +28,7 @@ def test_deployment_code_check_shows_features_without_configuration_values(monke
     record = json.loads(output)
     assert record['akshareVersion'] == '1.18.97'
     source = record['files']['source_execution.py']
-    assert (source['GLOBAL_LIMIT'],source['SOURCE_LIMIT']) == (8,4)
+    assert (source['GLOBAL_LIMIT'],source['SOURCE_LIMIT']) == (1,1)
     assert (source['LEASE_SECONDS'],source['RENEW_SECONDS']) == (30,10)
     assert source['currentCoolingName'] and not source['oldCoolingName']
     assert record['files']['providers/http.py']['disableTqdm']

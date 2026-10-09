@@ -5,7 +5,6 @@ import multiprocessing as mp
 import os
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from queue import Empty
@@ -17,12 +16,15 @@ import redis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
+from app.collection_gate import collection_entry, check_entry
+from app.resources import SourceResourceError, check_memory, memory_state
+from app.ths_paging import IndividualPaging
 from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 
 LOGGER = logging.getLogger(__name__)
 PREFIX = "stock:source-control:v1:"
-GLOBAL_LIMIT = 8
-SOURCE_LIMIT = 4
+GLOBAL_LIMIT = 1
+SOURCE_LIMIT = 1
 LEASE_SECONDS = 30
 RENEW_SECONDS = 10
 CLEANUP_SECONDS = 2
@@ -71,6 +73,10 @@ class SourceControlError(RuntimeError):
     """配额、业务锁或 Redis 控制失效；停止整轮而不是继续源请求。"""
 
 
+class SourceBusyError(SourceControlError):
+    """其他采集入口占用资源，立即拒绝。"""
+
+
 class SourceCoolingError(RuntimeError):
     def __init__(self, ttl: int) -> None:
         self.ttl = ttl
@@ -94,8 +100,15 @@ class SourceCallError(RuntimeError):
         self.root_type = metadata["root_type"]
         self.http_status = metadata["http_status"]
         self.category = metadata["category"]
+        self.reason = metadata.get("reason")
+        self.fields = metadata.get("fields", ())
+        self.code = metadata.get("code")
+        self.bad_rows = metadata.get("bad_rows", 0)
         super().__init__(f"type={self.exception_type} root={self.root_type} "
                          f"http={self.http_status} category={self.category}")
+
+    def diagnostic(self):
+        return f"reason={self.reason} fields={','.join(self.fields) or '-'} code={self.code or '-'} badRows={self.bad_rows}"
 
 
 @dataclass(frozen=True)
@@ -196,9 +209,12 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
     """Session.send 覆盖 get/post、雪球会话、重定向，每次物理 HTTP 都先取共享速率许可。"""
     import requests
     original = requests.Session.send
+    paging = IndividualPaging(call)
     def send(session: Any, request: Any, **kwargs: Any) -> Any:
         if urlparse(request.url).hostname not in call.domains:
             raise SourceControlError("源请求域名不在审计清单中")
+        page = paging.prepare(request)
+        check_memory()
         control.request_turn(call, keys, token, guard, deadline)
         remaining = max(0.001, deadline - time.monotonic())
         connect, read = bounded_timeout(kwargs.get("timeout"), read_seconds)
@@ -210,13 +226,16 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
                 started_event.set()
             response = original(session, request, **kwargs)
             response.raise_for_status()
+            paging.response(page,response)
             return response
+        except SourceResourceError:
+            raise
         except Exception as exc:
             control.cool(call, error_metadata(exc))
             raise
     requests.Session.send = send
     try:
-        yield
+        yield paging
     finally:
         requests.Session.send = original
 
@@ -230,25 +249,48 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
     def watchdog() -> None:
         while not stopped.wait(0.5):
             try:
-                if os.getppid() != parent_pid or time.monotonic() >= deadline:
-                    os._exit(70)
+                if os.getppid() != parent_pid:
+                    os._exit(77)
+                if time.monotonic() >= deadline:
+                    os._exit(76)
+                check_memory()
                 control.check(keys, token, guard)
+            except SourceResourceError:
+                os._exit(72)
+            except redis.RedisError:
+                os._exit(73)
+            except SourceControlError:
+                os._exit(74)
             except Exception:
                 os._exit(70)
     watcher = threading.Thread(target=watchdog, daemon=True)
     watcher.start()
     try:
         # 初始化、等待和清理均在父进程确定的同一个截止时间内。
+        initialized = time.monotonic()
+        from app.core.logging import configure_logging
+        configure_logging("info", "source:"+call.function)
+        check_memory()
         import akshare
+        LOGGER.info("源初始化耗时 %.2f 秒 memory=%s", time.monotonic()-initialized, memory_state())
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
-        with controlled_http(control, call, keys, token, guard, deadline, read_seconds, started_event), quiet_progress():
+        with controlled_http(control, call, keys, token, guard, deadline, read_seconds, started_event) as paging, quiet_progress():
             function = getattr(akshare, call.function)
             clear = getattr(function, "cache_clear", None)
             if clear:
                 clear()
+            fetched = time.monotonic()
             frame = function(**call.parameters)
-        queue.put(("ok", frame))
+            LOGGER.info("源请求耗时 %.2f 秒 memory=%s", time.monotonic()-fetched, memory_state())
+            serialized = time.monotonic()
+            rows = frame.to_dict("records")
+            paging.finish(rows)
+            del frame
+            LOGGER.info("源转换耗时 %.2f 秒 rows=%d memory=%s",time.monotonic()-serialized,len(rows),memory_state())
+        queue.put(("ok", rows))
+    except SourceResourceError as exc:
+        queue.put(("resource", {"reason":exc.reason,"state":exc.state}))
     except SourceThrottledError as exc:
         queue.put(("throttled", exc.ttl))
     except SourceCoolingError as exc:
@@ -302,6 +344,15 @@ class SourceExecutor:
     @contextmanager
     def batch(self, guard: tuple[str, str] | None = None,
               deadline: float | None = None) -> Iterator[None]:
+        with collection_entry(self.control.client) as acquired:
+            if not acquired:
+                raise SourceBusyError('其他采集任务正在运行')
+            with self._batch_locked(guard,deadline):
+                yield
+
+    @contextmanager
+    def _batch_locked(self, guard: tuple[str, str] | None = None,
+              deadline: float | None = None) -> Iterator[None]:
         self.cancelled.clear()
         self.guard, self.deadline = guard, deadline
         stop_renewal = threading.Event()
@@ -334,12 +385,20 @@ class SourceExecutor:
         self.cancelled.set()
 
     def _check(self) -> None:
+        check_entry()
+        check_memory()
         if self.cancelled.is_set():
             raise SourceControlError("源批次已取消")
         if self.guard and self.control.client.get(self.guard[0]) != self.guard[1]:
             raise SourceControlError("业务任务锁已失效")
 
     def call(self, call: SourceCall) -> Any:
+        with collection_entry(self.control.client) as acquired:
+            if not acquired:
+                raise SourceBusyError('其他采集任务正在运行')
+            return self._call_locked(call)
+
+    def _call_locked(self, call: SourceCall) -> Any:
         if call.group not in GROUPS:
             raise ValueError("未知来源组")
         started = time.monotonic()
@@ -350,6 +409,7 @@ class SourceExecutor:
         token = uuid4().hex
         keys = None
         queue = process = None
+        exitcode = None
         requested = self.context.Event()
         try:
             while keys is None:
@@ -387,9 +447,17 @@ class SourceExecutor:
                             if not requested.is_set():
                                 raise SourceNotStartedError("源预算结束，尚未发起请求")
                             raise TimeoutError("源调用超过预算")
-                        raise SourceControlError("源子进程提前退出")
+                        if process.exitcode == 76:
+                            if not requested.is_set():
+                                raise SourceNotStartedError("源预算结束，尚未发起请求")
+                            raise TimeoutError("源调用超过预算")
+                        if process.exitcode in {73,74,77}:
+                            raise SourceControlError("源控制失效 exitcode="+str(process.exitcode))
+                        raise SourceResourceError("MEMORY_PRESSURE" if process.exitcode == 72 else "PROCESS_EXIT",state=memory_state(),exitcode=process.exitcode)
             self._check()
             self.control.check(keys, token, self.guard)
+            if status == "resource":
+                raise SourceResourceError(result["reason"],state=result["state"])
             if status == "throttled":
                 raise SourceThrottledError(result)
             if status == "cooldown":
@@ -401,19 +469,24 @@ class SourceExecutor:
                     raise SourceNotStartedError("源预算结束，尚未发起请求")
                 raise SourceCallError(result)
             return result
-        except BaseException:
+        except BaseException as exc:
+            LOGGER.warning("源取消 function=%s reason=%s elapsed=%.2f memory=%s exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,memory_state(),process.exitcode if process else None)
             if process is not None:
                 self._reap(process, deadline)
+                exitcode = process.exitcode
+                process.close()
                 process = None
             raise
         finally:
             if process is not None:
                 self._reap(process, deadline)
+                exitcode = process.exitcode
+                process.close()
             if queue is not None:
                 queue.close()
             if keys is not None:
                 self.control.release(keys, token)
-            LOGGER.info("源 %s 总耗时 %.2f 秒", call.function, time.monotonic()-started)
+            LOGGER.info("源 %s 总耗时 %.2f 秒 memory=%s exitcode=%s",call.function,time.monotonic()-started,memory_state(),exitcode)
 
     @staticmethod
     def _reap(process: Any, deadline: float) -> None:
@@ -429,6 +502,7 @@ class SourceExecutor:
         if process.is_alive():
             raise SourceControlError("源进程未完成回收，拒绝释放名额")
         process.join(timeout=0)
+        LOGGER.info("源回收 exitcode=%s signal=%s memory=%s",process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None,memory_state())
 
 
 @contextmanager
@@ -444,42 +518,16 @@ def source_batch(source: Any, guard: tuple[str, str] | None = None,
 
 def completed(actions: list[tuple[str, str, Callable[[], Any]]], *, source: Any = None,
               limit: int = GLOBAL_LIMIT) -> Iterator[tuple[str, Any, Exception | None, float]]:
-    """有限候选按配置顺序准入，来源最多四路；只在父线程交付完成结果。"""
-    def invoke(function: Callable[[], Any]) -> tuple[Any, Exception | None, float]:
+    """单父进程串行准入，完成立即交付，不为源调用再创建等待线程。"""
+    for key, group, function in actions:
+        executor = getattr(source, 'executor', None)
         try:
-            return function(), None, time.monotonic()
-        except Exception as exc:
-            return None, exc, time.monotonic()
-    candidates = list(actions)
-    running = {}
-    executor = getattr(source, "executor", None)
-    with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="source-wait") as pool:
-        try:
-            while candidates or running:
-                groups = [group for _, group in running.values()]
-                for action in list(candidates):
-                    key, group, function = action
-                    if len(running) >= limit:
-                        break
-                    if groups.count(group) >= SOURCE_LIMIT:
-                        continue
-                    candidates.remove(action)
-                    running[pool.submit(invoke, function)] = (key, group)
-                    groups.append(group)
-                if not running:
-                    break
-                done, _ = wait(running, return_when=FIRST_COMPLETED)
-                # 同一轮多个已完成结果仍按配置顺序，避免不可复现的合并顺序。
-                for future in sorted(done, key=lambda item: next(i for i,a in enumerate(actions) if a[0] == running[item][0])):
-                    if executor is not None:
-                        executor._check()
-                    key, _ = running.pop(future)
-                    value, error, finished_at = future.result()
-                    if isinstance(error, (SourceControlError, redis.RedisError)):
-                        raise error
-                    yield key, value, error, finished_at
-        finally:
             if executor is not None:
-                executor.stop()
-            for future in running:
-                future.cancel()
+                executor._check()
+            value = function()
+        except (SourceControlError, redis.RedisError):
+            raise
+        except Exception as exc:
+            yield key, None, exc, time.monotonic()
+        else:
+            yield key, value, None, time.monotonic()

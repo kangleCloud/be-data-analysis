@@ -14,8 +14,14 @@ def bounded_timeout(original: Any, read_seconds: float) -> tuple[float, float]:
 
 
 def error_metadata(exc: BaseException) -> dict[str, Any]:
+    if getattr(exc,'category',None) == 'RESOURCE':
+        return {'exception_type':type(exc).__name__,'root_type':type(exc).__name__,
+                'http_status':None,'category':'RESOURCE'}
     if all(hasattr(exc, field) for field in ("exception_type", "root_type", "http_status", "category")):
-        return {field: getattr(exc, field) for field in ("exception_type", "root_type", "http_status", "category")}
+        result = {field: getattr(exc, field) for field in ("exception_type", "root_type", "http_status", "category")}
+        if getattr(exc,'reason',None):
+            result.update(reason=exc.reason,fields=exc.fields,code=exc.code,bad_rows=exc.bad_rows)
+        return result
     chain = []
     seen = set()
     current = exc
@@ -45,8 +51,11 @@ def error_metadata(exc: BaseException) -> dict[str, Any]:
         category = "FORMAT"
     else:
         category = "UNEXPECTED"
-    return {"exception_type": type(exc).__name__, "root_type": type(chain[-1]).__name__,
+    result = {"exception_type": type(exc).__name__, "root_type": type(chain[-1]).__name__,
             "http_status": status, "category": category}
+    if hasattr(exc,'diagnostic') and getattr(exc,'reason',None):
+        result.update(reason=exc.reason,fields=exc.fields,code=exc.code,bad_rows=exc.bad_rows)
+    return result
 
 
 @contextmanager

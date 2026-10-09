@@ -13,12 +13,19 @@ services:
 
     image: be-data-analysis:local
     restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    init: true
 
     env_file:
       - .env.prod
 
     environment:
       APP_ENV: prod
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
       SERVICE_HOST: 0.0.0.0
       SERVICE_PORT: 8000
 

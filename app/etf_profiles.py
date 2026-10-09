@@ -8,6 +8,7 @@ from contextlib import closing
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from app.resources import SourceResourceError
 from app.etf_normalize import ths_profile
 from app.source_execution import completed, source_batch, SourceNotStartedError
 
@@ -36,7 +37,7 @@ class ProfileBatchError(RuntimeError):
 
 def collect_profiles(source: Any, client: Any,
                      symbols: list[str]) -> dict[str, Any]:
-    """单批最多两路源进程同步；此锁由 Python 持有，不使用 Java 整体刷新锁。"""
+    """单批串行同步；此锁由 Python 持有，不使用 Java 整体刷新锁。"""
     token = uuid4().hex
     if not client.set(LOCK_KEY, token, nx=True, ex=LOCK_SECONDS):
         raise ProfileBatchError(409, "ETF 资料批次正在运行")
@@ -64,7 +65,7 @@ def collect_profiles(source: Any, client: Any,
                 raise
         actions = [(symbol, "ths", lambda code=symbol: fetch(code)) for symbol in symbols]
         with source_batch(source, (LOCK_KEY, token), deadline), closing(
-            completed(actions, source=source, limit=2)
+            completed(actions, source=source, limit=1)
         ) as results:
             for symbol, rows, error, finished_at in results:
                 if rows is None and error is None:
@@ -76,6 +77,8 @@ def collect_profiles(source: Any, client: Any,
                     budget_exhausted = True
                     LOGGER.info("ETF 资料 %s 预算结束，未发起源请求", symbol)
                     continue
+                if isinstance(error,SourceResourceError):
+                    raise error
                 try:
                     if error:
                         raise error

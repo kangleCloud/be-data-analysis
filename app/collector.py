@@ -9,6 +9,7 @@ from contextlib import closing
 from zoneinfo import ZoneInfo
 
 from app.normalize import SourceDataError, normalize_core_indices, normalize_individual_batch, normalize_sectors
+from app.resources import SourceResourceError
 from app.core.logging import log_failure, redis_failure_kind
 from app.providers.akshare_market import MarketSource
 from app.providers.http import error_metadata
@@ -116,7 +117,7 @@ def _error_module(timestamp: str, message: str) -> dict[str, Any]:
 def _fallback(key: str, prior: Any, timestamp: str, message: str) -> dict[str, Any]:
     if _reusable_prior(key, prior):
         return {**prior, "status": "STALE", "lastAttemptAt": timestamp, "message": message}
-    return _error_module(timestamp, "暂无可用数据")
+    return _error_module(timestamp, message)
 
 
 class MarketCollector:
@@ -168,11 +169,12 @@ class MarketCollector:
             modules = {key: old_modules.get(key) if _reusable_prior(key, old_modules.get(key))
                        else _error_module(timestamp, "暂无可用数据") for key in MODULE_KEYS}
             failures = 0
+            resource_failed = False
             actions = [
-                ("marketFundFlow", "ths", self._provider.market_fund_flow),
+                ("coreIndices", "sina", self._provider.index_spot),
                 ("industrySectors", "ths", lambda: self._provider.sector_fund_flow("industry")),
                 ("conceptSectors", "ths", lambda: self._provider.sector_fund_flow("concept")),
-                ("coreIndices", "sina", self._provider.index_spot),
+                ("marketFundFlow", "ths", self._provider.market_fund_flow),
             ]
             def fetch(key: str, group: str, function: Any) -> Any:
                 source = "ths" if group == "ths" else "sina-index"
@@ -206,6 +208,11 @@ class MarketCollector:
                                         "lastSuccessAt": source_finished, "lastAttemptAt": timestamp,
                                         "message": None, "data": data}
                         LOGGER.info("模块 %s 成功，批次已耗时 %.2f 秒", key, clock.monotonic()-started)
+                    except SourceResourceError as exc:
+                        resource_failed = True
+                        failures += 1
+                        LOGGER.warning("模块 %s 资源失败 reason=%s memory=%s exitcode=%s",key,exc.reason,exc.state,exc.exitcode)
+                        modules[key] = _fallback(key,old_modules.get(key),timestamp,"采集资源不足或源进程退出，保留上次有效数据")
                     except SourceNotStartedError:
                         failures += 1
                         LOGGER.info("模块 %s 预算结束，未发起源请求", key)
@@ -226,13 +233,15 @@ class MarketCollector:
                             log_failure(LOGGER, key, exc)
                         else:
                             LOGGER.warning("模块 %s 失败，异常 %s，诊断 %s", key, type(exc).__name__,
-                                           exc.diagnostic() if isinstance(exc, SourceDataError) else error_metadata(exc))
+                                           exc.diagnostic() if getattr(exc,"reason",None) and hasattr(exc,"diagnostic") else error_metadata(exc))
                         modules[key] = _fallback(key, old_modules.get(key), timestamp,
-                                                 "本轮采集失败，展示上次成功数据")
+                                                 "资金源分页或数值校验失败，保留上次有效数据" if key == "marketFundFlow" and getattr(exc,"reason",None) else "本轮采集失败，展示上次成功数据")
                         fund_points = None
                     # 每个完成模块仅发布一次；尚未完成模块保持原数据/时间。
                     self._publish(token, collected_time(), modules, day, fund_points)
-            return "partial" if failures else "published"
+                    frame = None
+                    fund_points = None
+            return "resource" if resource_failed else "partial" if failures else "published"
         finally:
             self._store.stop_renewal()
             self._store.release(token)

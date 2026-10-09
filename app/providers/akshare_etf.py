@@ -42,7 +42,7 @@ class AkShareEtfProvider:
                 tuple(ALLOWED_HOSTS[kind]), cooldown, policy, kind == "profile"))
         except SourceCallError as exc:
             raise EtfSourceError(error_metadata(exc)) from exc
-        return frame.to_dict("records")
+        return frame.to_dict("records") if hasattr(frame,"to_dict") else frame
 
     def quotes(self) -> list[dict[str, Any]]:
         return self._call("quotes")

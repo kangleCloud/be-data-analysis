@@ -61,6 +61,27 @@ danjuanfunds.com
 | `fund_info_ths(symbol="六位代码")` | `AkShareEtfProvider.profile()` / `ths_profile()` | `fund.10jqka.com.cn/{code}/interduce.html`，GET；禁止重定向 | `字段/值` 非空且不冲突，基金代码匹配；全称、基金类型、投资类型、经理、成立日期、业绩基准、管理人、托管人八项至少一项有效。 |
 | `fund_individual_detail_hold_xq(symbol,date,timeout)` | `asset_allocation()` Provider / 同名标准化函数 | `danjuanfunds.com/djapi/fundx/base/fund/record/asset/percent`，GET，`fund_code=六位代码,report_date=YYYY-MM-DD` | AKShare 的 `date=YYYYMMDD`。至少一个有效资产类型及有限的0–100仓位占比；服务要求雪球总闸和已配置Token，但这个函数**没有 token 形参，不会传 Token 给它**。 |
 
+### 完整业务依赖与复用落点
+
+下表与上面的真实域名/路径表逐项对应，共13函数/14参数组合。行情和曲线只写Redis；Python字典、资料、资产配置返回包由Java落MySQL。管理页面的字典/资料刷新均经Java受保护内部入口；三块业务屏为市场总览、股票监控、ETF监控。
+
+| AKShare函数＋参数 | 真实源／标准化输出 | 调用入口与周期 | Redis／Java MySQL | 管理端、业务屏与复用／授权 |
+| --- | --- | --- | --- | --- |
+| `tool_trade_date_hist_sina()` | 新浪finance；当年交易日期列表 | 启动补建、月初00:10、calendar-refresh／jobs calendar | `stock:calendar:v1:trading-days`；不落行情库 | 三屏采集共用同一日历；公开源，总闸无关 |
+| `stock_fund_flow_industry(symbol="即时")` | 同花顺data；行业名称、指数、涨幅、流入/流出/净额元 | 自动轮指数后；collect／jobs market，启动≥120秒 | `stock:market:v1:snapshot.modules.industrySectors`及原更新频道 | 市场总览行业热力图/涨跌Top10/资金Top10复用一批；公开源 |
+| `stock_fund_flow_concept(symbol="即时")` | 同花顺data；同上，概念维度 | 自动轮行业后；collect／jobs market | 同快照`conceptSectors` | 市场总览概念热力图/涨跌Top10/资金Top10复用一批；公开源 |
+| `stock_fund_flow_individual(symbol="即时")` | 同花顺data；全市场流入/流出/净额、涨跌计数、逐股资金点 | 自动轮末；collect／jobs market，稳定代码倒序分页 | 同快照`marketFundFlow`＋`stock:monitor:v1:fund-series:{date}:{symbol}`、state-id/原通知同事务 | 总览资金/宽度＋启用≤10股票资金曲线复用全市场一批；Java由模块/日期/点生成AVAILABLE/STALE/NO_DATA/DISABLED；公开源 |
+| `stock_zh_index_spot_sina()` | 新浪vip；五核心指数价格/涨幅、指数曲线 | 自动轮ETF后；collect／jobs market | 同快照`coreIndices`及模块内曲线 | 总览指数卡及曲线同批；公开源 |
+| `stock_info_sh_name_code(symbol="主板A股")` | SSE query；symbol/code/name/market=SH | Python stock exchange-dictionary按需；Java工作日16:30整体刷新/手动刷新 | 返回→`stock_symbol_dictionary` | 股票字典管理→股票监控选股；与其他3组合串行合并；公开源 |
+| `stock_info_sh_name_code(symbol="科创板")` | SSE query；同上SH，非第二个唯一函数 | 同上 | 同上 | 同上 |
+| `stock_info_sz_name_code(symbol="A股列表")` | SZSE；同上market=SZ | 同上 | 同上 | 同上，全部组合成功才返回 |
+| `stock_info_bj_name_code()` | BSE分页；同上market=BJ | 同上 | 同上 | 同上，原POST分页串行 |
+| `stock_individual_basic_info_xq(symbol,token,timeout)` | 雪球stock；industry/listingDate/marketCap可空 | Python stock profiles按需；Java工作日16:30整体刷新/手动资料刷新 | 返回→`stock_monitor_profile` | 股票资料管理→股票监控基础资料；完整所需字段可复用120秒内XQ报价，缺字段查源；总闸＋授权Token |
+| `stock_individual_spot_xq(symbol,token,timeout)` | 雪球会话＋quote；现价/涨幅/量额/源时间/市值元 | 自动轮首；monitor-sample／jobs monitor；资料缺市值时补；同股120秒 | `stock:monitor:v1:quote:{symbol}`＋price-series/state-id/原频道 | 股票监控报价及价格曲线，市值供资料复用；源时间收盘严格>15:00；总闸＋授权Token |
+| `fund_etf_category_sina(symbol="ETF基金")` | 新浪vip；ETF代码/名称、交易价/量额 | 自动轮第二；etf-collect／jobs etf；Python dictionary按需优先当日缓存，缺失一次；Java工作日16:40整体刷新/手动字典刷新 | `stock:etf-monitor:v1:snapshot`、price-series及dictionary-source(TTL86400)；字典返回→`etf_symbol_dictionary` | ETF字典管理及ETF监控复用全表；非启用子集、非基金净值；公开源，总闸无关 |
+| `fund_info_ths(symbol=六位代码)` | 同花顺fund；八项基本资料至少一项有效 | Python etf profiles按需；Java工作日16:40整体刷新/手动资料刷新；同代码30分钟、≤10只串行、180秒批次 | 返回→`etf_monitor_profile`；控制锁/限频Redis，不保存原表 | ETF资料管理→ETF监控资料；成立日不作上市日；公开源，总闸无关 |
+| `fund_individual_detail_hold_xq(symbol,date,timeout)` | 蛋卷；资产类别/仓位百分比，请求期不作披露日 | 独立etf asset-allocation；只查指定报告期 | 返回→`etf_asset_allocation_report` | ETF资料/监控资产配置；公开状态由Java按MySQL报告＋总闸生成；服务要求总闸/已配Token，原函数无token参数 |
+
 ### 时间、单位与认证前提
 
 - 所有验证记录采用上海时间 `+08:00`，区分采集时刻、源交易时间和请求报告期。
@@ -79,10 +100,10 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 | --- | --- |
 | 市场行业/概念/个股/指数 | 整次源预算分别120/120/900/120秒；行情120秒间隔，快轮按未来定点节奏；慢轮耗时>=120秒完成回收后窗口内立即接续，不补旧轮、不重叠；THS分页>=1秒，新浪指数连续请求>=0.2秒。 |
 | 日历 | 子进程取结果等待 `SOURCE_TIMEOUT_SECONDS+10`（默认25秒），随后 join 最多2秒，超时终止回收；每月1日00:10、自动失败每日限频，手动600秒限频。 |
-| 交易所字典 | 四组受控并发，全部成功并校验后合并；每次调用60秒（含等待/回收），每次HTTP>=1秒，清理缓存。 |
-| 雪球个股 | 同股报价TTL=120秒，跨股票受控并发；行情批次300秒、资料批次600秒、单次源300秒，会话及数据每次HTTP>=1秒，不能仅按一次read估算完整资料批次。 |
+| 交易所字典 | 四组串行，全部成功并校验后合并；每次调用60秒（含等待/回收），每次HTTP>=1秒，清理缓存。 |
+| 雪球个股 | 同股报价TTL=120秒，跨股票串行；行情批次300秒、资料批次600秒、单次源300秒，会话及数据每次HTTP>=1秒，不能仅按一次read估算完整资料批次。 |
 | 新浪 ETF | 子进程总预算 `SOURCE_TIMEOUT_SECONDS+17`（默认32秒），预留2秒回收；SINA组跨入口实际HTTP>=0.2秒，行情120秒。固定函数目前一次 GET。 |
-| 同花顺 ETF 资料 | 同代码30分钟限频、最多10只、并发最多2路；批次180秒，源请求>=2秒，单次子进程不超过剩余批次预算；Python锁210秒，Java等待210秒。已发起请求的失败受既有资料限频保护；预算/配额耗尽且没有HTTP则SKIPPED并释放该次预留。 |
+| 同花顺 ETF 资料 | 同代码30分钟限频、最多10只、串行1路；批次180秒，源请求>=2秒，单次子进程不超过剩余批次预算；Python锁210秒，Java等待210秒。已发起请求的失败受既有资料限频保护；预算/配额耗尽且没有HTTP则SKIPPED并释放该次预留。 |
 | ETF 资产配置 | 单次子进程默认32秒；内部接口独立调用，不属于八个固定刷新入口，不使用 ETF 行情冷却键。 |
 
 市场HTTP403/429或明确风控拒绝共享源暂停7200秒；普通网络/读取超时、`AttributeError/IndexError`等解析失败及`SourceDataError`只暂停失败模块300秒。父进程与源子进程使用同一分类，按同一键NX写入，不扩大冷却范围、不续期。ETF**行情**403/429为7200秒，普通网络/超时/格式/标准化错误300秒；不把行情冷却规则误套到字典或资料路由。股票雪球认证拒绝/限流沿用7200秒保护。冷却跳过只记录INFO及剩余TTL，不访问源、不续期、不增加曲线点，保留旧有效数据为STALE。
@@ -91,21 +112,24 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 
 ## 共享执行控制与及时发布
 
-- CLI、调度、同步内部API和直接Provider共用 `stock:source-control:v1:` 控制键。全局8个 `slot:global:{0..7}`，每组4个 `slot:{ths|sina|xq|sse|szse|bse}:{0..3}`；XQ含蛋卷。同花顺行业/概念/个股/基金资料共享THS，日历/指数/ETF共享SINA。
-- 租约令牌TTL30秒，每10秒续租；未回收子进程不得释放名额，旧令牌不得删除新持有者。`rate:{group}` 和 `rate:ths:fund` 为HTTP启动时间门槛，TTL30秒；雪球采样沿用同代码120秒键。资料市值补充不套用采样同股间隔。
-- 每次函数调用独立spawn，不再嵌套ETF/日历真实源进程。子进程只请求源及操作控制键；父进程负责标准化、合并和业务写入。所有会话首页、分页、数据请求及重定向都先检查配额、业务锁、冷却和HTTP速率许可。分页串行；失败不继续下一页。
-- 每批只保留有限候选、不排队补跑旧轮。等待/初始化/HTTP/TERM→KILL→JOIN回收均计入原总预算，清理最多2秒。取消、控制Redis失败或业务锁失效停止调用；源进程看门狗在父进程消失时退出，禁止旧轮回写。
-- 市场资金、行业、概念三路可同时准入THS，指数独立SINA。每完成一模块，父进程事务合并完整快照并更新版本/通知；未完成模块保持旧数据与时间。市场成功仅追加一次市场/个股资金点，指数仅追加一次；结束时不重复发布。
-- 个股最多10只受控并发，每股完成立即发布，曲线仍用源时间；资料跨股并发、同股先资料后可选市值补充，整批成功后按请求顺序返回。股票资料及采样继续共用锁。ETF清单仍只调一次新浪全表；ETF资料按代码记录OK/ERROR/SKIPPED并按配置顺序返回；资产配置只占一个共享名额。
-- V1业务键、HTTP响应、同步完成语义、GET/SSE、严格晚于15:00的收盘确认、两日历史及雪球总闸保持原约束，不新增jobId或队列。
+- 自动、CLI、内部刷新和直接Provider共用 `stock:source-control:v1:entry` 非排队入口，令牌TTL30秒/10秒续租。忙时立即locked或HTTP409；只读GET/SSE不取此锁。全局 `slot:global:0` 和来源 `slot:{ths|sina|xq|sse|szse|bse}:0` 各1个名额，XQ含蛋卷；租约30秒/10秒续租，回收子进程后才按令牌释放。历史8/4或4/2配额已删除。
+- 一个服务父进程、一条自动行情循环；顺序为股票报价→ETF→指数→行业→概念→全市场个股资金，轮内串行。每股/模块完成立即提交，未完成模块保持旧数据和时间。月初日历同父进程独立轻量循环，共用入口。没有三条CLI父进程、后台任务队列或补跑旧点。
+- 启动至少相隔120秒，快轮等未来定点；慢轮在交易窗口完成并回收后接续，从股票报价和ETF开始。休市后等下一窗口。交易日、午休、总闸、启用清单最多10只、严格源时间>15:00收盘确认、15:02/04/06/08/10补收盘不变。
+- 每个AKShare调用只有一个spawn子进程。子进程导入AKShare、请求并把DataFrame转精简records后释放；服务父进程不导入AKShare/pandas。所有实际HTTP（会话、分页、重定向）仍检查域名、令牌、锁、冷却和启动间隔，失败不继续后页。等待/初始化/HTTP/TERM→KILL→JOIN都计入原预算，预留回收2秒。
+- Compose设`mem_limit=512m`、`memswap_limit=512m`、`pids_limit=128`、`init=true`；BLAS/OMP/MKL线程为1。**cgroup总内存**达到400MiB停止新准入并TERM/KILL/reap当前子进程，资源状态独立返回RESOURCE；不启动403/429或普通源冷却。日志记录初始化/请求/转换耗时、退出码/信号/取消原因、memory.current/peak和可取得的oom_kill。SIGKILL本身不能证明OOM。Redis失败独立终止，保留已发布有效结果。
+- 全市场资金一批同时产出汇总、涨跌计数和启用个股资金点，不加逐股请求。市场快照、曲线、股票state-id和事件使用原`monitor_event_lock`及同一Redis事务。没有新点时，marketFundFlow真实结果/日期/诊断变化也向当前启用股票发送原有事件；单纯重试时间改变不重复发通知，不伪造资金点。
+- 股票资料仅复用同代码、XQ来源、FRESH且collectedAt不超过120秒的所需字段。缺字段仍查原源；补市值报价也受同股120秒间隔。Python不增加定期资料轮询；Java保留工作日16:30股票/16:40ETF整体刷新及手动入口，不猜市值。
+- ETF新浪全表一次取回用于启用报价及`stock:etf-monitor:v1:dictionary-source`，缓存`{schemaVersion:1,source:"SINA",collectedAt,etfs:[symbol/code/name/market]}`，TTL86400，不保存行情原表或仅启用子集。字典同步优先上海当日合法缓存，否则只调一次新浪。缓存写失败属于Redis故障，不能报成功或触发源格式冷却。
+- ETF交易价格仍为新浪交易价，基金净值不作替代；fundFlowStatus=NO_RELIABLE_SOURCE。资产配置报告由Java写MySQL，公开状态由Java按真实报告与总闸计算，Python报价不推测AVAILABLE。关闭总闸保留历史报告、不请求雪球。报价与曲线均不写MySQL。
+- 资产配置失败使用`HTTPException.detail.reason`：RESOURCE/NO_DATA/DISABLED/SOURCE。忙409、冷却/间隔429、参数422、资源/关闭503、源/无数据502。NO_DATA仅确实为空或该请求期无有效类别；KeyError、格式变更/未知异常为SOURCE。只请求指定期，不扫其他期、不立即重试；Java固定中文文案按reason映射。其他任务资源终态为HTTP503、state=FAILED、outcome=resource。
 
-## 市场自动接续与生产失败证据
+## 即时个股分页修复与验证限制
 
-市场两次启动至少120秒，Redis 120秒限频仍生效。快轮按未来定点节奏；慢轮耗时>=120秒且当前仍在交易窗口，等待子进程退出与回收后立即接续。休市后等待下一交易窗口，不补历史时段、不重叠，locked/throttled等快速退出不会忙循环。只改变市场自动调度；ETF/个股调度以及个股15:02/04/06/08/10补收盘保持原规则。前端延迟或SSE断开不会触发额外源请求。
+固定AKShare1.18.97的即时个股函数先按code倒序取页数、随后原源码按zdf分页。涨幅排序在长采集过程中会移动，最新日志2026-10-09 15:04:06/15:12:10已记录DUPLICATE_CONFLICT（74/134行，公开代码300613/605133），此前批次未发布资金点。排序移动是根据源码与重复证据作出的推断，未以真实源复测证明。
 
-固定AKShare1.18.97的三个同花顺函数已通过mock HTTP表格验证列名、金额单位与可空领涨字段；个股源净额可缺失，流入/流出等必需值缺失及重复冲突仍拒绝整批。聚合超出有限数值范围时拒绝发布，记录`AGGREGATE_OVERFLOW`及字段/行数，避免到Redis序列化阶段才失败。
+现仅对`stock_fund_flow_individual(symbol="即时")`、`data.10jqka.com.cn`准确`/funds/ggzjl/field/zdf/order/desc/page/{n}/ajax/1/free/1/`改为`field/code`；初始取页数请求不变，金额仍由原AKShare解析。行业/概念和3/5/10/20日参数不改。审计初始总页数、页序、非空页面、六位代码严格倒序、全批无重复及原始行数；分页响应若带page_info则核对，无该字段时按初始页数及请求顺序审计。源不支持稳定代码排序或出现缺页/重复/冲突时拒绝全批；不做最后值覆盖和不完整汇总。关键金额与有限聚合校验保持严格。
 
-旧附件日志缺少`reason/fields/code/badRows`，且包含旧`SourceCooldownError`，不能证明当前生产根因。仍需**当前部署版本/AKShare版本、发生时刻与模块、接口耗时、异常类别/底层类别/HTTP状态，以及标准化诊断reason/fields/badRows/可公开六位code**；不得提供原始响应、Cookie、密码或Token。仅“接口成功后SourceDataError”不足以判断缺失列、无效金额或批次冲突。离线验证不代表当前源站可用。
+离线mock固定AKShare真实解析覆盖多页/单位、精确改写范围、重复/排序/缺页/行数、关键金额以及资源/事件/缓存/调用次数。**本机没有Docker，512MiB容器实测未执行，真实单轮未执行**；生产日志未提供OOM计数/证据，不宣称早退是OOM。后续仅在非生产、512MiB受限容器中最多单轮验证，不接生产Redis或Token，失败停止；记录cgroup总峰值、函数耗时、行数、业务校验及退出原因，不把离线通过等同源当前可用。
 
 ## 只读业务数据的单源验证步骤
 
@@ -208,7 +232,7 @@ curl --noproxy '*' --proxy '' --max-time 1440 -X POST \
 | 分页进度 | 源worker内`quiet_progress()`关闭tqdm | 仍出现0/8至8/8 |
 | ETF未知异常 | 脱敏类别与保留原调用帧的诊断 | 仅`RuntimeError`不足以定位 |
 
-这些特征提示运行文件、解释器/目录、容器实例或日志来源需要核对，**不能仅凭片段断言旧镜像**。本轮8/4配额尚未部署时，生产为前轮4/2本身正常；异常名、脱敏日志和关闭进度条则是前轮已有特征。挂载的日志文件跨容器重建保留旧记录，需要匹配时间、PID、task及镜像ID，不将混合记录误当当前进程输出。
+这些特征提示运行文件、解释器/目录、容器实例或日志来源需要核对，**不能仅凭片段断言旧镜像**。新1/1配置尚未部署时，生产仍为前轮配额本身正常；异常名、脱敏日志和关闭进度条则是前轮已有特征。挂载的日志文件跨容器重建保留旧记录，需要匹配时间、PID、task及镜像ID，不将混合记录误当当前进程输出。
 
 ### 1. 核对容器与实际运行文件
 

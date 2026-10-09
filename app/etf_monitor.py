@@ -9,6 +9,8 @@ from uuid import uuid4
 from contextlib import ExitStack
 from zoneinfo import ZoneInfo
 
+from app.etf_dictionary import save_dictionary
+from app.resources import SourceResourceError
 from app.collector import _in_collection_window
 from app.core.logging import log_failure, redis_failure_kind
 from app.etf_normalize import etf_symbol, quote_rows
@@ -172,6 +174,7 @@ class EtfCollector:
         previous = self.store.load() or {}
         old_items = {item["symbol"]: item for item in previous.get("items", [])}
         failed = 0
+        resource_failed = False
         source_finished = None
         cooling = self.store.cooldown_active()
         if cooling:
@@ -182,7 +185,13 @@ class EtfCollector:
             try:
                 rows = self.source.quotes()
                 source_finished = time.monotonic()
+                save_dictionary(self.store.client,rows,local+timedelta(seconds=source_finished-started))
                 quotes = quote_rows(rows)
+                del rows
+            except SourceResourceError as exc:
+                resource_failed = True
+                LOGGER.warning("ETF资源失败 reason=%s memory=%s exitcode=%s",exc.reason,exc.state,exc.exitcode)
+                quotes, failed = {}, len(symbols)
             except SourceNotStartedError:
                 cooling = True
                 LOGGER.info("ETF 行情预算结束，未发起源请求")
@@ -249,4 +258,4 @@ class EtfCollector:
             "generatedAt": collected_at, "tradeDate": local.date().isoformat(),
             "items": items,
         })
-        return "cooldown" if cooling else "partial" if failed else "published"
+        return "resource" if resource_failed else "cooldown" if cooling else "partial" if failed else "published"

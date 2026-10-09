@@ -11,6 +11,7 @@ from contextlib import closing
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from app.resources import SourceResourceError
 from app.providers.xueqiu import XueqiuSourceError
 from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, completed, source_batch
 import redis
@@ -107,6 +108,7 @@ def normalize_quote(symbol: str, raw: dict[str, Any], collected_at: datetime) ->
         "averagePrice": _number(raw.get("avg_price")),
         "volume": _number(raw.get("volume")),
         "previousClose": _number(raw.get("previous_close")),
+        "marketCap": _number(raw.get("market_capital")),
         "status": "FRESH",
     }
 
@@ -271,6 +273,7 @@ class StockMonitorSampler:
                             self._mark_failed(stock["symbol"], local)
                 return "cooldown"
             failures = 0
+            resource_failed = False
             candidates = []
             for stock in stocks:
                 symbol = stock["symbol"]
@@ -313,6 +316,12 @@ class StockMonitorSampler:
                         if previous_time == source_time:
                             self._preserve_stale(symbol, quote, previous, local, "source_unchanged")
                             continue
+                    except SourceResourceError as exc:
+                        resource_failed = True
+                        failures += 1
+                        LOGGER.warning("雪球资源失败 reason=%s memory=%s exitcode=%s",exc.reason,exc.state,exc.exitcode)
+                        self._mark_failed(symbol,local)
+                        continue
                     except SourceThrottledError as exc:
                         LOGGER.info("雪球报价 %s 限频跳过，剩余 TTL %d 秒", symbol, exc.ttl)
                         if close_retry:
@@ -345,7 +354,7 @@ class StockMonitorSampler:
                     if self.store.client.get(SAMPLE_LOCK_KEY) != token:
                         raise SourceControlError("业务任务锁已失效")
                     self.store.write_quote(quote, append_point=True)
-            return "partial" if failures else "published"
+            return "resource" if resource_failed else "partial" if failures else "published"
         finally:
             self.store.release(token)
 

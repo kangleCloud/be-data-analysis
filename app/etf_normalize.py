@@ -129,8 +129,14 @@ def ths_profile(rows: list[dict[str, Any]], symbol: str,
     return profile
 
 
+class AllocationNoData(ValueError):
+    """确实为空或该报告期无有效类别，不含格式变化/未知异常。"""
+
+
 def asset_allocation(rows: list[dict[str, Any]], symbol: str,
                      report_period: str, collected_at: str) -> dict[str, Any]:
+    if not isinstance(rows,list) or any(not isinstance(row,dict) or not {'资产类型','仓位占比'}.issubset(row) for row in rows):
+        raise ValueError('雪球资产配置字段变化')
     categories = []
     for row in rows:
         category = _text(row.get("资产类型"))
@@ -138,7 +144,7 @@ def asset_allocation(rows: list[dict[str, Any]], symbol: str,
         if category is not None and percent is not None and 0 <= percent <= 100:
             categories.append({"category": category, "percent": percent})
     if not categories:
-        raise ValueError("雪球资产配置无有效类别")
+        raise AllocationNoData("雪球资产配置无有效类别")
     return {
         "schemaVersion": 1, "symbol": symbol,
         "requestedReportPeriod": date.fromisoformat(

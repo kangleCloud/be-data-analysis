@@ -2,11 +2,15 @@
 
 import asyncio
 import logging
-import sys
 import time as clock
 
-from app.process_wait import wait_worker
 from app.collector import _in_collection_window
+from app.stock_monitor_scheduler import next_sample_slot
+from app.core.config import get_settings
+from app.core.logging import log_failure
+from app.workflows import run_auto
+import threading
+import redis
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -36,37 +40,55 @@ def next_slot(after: datetime) -> datetime:
     raise AssertionError("未找到后续采集时段")
 
 
-async def launch_slot(slot: datetime, now: datetime) -> bool:
-    """仅在时段刚到时启动一次性采集子进程。"""
-    lag = (now - slot).total_seconds()
-    if lag < 0 or lag > MAX_START_LAG_SECONDS:
-        LOGGER.info("跳过错过的采集时段: %s", slot.isoformat())
-        return False
-    process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app", "collect")
-    exit_code = await wait_worker(process)
-    LOGGER.info("采集时段 %s 子进程退出: %s", slot.isoformat(), exit_code)
-    return True
+def next_auto_slot(after: datetime) -> datetime:
+    return min(next_slot(after),next_sample_slot(after))
 
 
-async def run_scheduler() -> None:
-    """快轮沿用定点节奏，慢轮完成回收后接续；两次启动至少相隔120秒。"""
-    last_started = None
-    last_monotonic = None
+def _round(settings,cancel):
+    client = redis.Redis.from_url(settings.redis_url.get_secret_value(),decode_responses=True,
+                                  socket_timeout=1,socket_connect_timeout=1)
+    try:
+        return run_auto(settings,client,cancel=cancel)
+    finally:
+        client.close()
+
+
+async def run_scheduler(settings=None) -> None:
+    """单服务父进程复用业务函数，轮内串行、跨轮至少120秒、长轮短任务优先。"""
+    settings = settings or get_settings()
+    last_started = last_monotonic = None
     continue_now = False
-    while True:
-        now = datetime.now(SHANGHAI)
-        slot = now if continue_now and _in_collection_window(now) else next_slot(now)
-        if last_started is not None:
-            earliest = last_started + timedelta(seconds=MIN_START_SECONDS)
-            if slot < earliest:
-                slot = earliest if _in_collection_window(earliest) else next_slot(earliest)
-        delay = max(0, (slot-now).total_seconds())
-        if last_monotonic is not None:
-            delay = max(delay, MIN_START_SECONDS-(clock.monotonic()-last_monotonic))
-        await asyncio.sleep(delay)
-        actual_start = datetime.now(SHANGHAI)
-        started = clock.monotonic()
-        launched = await launch_slot(slot, actual_start)
-        if launched:
-            last_started, last_monotonic = actual_start, started
-        continue_now = launched and clock.monotonic()-started >= MIN_START_SECONDS
+    cancel = threading.Event()
+    try:
+        while True:
+            now = datetime.now(SHANGHAI)
+            slot = now if continue_now and _in_collection_window(now) else next_auto_slot(now)
+            if last_started is not None:
+                earliest = last_started+timedelta(seconds=MIN_START_SECONDS)
+                if slot < earliest:
+                    slot = earliest if _in_collection_window(earliest) else next_auto_slot(earliest)
+            delay = max(0,(slot-now).total_seconds())
+            if last_monotonic is not None:
+                delay = max(delay,MIN_START_SECONDS-(clock.monotonic()-last_monotonic))
+            await asyncio.sleep(delay)
+            actual = datetime.now(SHANGHAI)
+            if (actual-slot).total_seconds() > MAX_START_LAG_SECONDS:
+                continue_now = False
+                continue
+            last_started,last_monotonic = actual,clock.monotonic()
+            work = asyncio.create_task(asyncio.to_thread(_round,settings,cancel))
+            try:
+                outcome = await asyncio.shield(work)
+                LOGGER.info('串行行情轮完成: %s',outcome)
+            except asyncio.CancelledError:
+                cancel.set()
+                try:
+                    await work
+                except Exception as exc:
+                    log_failure(LOGGER,'auto-round-shutdown',exc)
+                raise
+            except Exception as exc:
+                log_failure(LOGGER,'auto-round',exc)
+            continue_now = clock.monotonic()-last_monotonic >= MIN_START_SECONDS
+    finally:
+        cancel.set()

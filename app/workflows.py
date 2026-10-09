@@ -1,6 +1,8 @@
 """CLI、自动调度和内部手动任务复用的业务入口。"""
 
 from datetime import datetime
+from functools import wraps
+from app.collection_gate import collection_entry, check_entry
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,10 +20,21 @@ from app.trading_calendar import AkShareCalendarSource, CalendarService
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def exclusive(function):
+    @wraps(function)
+    def run(settings,client,**kwargs):
+        with collection_entry(client) as acquired:
+            if not acquired:
+                return 'locked'
+            return function(settings,client,**kwargs)
+    return run
+
+
 def calendar_service(settings: Settings, client: Any) -> CalendarService:
     return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)))
 
 
+@exclusive
 def run_calendar(settings: Settings, client: Any, *, manual: bool = False,
                  at: datetime | None = None) -> str:
     return calendar_service(settings, client).refresh(
@@ -29,6 +42,7 @@ def run_calendar(settings: Settings, client: Any, *, manual: bool = False,
     )
 
 
+@exclusive
 def run_market(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
     return MarketCollector(
         AkShareMarketProvider(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
@@ -37,6 +51,7 @@ def run_market(settings: Settings, client: Any, *, at: datetime | None = None) -
     ).collect(at or datetime.now(SHANGHAI))
 
 
+@exclusive
 def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
     if not settings.stock_monitor_xq_enabled:
         return "disabled"
@@ -45,14 +60,27 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) 
         return "missing_token"
     return StockMonitorSampler(
         MonitorStore(client),
-        XueqiuProvider(token, settings.source_timeout_seconds, sample_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
+        XueqiuProvider(token, settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
         calendar_service(settings, client),
         xq_enabled=True,
     ).sample(at or datetime.now(SHANGHAI))
 
 
+@exclusive
 def run_etf(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
     return EtfCollector(
         AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
         EtfStore(client), calendar_service(settings, client),
     ).collect(at or datetime.now(SHANGHAI))
+
+
+def run_auto(settings: Settings,client: Any,*,cancel=None) -> dict[str,str]:
+    """一个服务父进程按短任务优先的固定顺序完成一轮，不补跑过期点。"""
+    with collection_entry(client,cancel) as acquired:
+        if not acquired:
+            return {'outcome':'locked'}
+        outcomes = {}
+        for key,function in [('monitor',run_monitor),('etf',run_etf),('market',run_market)]:
+            check_entry()
+            outcomes[key] = function(settings,client,at=datetime.now(SHANGHAI))
+        return outcomes

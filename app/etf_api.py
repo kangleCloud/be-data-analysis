@@ -12,8 +12,11 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from app.core.config import Settings
-from app.source_execution import SourceExecutor
-from app.etf_normalize import asset_allocation, catalog, etf_symbol
+from app.source_execution import SourceExecutor, SourceBusyError, SourceCoolingError, SourceThrottledError
+from app.resources import SourceResourceError
+from app.collection_gate import collection_entry
+from app.etf_dictionary import load_dictionary, save_dictionary, dictionary_response
+from app.etf_normalize import asset_allocation, etf_symbol, AllocationNoData
 from app.etf_profiles import ProfileBatchError, collect_profiles
 from app.providers.akshare_etf import AkShareEtfProvider
 
@@ -50,6 +53,10 @@ def create_etf_router(
             executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
         )
 
+    def redis_client():
+        return redis_factory() if redis_factory else redis.Redis.from_url(settings.redis_url.get_secret_value(),
+            decode_responses=True,socket_timeout=1,socket_connect_timeout=1)
+
     def valid_day(value: str) -> bool:
         if not re.fullmatch(r"\d{8}", value):
             return False
@@ -64,15 +71,30 @@ def create_etf_router(
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        client = None
         try:
-            return {
-                "schemaVersion": 1, "source": "SINA",
-                "collectedAt": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
-                "etfs": catalog(provider().quotes()),
-            }
+            client = redis_client()
+            now = datetime.now(SHANGHAI)
+            cached = load_dictionary(client,now)
+            if cached:
+                return dictionary_response(cached)
+            with collection_entry(client) as entered:
+                if not entered:
+                    raise HTTPException(status_code=409,detail='采集入口忙碌')
+                rows = provider().quotes()
+                return dictionary_response(save_dictionary(client,rows,datetime.now(SHANGHAI)))
+        except HTTPException:
+            raise
+        except SourceBusyError as exc:
+            raise HTTPException(status_code=409,detail='采集入口忙碌') from exc
+        except SourceResourceError as exc:
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
         except Exception as exc:
-            LOGGER.warning("ETF 字典同步失败，异常 %s", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="ETF 字典同步失败") from exc
+            LOGGER.warning("ETF 字典同步失败，异常 %s",type(exc).__name__)
+            raise HTTPException(status_code=502,detail='ETF 字典同步失败') from exc
+        finally:
+            if client is not None:
+                client.close()
 
     @router.post("/profiles", summary="同步同花顺 ETF 基本资料")
     def profile_list(
@@ -94,7 +116,14 @@ def create_etf_router(
                 settings.redis_url.get_secret_value(), decode_responses=True,
                 socket_timeout=5, socket_connect_timeout=5,
             )
-            return collect_profiles(provider(), client, symbols)
+            with collection_entry(client) as entered:
+                if not entered:
+                    raise HTTPException(status_code=409,detail='采集入口忙碌')
+                return collect_profiles(provider(),client,symbols)
+        except HTTPException:
+            raise
+        except SourceResourceError as exc:
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
         except ProfileBatchError as exc:
             raise HTTPException(status_code=exc.status_code, detail={
                 "message": str(exc), "sourceStatus": exc.states,
@@ -113,18 +142,34 @@ def create_etf_router(
     ) -> dict[str, Any]:
         authorize(x_internal_token)
         if not settings.stock_monitor_xq_enabled or not settings.xueqiu_token.get_secret_value():
-            raise HTTPException(status_code=503, detail="雪球生产采集未启用")
+            raise HTTPException(status_code=503, detail={"reason":"DISABLED","message":"雪球生产采集未启用"})
         symbol = etf_symbol(request.symbol)
         if symbol is None or not valid_day(request.reportPeriod):
             raise HTTPException(status_code=422, detail="ETF 代码或请求报告期不正确")
+        client = None
         try:
-            now = datetime.now(SHANGHAI).isoformat(timespec="seconds")
-            return asset_allocation(
-                provider().asset_allocation(symbol[2:], request.reportPeriod),
-                symbol, request.reportPeriod, now,
-            )
+            client = redis_client()
+            with collection_entry(client) as entered:
+                if not entered:
+                    raise HTTPException(status_code=409,detail='采集入口忙碌')
+                rows = provider().asset_allocation(symbol[2:],request.reportPeriod)
+                now = datetime.now(SHANGHAI).isoformat(timespec='seconds')
+                return asset_allocation(rows,symbol,request.reportPeriod,now)
+        except HTTPException:
+            raise
+        except SourceBusyError as exc:
+            raise HTTPException(status_code=409,detail='采集入口忙碌') from exc
+        except (SourceCoolingError,SourceThrottledError) as exc:
+            raise HTTPException(status_code=429,detail='源保护或请求间隔未满足') from exc
+        except SourceResourceError as exc:
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+        except AllocationNoData as exc:
+            raise HTTPException(status_code=502,detail={'reason':'NO_DATA','message':'该报告期无有效资产配置'}) from exc
         except Exception as exc:
-            LOGGER.warning("ETF 资产配置源失败，异常 %s", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="ETF 资产配置源失败") from exc
+            LOGGER.warning('ETF资产配置源失败，异常 %s',type(exc).__name__)
+            raise HTTPException(status_code=502,detail={'reason':'SOURCE','message':'资产配置源失败'}) from exc
+        finally:
+            if client is not None:
+                client.close()
 
     return router

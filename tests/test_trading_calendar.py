@@ -189,3 +189,17 @@ def test_old_multiyear_payload_without_year_is_rejected():
     new_year = datetime(2027, 1, 1, 0, 10, tzinfo=SHANGHAI)
     assert CalendarService(client, source).day_status(new_year.date(), new_year) is None
     assert client.get(CACHE_KEY) == json.dumps(old)
+
+
+def test_calendar_resource_error_is_distinct_and_preserves_cache():
+    from app.resources import SourceResourceError
+    from app.trading_calendar import CACHE_KEY
+    from tests.test_snapshot import FakeRedis
+    client=FakeRedis()
+    client.set(CACHE_KEY,'previous')
+    class Source:
+        def dates(self):
+            raise SourceResourceError('PROCESS_EXIT',exitcode=-9)
+    with pytest.raises(SourceResourceError):
+        CalendarService(client,Source()).refresh(datetime(2026,10,9,10,tzinfo=SHANGHAI),manual=True)
+    assert client.get(CACHE_KEY)=='previous'

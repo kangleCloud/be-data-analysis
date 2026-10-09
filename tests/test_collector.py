@@ -287,8 +287,8 @@ def test_market_source_failure_leaves_fund_series_and_snapshot_stale(flow_rows, 
     assert client.get(key) == first
     assert store.load()["modules"]["marketFundFlow"]["status"] == "STALE"
     assert len(client.transactions) == 8
-    assert not any(command[:2] == ("publish", "stock:monitor:v1:updates")
-                   for transaction in client.transactions[4:] for command in transaction)
+    assert sum(command[:2] == ("publish", "stock:monitor:v1:updates")
+               for transaction in client.transactions[4:] for command in transaction) == 1
 
 
 def test_fund_history_keeps_two_data_days_and_holiday_does_not_prune(flow_rows, market_rows):
@@ -421,7 +421,7 @@ def test_market_rejection_is_shared_but_ordinary_failure_is_module_only(flow_row
     scope = "ths" if shared else "module:industrySectors"
     assert store.cooldown_remaining(scope) == (7200 if shared else 300)
     assert provider.calls.count("failure") == 1
-    assert provider.calls.count("market") == 1 and "index" in provider.calls
+    assert provider.calls.count("market") == (0 if shared else 1) and "index" in provider.calls
     if not shared:
         assert not store.cooldown_active("ths")
         assert store.load()["modules"]["conceptSectors"]["status"] == "FRESH"
@@ -520,32 +520,19 @@ def test_business_write_failure_stops_admitting_later_modules(flow_rows, market_
     assert not [event for event in client.events if event[0] == 'publish']
 
 
-def test_all_three_ths_market_modules_are_admitted_together(flow_rows, market_rows):
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-    provider, client, store, collector = setup(flow_rows, market_rows)
-    started, release, mutex = threading.Event(), threading.Event(), threading.Lock()
-    seen = set()
-    market, sector = provider.market_fund_flow, provider.sector_fund_flow
-    def enter(name):
-        with mutex:
-            seen.add(name)
-            if len(seen) == 3:
-                started.set()
-        assert release.wait(timeout=3)
-    def fetch_market():
-        enter('market')
-        return market()
-    def fetch_sector(kind):
-        enter(kind)
-        return sector(kind)
-    provider.market_fund_flow, provider.sector_fund_flow = fetch_market, fetch_sector
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(collector.collect,TRADING_AT)
-        try:
-            assert started.wait(timeout=2)
-            assert seen == {'market','industry','concept'}
-        finally:
-            release.set()
-        assert future.result(timeout=2) == 'published'
-    assert all(item['status']=='FRESH' for item in store.load()['modules'].values())
+def test_market_modules_are_serial_and_publish_before_next_source(flow_rows,market_rows):
+    provider,client,store,collector = setup(flow_rows,market_rows)
+    original_market,original_sector = provider.market_fund_flow,provider.sector_fund_flow
+    def sector(kind):
+        modules = store.load()['modules']
+        assert modules['coreIndices']['status'] == 'FRESH'
+        if kind == 'concept':
+            assert modules['industrySectors']['status'] == 'FRESH'
+        return original_sector(kind)
+    def market():
+        assert store.load()['modules']['conceptSectors']['status'] == 'FRESH'
+        return original_market()
+    provider.market_fund_flow,provider.sector_fund_flow = market,sector
+    assert collector.collect(TRADING_AT) == 'published'
+    assert provider.calls == ['calendar','index','flow:industry','flow:concept','market']
+    assert all(item['status'] == 'FRESH' for item in store.load()['modules'].values())

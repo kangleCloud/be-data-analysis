@@ -15,13 +15,11 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from app.core import msg
 from app.core.config import Settings, get_settings
 from app.core.logging import log_failure
-from app.calendar_scheduler import run_calendar_scheduler
 from app.etf_api import create_etf_router
-from app.etf_scheduler import run_etf_scheduler
 from app.jobs_api import create_jobs_router
 from app.scheduler import run_scheduler
+from app.calendar_scheduler import run_calendar_scheduler
 from app.stock_monitor_api import create_monitor_router
-from app.stock_monitor_scheduler import run_monitor_scheduler
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,19 +35,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
-        task = asyncio.create_task(run_scheduler()) if scheduler_enabled else None
-        calendar_task = (
-            asyncio.create_task(run_calendar_scheduler(configured)) if scheduler_enabled else None
-        )
-        monitor_task = (
-            asyncio.create_task(run_monitor_scheduler())
-            if scheduler_enabled and configured.stock_monitor_xq_enabled else None
-        )
-        etf_task = asyncio.create_task(run_etf_scheduler()) if scheduler_enabled else None
+        task = asyncio.create_task(run_scheduler(configured)) if scheduler_enabled else None
+        calendar_task = asyncio.create_task(run_calendar_scheduler(configured)) if scheduler_enabled else None
         try:
             yield
         finally:
-            for running in (task, calendar_task, monitor_task, etf_task):
+            for running in (task,calendar_task):
                 if running is not None:
                     running.cancel()
                     with suppress(asyncio.CancelledError):

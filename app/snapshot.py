@@ -62,6 +62,13 @@ class SnapshotStore(Protocol):
     def start_cooldown(self, source: str, seconds: int = SOURCE_COOLDOWN_SECONDS) -> None: ...
 
 
+def _fund_state(module):
+    if not isinstance(module,dict):
+        return None
+    # 仅重试时刻变化不改变资金状态，不重复唤醒；真实结果/日期/诊断变化则通知。
+    return tuple(module.get(key) for key in ('status','tradeDate','lastSuccessAt','message'))
+
+
 class RedisSnapshotStore:
     """以 Redis 事务发布快照、资金点和通知；保留旧成功数据供降级。"""
 
@@ -138,9 +145,11 @@ class RedisSnapshotStore:
 
     def save(self, snapshot: dict[str, Any], *, trade_date: str | None = None,
              fund_points: dict[str, dict[str, Any]] | None = None) -> None:
-        if fund_points:
+        old = self.load() or {}
+        changed = _fund_state(old.get('modules',{}).get('marketFundFlow')) != _fund_state(snapshot.get('modules',{}).get('marketFundFlow'))
+        if fund_points or changed:
             with monitor_event_lock(self._client):
-                self._save_transaction(snapshot, trade_date=trade_date, fund_points=fund_points)
+                self._save_transaction(snapshot,trade_date=trade_date,fund_points=fund_points)
         else:
             self._save_transaction(snapshot)
 
@@ -206,14 +215,18 @@ class RedisSnapshotStore:
                     pipe.delete(f"{FUND_SERIES_PREFIX}{day}:{symbol}")
                 pipe.delete(index_key)
         pipe.set(SNAPSHOT_KEY, payload)
-        if fund_points:
+        state_changed = _fund_state(old_modules.get('marketFundFlow')) != _fund_state(new_modules.get('marketFundFlow'))
+        changed_symbols = set(fund_points or {})
+        if state_changed:
+            changed_symbols.update(self.enabled_symbols())
+        if changed_symbols:
             from app.stock_monitor import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
 
             base_id = self._client.get(MONITOR_STATE_KEY)
             state_id = uuid4().hex
             monitor_notice = json.dumps({
                 "baseStateId": base_id, "stateId": state_id,
-                "changedSymbols": sorted(fund_points),
+                "changedSymbols": sorted(changed_symbols),
             }, ensure_ascii=False, separators=(",", ":"))
             pipe.set(MONITOR_STATE_KEY, state_id)
             pipe.publish(MONITOR_UPDATES_CHANNEL, monitor_notice)
