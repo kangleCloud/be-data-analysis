@@ -182,6 +182,12 @@ def normalize_individual_batch(
     inflow_total = sum(row[1] for row in values)
     outflow_total = sum(row[2] for row in values)
     net_total = inflow_total - outflow_total
+    overflowing = tuple(field for field, amount in zip(
+        ("流入资金", "流出资金", "净额"), (inflow_total, outflow_total, net_total)
+    ) if not math.isfinite(amount))
+    if overflowing:
+        raise SourceDataError("市场汇总金额超出有限数值范围", reason="AGGREGATE_OVERFLOW",
+                              fields=overflowing, bad_rows=len(stocks))
     audited = [code for code, source_net in audit.items() if source_net is not None]
     source_net_total = sum(audit[code] for code in audited)
     audited_net = sum(stocks[code][1][1] - stocks[code][1][2] for code in audited)

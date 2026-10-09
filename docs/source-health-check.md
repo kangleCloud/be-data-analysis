@@ -77,7 +77,7 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 
 | 业务 | 调用约束 |
 | --- | --- |
-| 市场行业/概念/个股/指数 | 整次源预算分别120/120/900/120秒；行情120秒间隔，慢任务等完成后跳过错过时段，不补跑、不重叠；THS分页>=1秒，新浪指数连续请求>=0.2秒。 |
+| 市场行业/概念/个股/指数 | 整次源预算分别120/120/900/120秒；行情120秒间隔，快轮按未来定点节奏；慢轮耗时>=120秒完成回收后窗口内立即接续，不补旧轮、不重叠；THS分页>=1秒，新浪指数连续请求>=0.2秒。 |
 | 日历 | 子进程取结果等待 `SOURCE_TIMEOUT_SECONDS+10`（默认25秒），随后 join 最多2秒，超时终止回收；每月1日00:10、自动失败每日限频，手动600秒限频。 |
 | 交易所字典 | 四组受控并发，全部成功并校验后合并；每次调用60秒（含等待/回收），每次HTTP>=1秒，清理缓存。 |
 | 雪球个股 | 同股报价TTL=120秒，跨股票受控并发；行情批次300秒、资料批次600秒、单次源300秒，会话及数据每次HTTP>=1秒，不能仅按一次read估算完整资料批次。 |
@@ -85,19 +85,27 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 | 同花顺 ETF 资料 | 同代码30分钟限频、最多10只、并发最多2路；批次180秒，源请求>=2秒，单次子进程不超过剩余批次预算；Python锁210秒，Java等待210秒。已发起请求的失败受既有资料限频保护；预算/配额耗尽且没有HTTP则SKIPPED并释放该次预留。 |
 | ETF 资产配置 | 单次子进程默认32秒；内部接口独立调用，不属于八个固定刷新入口，不使用 ETF 行情冷却键。 |
 
-市场 HTTP403/429、网络/超时为现有源7200秒保护；THS 的既有 `AttributeError/IndexError` 也保护7200秒。市场 `SourceDataError` 只将失败模块冷却300秒。ETF**行情**403/429为7200秒，普通网络/超时/格式/标准化错误300秒；不把行情冷却规则误套到字典或资料路由。股票雪球认证拒绝/限流沿用7200秒保护。冷却跳过只记录INFO及剩余TTL，不访问源、不续期、不增加曲线点，保留旧有效数据为STALE。
+市场HTTP403/429或明确风控拒绝共享源暂停7200秒；普通网络/读取超时、`AttributeError/IndexError`等解析失败及`SourceDataError`只暂停失败模块300秒。父进程与源子进程使用同一分类，按同一键NX写入，不扩大冷却范围、不续期。ETF**行情**403/429为7200秒，普通网络/超时/格式/标准化错误300秒；不把行情冷却规则误套到字典或资料路由。股票雪球认证拒绝/限流沿用7200秒保护。冷却跳过只记录INFO及剩余TTL，不访问源、不续期、不增加曲线点，保留旧有效数据为STALE。
 
 直接调用Provider也需要Redis控制层，会写配额、HTTP速率和适用冷却键，但不写业务快照、曲线或事件。验证人员须使用正确环境的控制Redis，并确认保护状态，选一个源串行一次、不并行分页、不立即重复重试。未检查保护信息时记SKIPPED。
 
 ## 共享执行控制与及时发布
 
-- CLI、调度、同步内部API和直接Provider共用 `stock:source-control:v1:` 控制键。全局4个 `slot:global:{0..3}`，每组2个 `slot:{ths|sina|xq|sse|szse|bse}:{0..1}`；XQ含蛋卷。同花顺行业/概念/个股/基金资料共享THS，日历/指数/ETF共享SINA。
+- CLI、调度、同步内部API和直接Provider共用 `stock:source-control:v1:` 控制键。全局8个 `slot:global:{0..7}`，每组4个 `slot:{ths|sina|xq|sse|szse|bse}:{0..3}`；XQ含蛋卷。同花顺行业/概念/个股/基金资料共享THS，日历/指数/ETF共享SINA。
 - 租约令牌TTL30秒，每10秒续租；未回收子进程不得释放名额，旧令牌不得删除新持有者。`rate:{group}` 和 `rate:ths:fund` 为HTTP启动时间门槛，TTL30秒；雪球采样沿用同代码120秒键。资料市值补充不套用采样同股间隔。
 - 每次函数调用独立spawn，不再嵌套ETF/日历真实源进程。子进程只请求源及操作控制键；父进程负责标准化、合并和业务写入。所有会话首页、分页、数据请求及重定向都先检查配额、业务锁、冷却和HTTP速率许可。分页串行；失败不继续下一页。
 - 每批只保留有限候选、不排队补跑旧轮。等待/初始化/HTTP/TERM→KILL→JOIN回收均计入原总预算，清理最多2秒。取消、控制Redis失败或业务锁失效停止调用；源进程看门狗在父进程消失时退出，禁止旧轮回写。
-- 市场优先准入市场资金与行业；概念等THS空位，指数独立SINA。每完成一模块，父进程事务合并完整快照并更新版本/通知；未完成模块保持旧数据与时间。市场成功仅追加一次市场/个股资金点，指数仅追加一次；结束时不重复发布。
+- 市场资金、行业、概念三路可同时准入THS，指数独立SINA。每完成一模块，父进程事务合并完整快照并更新版本/通知；未完成模块保持旧数据与时间。市场成功仅追加一次市场/个股资金点，指数仅追加一次；结束时不重复发布。
 - 个股最多10只受控并发，每股完成立即发布，曲线仍用源时间；资料跨股并发、同股先资料后可选市值补充，整批成功后按请求顺序返回。股票资料及采样继续共用锁。ETF清单仍只调一次新浪全表；ETF资料按代码记录OK/ERROR/SKIPPED并按配置顺序返回；资产配置只占一个共享名额。
 - V1业务键、HTTP响应、同步完成语义、GET/SSE、严格晚于15:00的收盘确认、两日历史及雪球总闸保持原约束，不新增jobId或队列。
+
+## 市场自动接续与生产失败证据
+
+市场两次启动至少120秒，Redis 120秒限频仍生效。快轮按未来定点节奏；慢轮耗时>=120秒且当前仍在交易窗口，等待子进程退出与回收后立即接续。休市后等待下一交易窗口，不补历史时段、不重叠，locked/throttled等快速退出不会忙循环。只改变市场自动调度；ETF/个股调度以及个股15:02/04/06/08/10补收盘保持原规则。前端延迟或SSE断开不会触发额外源请求。
+
+固定AKShare1.18.97的三个同花顺函数已通过mock HTTP表格验证列名、金额单位与可空领涨字段；个股源净额可缺失，流入/流出等必需值缺失及重复冲突仍拒绝整批。聚合超出有限数值范围时拒绝发布，记录`AGGREGATE_OVERFLOW`及字段/行数，避免到Redis序列化阶段才失败。
+
+旧附件日志缺少`reason/fields/code/badRows`，且包含旧`SourceCooldownError`，不能证明当前生产根因。仍需**当前部署版本/AKShare版本、发生时刻与模块、接口耗时、异常类别/底层类别/HTTP状态，以及标准化诊断reason/fields/badRows/可公开六位code**；不得提供原始响应、Cookie、密码或Token。仅“接口成功后SourceDataError”不足以判断缺失列、无效金额或批次冲突。离线验证不代表当前源站可用。
 
 ## 只读业务数据的单源验证步骤
 
@@ -187,3 +195,113 @@ curl --noproxy '*' --proxy '' --max-time 1440 -X POST \
 ```
 
 手动行情刷新仍受交易日、时段、锁、120秒间隔和冷却限制，`SKIPPED/DISABLED` 不证明源失败。检查返回的业务状态与模块快照，不把HTTP200误读为所有源成功。详细同步结果、锁和等待限制见 [交易日历与内部任务V1](trading-calendar-jobs-v1.md)。
+
+## 2026-10-09 09:32–09:36 日志核对（只读）
+
+已收到的生产日志只能确认：`collect/etf-collect throttled` 表示120秒最小请求间隔保护返回，不表示完成采集；锁竞争会返回`locked`；三个THS模块以0.00秒及`SourceCooldownError`退出说明被既有冷却跳过；新浪指数成功仅证明该指数调用当时成功。无法据此判断首次触发的是403/429、网络超时还是解析/校验问题，也不能从ETF的一个`RuntimeError`推断底层原因。
+
+| 核对点 | 前轮受控实现及本轮实现应有的特征 | 新生产日志特征 |
+| --- | --- | --- |
+| 冷却异常 | `SourceCoolingError`；INFO记录剩余TTL | `SourceCooldownError`及失败日志 |
+| Provider异常诊断 | 类型、底层异常、HTTP状态、分类 | 仅异常名、0.00秒 |
+| 日志上下文 | 上海时间、PID、task | 应核对完整行是否具备这些字段 |
+| 分页进度 | 源worker内`quiet_progress()`关闭tqdm | 仍出现0/8至8/8 |
+| ETF未知异常 | 脱敏类别与保留原调用帧的诊断 | 仅`RuntimeError`不足以定位 |
+
+这些特征提示运行文件、解释器/目录、容器实例或日志来源需要核对，**不能仅凭片段断言旧镜像**。本轮8/4配额尚未部署时，生产为前轮4/2本身正常；异常名、脱敏日志和关闭进度条则是前轮已有特征。挂载的日志文件跨容器重建保留旧记录，需要匹配时间、PID、task及镜像ID，不将混合记录误当当前进程输出。
+
+### 1. 核对容器与实际运行文件
+
+以下命令仅供在生产项目目录人工执行，不执行刷新或请求数据源，也不输出容器环境变量。不要用完整`docker inspect`、`env`或`cat .env.prod`回传结果。
+
+```bash
+docker compose ps be-data-analysis
+docker inspect --format '{{.Image}} {{.State.StartedAt}}' "$(docker compose ps -q be-data-analysis)"
+docker compose exec -T be-data-analysis python - <<'PY'
+import hashlib, importlib.util, json, os, re, sys
+from importlib.metadata import version, PackageNotFoundError
+from pathlib import Path
+
+def link(path):
+    try:
+        return str(Path(path).resolve(strict=True))
+    except OSError:
+        return None
+
+spec = importlib.util.find_spec("app")
+root = Path(spec.origin).parent if spec and spec.origin else None
+try:
+    ak_version = version("akshare")
+except PackageNotFoundError:
+    ak_version = "NOT_INSTALLED"
+files = {}
+for name in ("source_execution.py", "collector.py", "providers/akshare_market.py",
+             "providers/http.py", "etf_monitor.py", "scheduler.py"):
+    path = root / name if root else None
+    if not path or not path.is_file():
+        files[name] = {"present": False}
+        continue
+    data = path.read_bytes()
+    code = data.decode("utf-8")
+    files[name] = {"present": True, "sha256": hashlib.sha256(data).hexdigest(),
+                   "currentCoolingName": "SourceCoolingError" in code,
+                   "oldCoolingName": "SourceCooldownError" in code,
+                   "quietProgress": "quiet_progress()" in code,
+                   "disableTqdm": 'kwargs["disable"] = True' in code,
+                   "sharedCooldownClassifier": "market_cooldown" in code}
+    if name == "source_execution.py":
+        for setting in ("GLOBAL_LIMIT", "SOURCE_LIMIT", "LEASE_SECONDS", "RENEW_SECONDS"):
+            match = re.search(r"^"+setting+r"\s*=\s*(\d+)\s*$", code, re.M)
+            files[name][setting] = int(match.group(1)) if match else None
+record = {"python": sys.executable, "diagnosticCwd": os.getcwd(),
+          "pid1Executable": link("/proc/1/exe"), "pid1Cwd": link("/proc/1/cwd"),
+          "appDirectory": str(root) if root else None, "akshareVersion": ak_version,
+          "APP_ENV": os.environ.get("APP_ENV") if os.environ.get("APP_ENV") in {"dev", "prod"} else "UNSET_OR_OTHER",
+          "files": files}
+print(json.dumps(record, ensure_ascii=False, indent=2))
+PY
+```
+
+`python`是本次诊断解释器，`/proc/1/exe`和`/proc/1/cwd`是容器PID1的实际解释器/启动目录；若PID1是supervisor而非业务进程，应在已确认的业务PID核对同样两项，不打印完整命令行。当前Dockerfile/Compose使用`exec python -m app serve`。核对AKShare应为1.18.97，部署目录应与`appDirectory`一致。文件哈希可与准备部署的同版本文件对照；容器磁盘代码与长期运行进程的已加载代码也可能不同，不能只看宿主机仓库更新。
+
+### 2. 仅查看保护键TTL
+
+在**确认解释器与配置来源后**执行。此脚本仅TTL查询，不读取键值、不清除/续期键、不输出连接URL或凭据，不扫描完整Redis、不调用业务刷新。默认从容器已注入的`.env.prod`环境获取连接配置；本地直接执行默认`.env.dev`。
+
+```bash
+docker compose exec -T be-data-analysis python - <<'PY'
+import json
+import sys
+import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+from app.core.config import load_settings
+
+keys = [
+    "stock:market:v1:cooldown:ths", "stock:market:v1:cooldown:sina-index",
+    *["stock:market:v1:cooldown:module:"+name for name in
+      ("industrySectors", "conceptSectors", "marketFundFlow", "coreIndices")],
+    "stock:etf-monitor:v1:sina:cooldown", "stock:monitor:v1:xq:cooldown",
+    "stock:market:v1:min-interval", "stock:market:v1:lock",
+    "stock:etf-monitor:v1:min-interval", "stock:etf-monitor:v1:lock",
+    "stock:monitor:v1:sample:lock",
+]
+client = None
+try:
+    settings = load_settings()
+    client = redis.Redis.from_url(settings.redis_url.get_secret_value(),
+        decode_responses=True, socket_connect_timeout=1, socket_timeout=1,
+        retry=Retry(NoBackoff(), 0))
+    print(json.dumps({key: client.ttl(key) for key in keys}, ensure_ascii=False, indent=2))
+except Exception as exc:
+    print(json.dumps({"status": "READ_FAILED", "exceptionType": type(exc).__name__}))
+    sys.exit(1)
+finally:
+    if client is not None:
+        client.close()
+PY
+```
+
+TTL正数表示剩余秒数，`-2`表示键不存在，`-1`表示键无过期时间；TTL本身**不能证明首次冷却原因**。可以相隔一段时间重复只读TTL，观察是否自然下降，但不据此清键或批量重试。旧版本写入的两小时THS共享冷却**不会因代码升级自动消失**；本轮使用NX且不主动清理已有保护，须尊重现有TTL，不能仅因新规则为模块300秒就绕过可能的403/429保护。
+
+若这些只读信息仍不能定位，补充当前实例首次失败前后的脱敏日志（接口、模块、耗时、异常/底层类型、HTTP、分类，以及`reason/fields/badRows/code`），不要回传Token、Cookie、URL凭据或完整缓存。本轮仅离线核对，未执行上述生产命令，未清除冷却、未真实重试。

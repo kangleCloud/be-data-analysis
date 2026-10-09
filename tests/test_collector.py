@@ -131,9 +131,9 @@ def test_module_failure_retains_only_that_module_valid_history(flow_rows, market
     modules = store.load()["modules"]
     assert modules["industrySectors"]["status"] == "STALE"
     assert modules["industrySectors"]["data"] == old["data"]
-    assert modules["conceptSectors"]["status"] == "STALE"
+    assert modules["conceptSectors"]["status"] == "FRESH"
     assert modules["marketFundFlow"]["status"] == "FRESH"
-    assert provider.calls.count("flow:concept") == 1
+    assert provider.calls.count("flow:concept") == 2
 
 
 def test_invalid_one_module_does_not_block_other_two(flow_rows, market_rows):
@@ -399,7 +399,7 @@ def test_data_failure_cools_only_failed_module_and_recovers(flow_rows, market_ro
 
 
 @pytest.mark.parametrize("kind", ["403", "429", "network", "timeout", "parser"])
-def test_ths_source_protection_stays_two_hours(flow_rows, market_rows, monkeypatch, caplog, kind):
+def test_market_rejection_is_shared_but_ordinary_failure_is_module_only(flow_rows, market_rows, monkeypatch, caplog, kind):
     import requests
     provider, client, store, collector = setup(flow_rows, market_rows)
     if kind.isdigit():
@@ -409,21 +409,33 @@ def test_ths_source_protection_stays_two_hours(flow_rows, market_rows, monkeypat
     else:
         error = {"network": requests.ConnectionError, "timeout": requests.Timeout,
                  "parser": AttributeError}[kind]("private-url")
-    def fail(_kind):
+    original = provider.sector_fund_flow
+    def fail(sector):
+        if sector == "concept":
+            return original(sector)
         provider.calls.append("failure")
         raise error
     monkeypatch.setattr(provider, "sector_fund_flow", fail)
     assert collector.collect(TRADING_AT) == "partial"
-    assert store.cooldown_remaining("ths") == 7200
+    shared = kind.isdigit()
+    scope = "ths" if shared else "module:industrySectors"
+    assert store.cooldown_remaining(scope) == (7200 if shared else 300)
     assert provider.calls.count("failure") == 1
     assert provider.calls.count("market") == 1 and "index" in provider.calls
+    if not shared:
+        assert not store.cooldown_active("ths")
+        assert store.load()["modules"]["conceptSectors"]["status"] == "FRESH"
     caplog.clear()
     client.advance(120)
     with caplog.at_level("INFO"):
         assert collector.collect(TRADING_AT.replace(minute=2)) == "partial"
     assert provider.calls.count("failure") == 1
-    assert store.cooldown_remaining("ths") == 7080
+    assert store.cooldown_remaining(scope) == (7080 if shared else 180)
     assert not [record for record in caplog.records if record.levelno >= 30]
+    if not shared:
+        assert provider.calls.count("market") == 2
+        assert provider.calls.count("flow:concept") == 2
+        assert store.load()["modules"]["marketFundFlow"]["status"] == "FRESH"
 
 
 def test_market_unexpected_program_error_keeps_redacted_traceback(flow_rows, market_rows, monkeypatch, caplog):
@@ -504,5 +516,36 @@ def test_business_write_failure_stops_admitting_later_modules(flow_rows, market_
     store.save = fail_save
     with pytest.raises(ConnectionError):
         collector.collect(TRADING_AT)
-    assert 'flow:concept' not in provider.calls
+    assert provider.calls.count('flow:concept') <= 1
     assert not [event for event in client.events if event[0] == 'publish']
+
+
+def test_all_three_ths_market_modules_are_admitted_together(flow_rows, market_rows):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    provider, client, store, collector = setup(flow_rows, market_rows)
+    started, release, mutex = threading.Event(), threading.Event(), threading.Lock()
+    seen = set()
+    market, sector = provider.market_fund_flow, provider.sector_fund_flow
+    def enter(name):
+        with mutex:
+            seen.add(name)
+            if len(seen) == 3:
+                started.set()
+        assert release.wait(timeout=3)
+    def fetch_market():
+        enter('market')
+        return market()
+    def fetch_sector(kind):
+        enter(kind)
+        return sector(kind)
+    provider.market_fund_flow, provider.sector_fund_flow = fetch_market, fetch_sector
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(collector.collect,TRADING_AT)
+        try:
+            assert started.wait(timeout=2)
+            assert seen == {'market','industry','concept'}
+        finally:
+            release.set()
+        assert future.result(timeout=2) == 'published'
+    assert all(item['status']=='FRESH' for item in store.load()['modules'].values())

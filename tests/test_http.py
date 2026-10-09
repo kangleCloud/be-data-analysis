@@ -36,3 +36,12 @@ def test_progress_is_disabled_and_patch_is_restored(capsys):
             pass
     assert tqdm.__dict__.get("__init__") is original
     assert "PRIVATE_PROGRESS" not in capsys.readouterr().err
+
+
+def test_akshare_standard_progress_factory_is_silent_in_source_scope(capsys):
+    from akshare.utils.tqdm import get_tqdm
+    with quiet_progress():
+        for _ in get_tqdm()(range(8), disable=False, desc='OFFLINE_PAGES'):
+            pass
+    output = capsys.readouterr()
+    assert 'OFFLINE_PAGES' not in output.err and '8/8' not in output.err

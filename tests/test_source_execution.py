@@ -13,7 +13,7 @@ import requests
 
 from app.source_execution import (
     ACQUIRE_SCRIPT, RENEW_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, TASK_RENEW_SCRIPT,
-    PREFIX, SourceCall, SourceCallError, SourceControl, SourceControlError, SourceCoolingError,
+    GLOBAL_LIMIT, SOURCE_LIMIT, PREFIX, SourceCall, SourceCallError, SourceControl, SourceControlError, SourceCoolingError,
     SourceExecutor, controlled_http,
 )
 from tests.test_snapshot import FakeRedis
@@ -36,8 +36,8 @@ class ControlRedis(FakeRedis):
                 raise redis.ConnectionError("private-control-password")
             keys, args = arguments[:count], arguments[count:]
             if script == ACQUIRE_SCRIPT:
-                global_slot = next((i for i in range(4) if self.get(keys[i]) is None), None)
-                group_slot = next((i for i in range(4,6) if self.get(keys[i]) is None), None)
+                global_slot = next((i for i in range(int(args[2])) if self.get(keys[i]) is None), None)
+                group_slot = next((i for i in range(int(args[2]),count) if self.get(keys[i]) is None), None)
                 if global_slot is None or group_slot is None:
                     return []
                 for i in (global_slot, group_slot):
@@ -103,15 +103,15 @@ def ignore_term_worker(queue, url, call, keys, token, guard, deadline, read, par
     time.sleep(60)
 
 
-def test_cross_entry_executors_share_four_global_and_two_group_slots():
+def test_cross_entry_executors_share_eight_global_and_four_group_slots():
     backend = ControlRedis()
     executors = [SourceExecutor('redis://offline', client=backend, worker=frame_worker) for _ in range(8)]
-    groups = ['ths','ths','ths','sina','sina','sse','szse','bse']
+    groups = ['ths']*4+['sina']*4
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda pair: pair[0].call(SourceCall('fake', pair[1], {}, 5)), zip(executors, groups)))
     assert len(results) == 8
-    assert backend.max_global == 4
-    assert max(backend.max_groups.values()) <= 2
+    assert backend.max_global == 8
+    assert max(backend.max_groups.values()) <= 4
     assert backend.releases == 8
     assert not [key for key in backend.values if key.startswith(PREFIX+'slot:')]
 
@@ -210,7 +210,7 @@ def test_independent_parent_processes_share_atomic_quotas():
     context = mp.get_context('spawn')
     with RedisManager(ctx=context) as manager:
         backend = manager.ControlRedis()
-        groups = ['ths', 'ths', 'ths', 'sina', 'sse', 'szse']
+        groups = ['ths']*6+['sina']*6
         barrier, queue = context.Barrier(len(groups)), context.Queue()
         parents = [context.Process(target=parent_entry, args=(backend, barrier, queue, group)) for group in groups]
         try:
@@ -222,8 +222,8 @@ def test_independent_parent_processes_share_atomic_quotas():
                 assert process.exitcode == 0
             assert results == [{'name': 'fake'}] * len(groups)
             maximum, groups_max, releases, remaining = backend.metrics()
-            assert maximum == 4 and groups_max['ths'] == 2
-            assert max(groups_max.values()) <= 2
+            assert maximum == 8 and groups_max['ths'] == 4
+            assert max(groups_max.values()) <= 4
             assert releases == len(groups) and remaining == []
         finally:
             for process in parents:
@@ -239,7 +239,8 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     control = SourceControl(client)
     first = control.acquire('ths', 'first')
     second = control.acquire('ths', 'second')
-    assert control.acquire('ths', 'third') is None
+    others = [control.acquire('ths', value) for value in ('third', 'fourth')]
+    assert control.acquire('ths', 'fifth') is None
     assert all(0 < client.ttl(key) <= 30 for key in first)
     control.renew(first, 'first')
     with pytest.raises(SourceControlError):
@@ -259,6 +260,8 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     assert client.get(first[0]) == 'replacement'
     assert client.get(first[1]) is None
     control.release(second, 'second')
+    for keys, token in zip(others, ('third','fourth')):
+        control.release(keys, token)
 
 
 @pytest.mark.parametrize('group,interval', [('sina', .2), ('xq', 1), ('sse', 1), ('szse', 1), ('bse', 1)])
@@ -305,12 +308,12 @@ def test_same_symbol_interval_is_reserved_only_at_first_http(monkeypatch):
 def test_quota_wait_budget_never_starts_worker():
     backend = ControlRedis()
     control = SourceControl(backend)
-    held = [control.acquire('ths', token) for token in ('one', 'two')]
+    held = [control.acquire('ths', token) for token in ('one', 'two', 'three', 'four')]
     executor = SourceExecutor('redis://offline', client=backend, worker=frame_worker)
     with pytest.raises(SourceNotStartedError):
         executor.call(SourceCall('fake', 'ths', budget_seconds=2.05))
     assert backend.releases == 0
-    for keys, token in zip(held, ('one','two')):
+    for keys, token in zip(held, ('one','two','three','four')):
         control.release(keys, token)
 
 
@@ -361,7 +364,7 @@ def test_close_completed_iterator_cancels_inflight_before_more_candidates():
     later = []
     actions = [('fast','ths',fast), ('slow','ths',lambda: executor.call(SourceCall('fake','ths',{'ready':ready},900))),
                ('later','ths',lambda: later.append(True))]
-    with executor.batch(), closing(completed(actions, source=source)) as results:
+    with executor.batch(), closing(completed(actions, source=source, limit=2)) as results:
         key, value, error, finished_at = next(results)
         assert (key,value,error) == ('fast','fast',None)
         assert finished_at <= time.monotonic()
@@ -509,3 +512,52 @@ def test_actual_http_start_gaps_across_independent_parents_and_source_children()
                     process.kill()
                 process.join(timeout=2)
             queue.close()
+
+
+@pytest.mark.parametrize('category,status,kind', [
+    ('NETWORK',None,'ConnectionError'),('TIMEOUT',None,'ReadTimeout'),
+    ('FORMAT',None,'AttributeError'),('FORMAT',None,'ValueError'),
+    ('HTTP_REJECTED',403,'HTTPError'),('HTTP_REJECTED',429,'HTTPError'),
+    ('SOURCE_REJECTED',None,'RateLimitError'),
+])
+def test_market_child_and_parent_share_cooldown_scope_without_expansion(category,status,kind):
+    import fakeredis
+    from app.source_execution import market_cooldown
+    client = fakeredis.FakeRedis(decode_responses=True)
+    control = SourceControl(client)
+    call = SourceCall('fake','ths',cooldown_keys=('shared','module'),cooldown_policy='market')
+    metadata = {'http_status':status,'category':category,'exception_type':kind}
+    control.cool(call,metadata)
+    shared, seconds = market_cooldown(metadata)
+    key, other = ('shared','module') if shared else ('module','shared')
+    assert client.ttl(key) == seconds and client.get(other) is None
+    client.expire(key,seconds-120)
+    control.cool(call,metadata)  # 父层重写同键也不得续期/扩范围。
+    assert client.ttl(key) == seconds-120 and client.get(other) is None
+
+
+def test_ordinary_market_http_failure_does_not_block_sibling_module(monkeypatch):
+    backend = ControlRedis()
+    control = SourceControl(backend)
+    keys = control.acquire('ths','first')
+    sibling = control.acquire('ths','second')
+    call = SourceCall('fake','ths',domains=('offline.test',),cooldown_keys=('ths','industry'),cooldown_policy='market')
+    other = SourceCall('fake','ths',domains=('offline.test',),cooldown_keys=('ths','concept'),cooldown_policy='market')
+    sends = []
+    def send(session,request,**kwargs):
+        sends.append(request.url)
+        if len(sends) == 1:
+            raise requests.ReadTimeout('private raw request')
+        response = requests.Response()
+        response.status_code,response._content = 200,b'{}'
+        return response
+    monkeypatch.setattr(requests.Session,'send',send)
+    with controlled_http(control,call,keys,'first',None,time.monotonic()+5,15):
+        with pytest.raises(requests.ReadTimeout):
+            requests.get('https://offline.test/industry')
+        with pytest.raises(SourceCoolingError):
+            requests.get('https://offline.test/industry/page/2')
+    assert backend.get('ths') is None and backend.ttl('industry') == 300
+    with controlled_http(control,other,sibling,'second',None,time.monotonic()+5,15):
+        assert requests.get('https://offline.test/concept').status_code == 200
+    assert len(sends) == 2

@@ -208,3 +208,25 @@ def test_etf_unexpected_program_error_keeps_traceback(monkeypatch, caplog, wrapp
     assert "private-raw-response-or-password" not in caplog.text
     item = json.loads(client.get(SNAPSHOT_KEY))["items"][0]
     assert item["quote"]["status"] == "STALE" and len(item["priceSeries"]) == 1
+
+
+def test_mid_call_cooldown_is_info_and_keeps_original_ttl(monkeypatch, caplog):
+    from app.source_execution import SourceCoolingError
+    from app.etf_monitor import COOLDOWN_KEY
+    client, source = _setup()
+    collector = EtfCollector(source,EtfStore(client),Calendar())
+    assert collector.collect(AT) == 'published'
+    client.advance(120)
+    def cool():
+        client.set(COOLDOWN_KEY,'1',ex=7080,nx=True)
+        raise SourceCoolingError(7080)
+    monkeypatch.setattr(source,'quotes',cool)
+    caplog.clear()
+    with caplog.at_level('INFO'):
+        assert collector.collect(AT.replace(minute=34)) == 'cooldown'
+    assert client.ttl(COOLDOWN_KEY) == 7080
+    assert '剩余 TTL 7080 秒' in caplog.text
+    assert 'SourceCooldownError' not in caplog.text
+    assert all(record.levelno < 30 for record in caplog.records)
+    item = json.loads(client.get(SNAPSHOT_KEY))['items'][0]
+    assert item['quote']['status'] == 'STALE' and len(item['priceSeries']) == 1

@@ -16,15 +16,15 @@ HTTP_RULES = {
     "shorterLimits": "缺失或 None 补齐上限；已有 scalar/tuple 更短限制保留",
     "retry": "服务不增加即时重试，不并行分页；一次函数调用可能含多个 HTTP 请求",
     "execution": "每次 AKShare 调用独立 spawn；父进程标准化和业务发布",
-    "quota": "所有入口共享全局4路、同来源2路；THS/SINA/XQ及蛋卷/SSE/SZSE/BSE",
+    "quota": "所有入口共享全局8路、同来源4路；THS/SINA/XQ及蛋卷/SSE/SZSE/BSE",
     "lease": "令牌租约30秒、每10秒续租；子进程回收后按令牌释放",
     "requestStartGaps": "每次实际HTTP：新浪0.2秒、THS/雪球/交易所1秒、THS基金资料额外2秒",
     "deadline": "配额等待、模块初始化、HTTP和最多2秒回收均计入原函数/批次预算",
 }
 THS_MARKET_POLICY = [
-    "行情采集至少间隔 120 秒，串行调度等待上一轮，只启动未来时段",
+    "两次市场启动至少120秒；快轮沿原定点节奏，耗时>=120秒的慢轮完成回收后在交易窗口立即接续，不补旧轮",
     "同花顺分页请求至少间隔 1 秒",
-    "403/429、网络/超时及既有 AttributeError/IndexError：THS 共享源冷却 7200 秒",
+    "403/429或明确风控拒绝：THS共享源冷却7200秒；普通网络/读取超时/解析/校验失败仅当前模块300秒",
     "SourceDataError：仅失败模块冷却 300 秒；冷却不访问源、不续期、不新增曲线点",
 ]
 PUBLIC_AUTH = "公开网页接口，无服务 Token；仍可能被源站限流或拒绝"
@@ -119,7 +119,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
                                  "node": "hs_s", "_s_r_a": "page"}}],
         "authorization": PUBLIC_AUTH,
         "frequency": ["行情 120 秒；源请求至少间隔 0.2 秒",
-                      "403/429、网络/超时：sina-index 源冷却 7200 秒；标准化模块冷却 300 秒"],
+                      "403/429或明确风控拒绝：sina-index源7200秒；普通网络/读取超时/解析/校验失败只暂停当前模块300秒"],
         "timeout": {"functionBudgetSeconds": 120},
         "availability": ["sh000001、sz399001、sh000300、sz399006、sh000688 必须全部存在",
                          "各点位有效且>0、重复行无冲突；缺任一则模块降级"],
@@ -151,7 +151,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
                        "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L", "pageHelp.pageSize": "10000"},
                        "headers": {"Referer": "https://www.sse.com.cn/assortment/stock/list/share/"}}],
         "authorization": PUBLIC_AUTH,
-        "frequency": ["与主板、深圳、北京字典同批受控并发，SSE同源最多2路，清理缓存"],
+        "frequency": ["与主板、深圳、北京字典同批受控并发，SSE同源最多4路，清理缓存"],
         "timeout": {"functionBudgetSeconds": 60},
         "availability": ["本组合非空，证券代码/证券简称有效；六位代码；合并重复无冲突且三市场均有股票"],
         "semantics": ["市场仍为 SH；symbol=科创板是另一参数组合，不是另一唯一函数"],

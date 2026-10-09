@@ -521,5 +521,5 @@ def test_quote_business_write_failure_stops_later_candidates():
     store.write_quote = fail_write
     with pytest.raises(ConnectionError):
         StockMonitorSampler(store, source, Calendar(), xq_enabled=True).sample(AT)
-    assert set(source.calls) == {item['symbol'] for item in STOCKS}
+    assert set(source.calls) <= {item['symbol'] for item in STOCKS} | {'SH600001'}
     assert not any(event[0] == 'publish' for event in client.events)

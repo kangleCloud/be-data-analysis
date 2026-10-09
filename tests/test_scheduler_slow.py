@@ -42,9 +42,11 @@ def test_slow_child_skips_missed_slots_without_overlap(monkeypatch, module_name,
         running[0] = True
         return Process()
     monkeypatch.setattr(module, "datetime", Clock)
+    if module_name == "app.scheduler":
+        monkeypatch.setattr(module.clock, "monotonic", lambda: clock[0].timestamp())
     monkeypatch.setattr(module.asyncio, "sleep", sleep)
     monkeypatch.setattr(module.asyncio, "create_subprocess_exec", create)
     with pytest.raises(FinishedSimulation):
         asyncio.run(getattr(module, function_name)())
-    assert starts == ["10:02", "10:06"]
+    assert starts == (["10:02", "10:05"] if module_name == "app.scheduler" else ["10:02", "10:06"])
     assert not running[0]

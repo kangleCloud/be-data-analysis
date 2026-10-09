@@ -8,13 +8,11 @@ from typing import Any
 from contextlib import closing
 from zoneinfo import ZoneInfo
 
-import requests
-
 from app.normalize import SourceDataError, normalize_core_indices, normalize_individual_batch, normalize_sectors
 from app.core.logging import log_failure, redis_failure_kind
 from app.providers.akshare_market import MarketSource
 from app.providers.http import error_metadata
-from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch
+from app.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch, market_cooldown
 from app.snapshot import LOCK_KEY
 from app.snapshot import SnapshotStore
 from app.trading_calendar import CalendarService
@@ -96,15 +94,6 @@ def _reusable_prior(key: str, prior: Any) -> bool:
             for item in items
         )
     )
-
-
-def _needs_cooldown(exc: Exception, source: str) -> bool:
-    metadata = error_metadata(exc)
-    if metadata["category"] in {"NETWORK", "TIMEOUT"} or metadata["http_status"] in {403, 429}:
-        return True
-    if isinstance(exc, requests.HTTPError):
-        return exc.response is not None and exc.response.status_code in {403, 429}
-    return source == "ths" and metadata["exception_type"] in {"AttributeError", "IndexError"}
 
 
 def _in_collection_window(at: datetime) -> bool:
@@ -231,10 +220,8 @@ class MarketCollector:
                         if isinstance(exc, SourceControlError) or redis_failure_kind(exc):
                             raise
                         failures += 1
-                        if _needs_cooldown(exc, source):
-                            self._store.start_cooldown(source)
-                        elif isinstance(exc, SourceDataError):
-                            self._store.start_cooldown(f"module:{key}", seconds=300)
+                        shared, seconds = market_cooldown(error_metadata(exc))
+                        self._store.start_cooldown(source if shared else f"module:{key}", seconds=seconds)
                         if not isinstance(exc, SourceDataError) and error_metadata(exc)["category"] == "UNEXPECTED":
                             log_failure(LOGGER, key, exc)
                         else:

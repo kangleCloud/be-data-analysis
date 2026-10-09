@@ -21,14 +21,16 @@ from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 
 LOGGER = logging.getLogger(__name__)
 PREFIX = "stock:source-control:v1:"
+GLOBAL_LIMIT = 8
+SOURCE_LIMIT = 4
 LEASE_SECONDS = 30
 RENEW_SECONDS = 10
 CLEANUP_SECONDS = 2
 GROUPS = {"ths", "sina", "xq", "sse", "szse", "bse"}
 ACQUIRE_SCRIPT = """
 local g, s = nil, nil
-for i=1,4 do if redis.call('exists', KEYS[i]) == 0 then g=i; break end end
-for i=5,6 do if redis.call('exists', KEYS[i]) == 0 then s=i; break end end
+for i=1,tonumber(ARGV[3]) do if redis.call('exists', KEYS[i]) == 0 then g=i; break end end
+for i=tonumber(ARGV[3])+1,#KEYS do if redis.call('exists', KEYS[i]) == 0 then s=i; break end end
 if not g or not s then return {} end
 redis.call('set', KEYS[g], ARGV[1], 'EX', ARGV[2])
 redis.call('set', KEYS[s], ARGV[1], 'EX', ARGV[2])
@@ -115,9 +117,9 @@ class SourceControl:
         self.client = client
 
     def acquire(self, group: str, token: str) -> tuple[str, str] | None:
-        keys = [f"{PREFIX}slot:global:{i}" for i in range(4)] + [
-            f"{PREFIX}slot:{group}:{i}" for i in range(2)]
-        result = self.client.eval(ACQUIRE_SCRIPT, len(keys), *keys, token, LEASE_SECONDS)
+        keys = [f"{PREFIX}slot:global:{i}" for i in range(GLOBAL_LIMIT)] + [
+            f"{PREFIX}slot:{group}:{i}" for i in range(SOURCE_LIMIT)]
+        result = self.client.eval(ACQUIRE_SCRIPT, len(keys), *keys, token, LEASE_SECONDS, GLOBAL_LIMIT)
         return (keys[result[0]-1], keys[result[1]-1]) if result else None
 
     def renew(self, keys: tuple[str, str], token: str) -> None:
@@ -160,18 +162,26 @@ class SourceControl:
     def cool(self, call: SourceCall, metadata: dict[str, Any]) -> None:
         status = metadata["http_status"]
         seconds = None
-        if call.cooldown_policy == "market" and (
-            status in {403, 429} or metadata["category"] in {"NETWORK", "TIMEOUT"}
-            or call.group == "ths" and metadata["exception_type"] in {"AttributeError", "IndexError"}
-        ):
-            seconds = 7200
+        key = call.cooldown_keys[0] if call.cooldown_keys else None
+        if call.cooldown_policy == "market":
+            shared, seconds = market_cooldown(metadata)
+            index = 0 if shared else 1
+            key = call.cooldown_keys[index] if len(call.cooldown_keys) > index else None
         elif call.cooldown_policy == "etf":
             seconds = 7200 if status in {403, 429} else 300
         elif call.cooldown_policy == "stock" and (status in {401, 403, 429}
                 or metadata["exception_type"] == "RateLimitError" or metadata["category"] == "AUTH_REJECTED"):
             seconds = 7200
-        if seconds and call.cooldown_keys:
-            self.client.set(call.cooldown_keys[0], "1", ex=seconds, nx=True)
+        if seconds and key:
+            self.client.set(key, "1", ex=seconds, nx=True)
+
+
+def market_cooldown(metadata: dict[str, Any]) -> tuple[bool, int]:
+    """只有明确风控拒绝才暂停共享源；普通失败仅暂停当前市场模块。"""
+    shared = (metadata["http_status"] in {403, 429}
+              or metadata["category"] == "SOURCE_REJECTED"
+              or metadata["exception_type"] == "RateLimitError")
+    return shared, 7200 if shared else 300
 
 
 def _client(url: str) -> redis.Redis:
@@ -433,8 +443,8 @@ def source_batch(source: Any, guard: tuple[str, str] | None = None,
 
 
 def completed(actions: list[tuple[str, str, Callable[[], Any]]], *, source: Any = None,
-              limit: int = 4) -> Iterator[tuple[str, Any, Exception | None, float]]:
-    """有限候选按配置顺序准入，来源最多两路；只在父线程交付完成结果。"""
+              limit: int = GLOBAL_LIMIT) -> Iterator[tuple[str, Any, Exception | None, float]]:
+    """有限候选按配置顺序准入，来源最多四路；只在父线程交付完成结果。"""
     def invoke(function: Callable[[], Any]) -> tuple[Any, Exception | None, float]:
         try:
             return function(), None, time.monotonic()
@@ -451,7 +461,7 @@ def completed(actions: list[tuple[str, str, Callable[[], Any]]], *, source: Any 
                     key, group, function = action
                     if len(running) >= limit:
                         break
-                    if groups.count(group) >= 2:
+                    if groups.count(group) >= SOURCE_LIMIT:
                         continue
                     candidates.remove(action)
                     running[pool.submit(invoke, function)] = (key, group)
