@@ -114,14 +114,14 @@ def test_manual_refresh_obeys_lock_and_interval():
     source = Source(["2026-09-30", "2026-10-02"])
     calendar = CalendarService(client, source)
     client.set(LOCK_KEY, "other", nx=True, ex=120)
-    assert calendar.refresh(AT, manual=True) == "locked"
+    assert calendar.refresh(AT, on_demand=True) == "locked"
     assert source.calls == 0
     client.advance(120)
-    assert calendar.refresh(AT, manual=True) == "refreshed"
-    assert calendar.refresh(AT, manual=True) == "throttled"
+    assert calendar.refresh(AT, on_demand=True) == "refreshed"
+    assert calendar.refresh(AT, on_demand=True) == "throttled"
     assert source.calls == 1
     client.advance(600)
-    assert calendar.refresh(AT, manual=True) == "refreshed"
+    assert calendar.refresh(AT, on_demand=True) == "refreshed"
     assert source.calls == 2
 
 
@@ -201,5 +201,5 @@ def test_calendar_resource_error_is_distinct_and_preserves_cache():
         def dates(self):
             raise SourceResourceError('PROCESS_EXIT',exitcode=-9)
     with pytest.raises(SourceResourceError):
-        CalendarService(client,Source()).refresh(datetime(2026,10,9,10,tzinfo=SHANGHAI),manual=True)
+        CalendarService(client,Source()).refresh(datetime(2026,10,9,10,tzinfo=SHANGHAI),on_demand=True)
     assert client.get(CACHE_KEY)=='previous'

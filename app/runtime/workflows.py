@@ -23,42 +23,42 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 def exclusive(function):
     @wraps(function)
     def run(settings,client,**kwargs):
-        with collection_entry(client) as acquired:
+        with collection_entry(client, mode=kwargs.get('mode', 'auto')) as acquired:
             if not acquired:
                 return 'locked'
             return function(settings,client,**kwargs)
     return run
 
 
-def calendar_service(settings: Settings, client: Any) -> CalendarService:
-    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)))
+def calendar_service(settings: Settings, client: Any, *, mode: str = "auto") -> CalendarService:
+    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client, mode=mode), mode=mode), mode=mode)
 
 
 @exclusive
-def run_calendar(settings: Settings, client: Any, *, manual: bool = False,
+def run_calendar(settings: Settings, client: Any, *, on_demand: bool = False, mode: str = "auto",
                  at: datetime | None = None) -> str:
-    return calendar_service(settings, client).refresh(
-        at or datetime.now(SHANGHAI), manual=manual,
+    return calendar_service(settings, client, mode=mode).refresh(
+        at or datetime.now(SHANGHAI), on_demand=on_demand,
     )
 
 
-def _market(settings,client,at,lane):
+def _market(settings,client,at,lane,mode="auto"):
     return MarketCollector(
         AkShareMarketProvider(settings.source_timeout_seconds,executor=SourceExecutor(
-            settings.redis_url.get_secret_value(),settings.source_timeout_seconds,client=client,lane=lane)),
+            settings.redis_url.get_secret_value(),settings.source_timeout_seconds,client=client,lane=lane,mode=mode), mode=mode),
         RedisSnapshotStore(client,settings.redis_lock_seconds,lane=lane),
-        calendar_service(settings,client),lane=lane,
+        calendar_service(settings,client,mode=mode),lane=lane,mode=mode,
     ).collect(at or datetime.now(SHANGHAI))
 
 
-def run_market(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
+def run_market(settings: Settings, client: Any, *, at: datetime | None = None, mode: str = "auto") -> str:
     """同步完整市场刷新：一次原子获取两个入口，忙时不遗留半把锁。"""
-    with collection_entry(client,lane='market') as acquired:
-        return _market(settings,client,at,'market') if acquired else 'locked'
+    with collection_entry(client,lane='market',mode=mode) as acquired:
+        return _market(settings,client,at,'market',mode) if acquired else 'locked'
 
 
 @exclusive
-def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
+def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None, mode: str = "auto") -> str:
     if not settings.stock_monitor_xq_enabled:
         return "disabled"
     token = settings.xueqiu_token.get_secret_value()
@@ -66,17 +66,17 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None) 
         return "missing_token"
     return StockMonitorSampler(
         MonitorStore(client),
-        XueqiuProvider(token, settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
-        calendar_service(settings, client),
-        xq_enabled=True,
+        XueqiuProvider(token, settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,mode=mode), mode=mode),
+        calendar_service(settings, client, mode=mode),
+        xq_enabled=True, mode=mode,
     ).sample(at or datetime.now(SHANGHAI))
 
 
 @exclusive
-def run_etf(settings: Settings, client: Any, *, at: datetime | None = None) -> str:
+def run_etf(settings: Settings, client: Any, *, at: datetime | None = None, mode: str = "auto") -> str:
     return EtfCollector(
-        AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client)),
-        EtfStore(client), calendar_service(settings, client),
+        AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,mode=mode), mode=mode),
+        EtfStore(client), calendar_service(settings, client, mode=mode), mode=mode,
     ).collect(at or datetime.now(SHANGHAI))
 
 

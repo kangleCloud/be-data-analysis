@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import redis
 from app.etf_monitor.normalize import catalog
+from app.stock_monitor.events import monitor_event_lock
 
 KEY = 'stock:etf-monitor:v1:dictionary-source'
 SHANGHAI = ZoneInfo('Asia/Shanghai')
@@ -14,8 +15,16 @@ SHANGHAI = ZoneInfo('Asia/Shanghai')
 def save_dictionary(client,rows,at):
     payload = {'schemaVersion':1,'source':'SINA','collectedAt':at.astimezone(SHANGHAI).isoformat(timespec='seconds'),
                'etfs':[ {key:item[key] for key in ('symbol','code','name','market')} for item in catalog(rows)]}
-    if not client.set(KEY,json.dumps(payload,ensure_ascii=False,allow_nan=False),ex=86400):
-        raise redis.RedisError('ETF字典缓存写入失败')
+    with monitor_event_lock(client, key=f"{KEY}:write-lock"):
+        old_raw = client.get(KEY)
+        try:
+            previous = json.loads(old_raw) if old_raw else {}
+        except (ValueError, TypeError):
+            previous = {}
+        if isinstance(previous, dict) and previous.get("collectedAt", "") > payload["collectedAt"]:
+            return previous
+        if not client.set(KEY,json.dumps(payload,ensure_ascii=False,allow_nan=False),ex=86400):
+            raise redis.RedisError('ETF字典缓存写入失败')
     return payload
 
 

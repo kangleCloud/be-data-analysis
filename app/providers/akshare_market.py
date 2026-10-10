@@ -20,8 +20,9 @@ class MarketSource(Protocol):
 
 
 class AkShareMarketProvider:
-    def __init__(self, timeout_seconds: int, *, executor: Any = None, api: Any = None) -> None:
-        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds))
+    def __init__(self, timeout_seconds: int, *, executor: Any = None, api: Any = None, mode: str = "auto") -> None:
+        self.mode = mode
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, mode=mode))
         self._akshare = api
         self._timeout_seconds = timeout_seconds
 
@@ -35,7 +36,7 @@ class AkShareMarketProvider:
                 source = "ths" if group == "ths" else "sina-index"
                 result = self.executor.call(SourceCall(function, group, parameters, budget,
                     ("data.10jqka.com.cn",) if group == "ths" else ("vip.stock.finance.sina.com.cn",),
-                    (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{module}"), "market"))
+                    (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{module}"), "market", mode=self.mode))
             LOGGER.info("接口 %s 成功，耗时 %.2f 秒", function, time.monotonic()-started)
             return result
         except SourceCoolingError as exc:

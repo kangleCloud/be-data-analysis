@@ -1,5 +1,7 @@
 """ETF 采样与 Redis 发布的离线回归。"""
 
+from app.runtime.cooldown import risk_key, ordinary_key
+
 import json
 import pytest
 from datetime import datetime
@@ -117,7 +119,7 @@ def test_etf_partial_symbol_does_not_invent_price():
 def test_etf_workflow_collects_sina_quotes_with_xueqiu_gate_disabled(monkeypatch):
     client, source = _setup()
     monkeypatch.setattr("app.runtime.workflows.AkShareEtfProvider", lambda _timeout, **_kwargs: source)
-    monkeypatch.setattr("app.runtime.workflows.calendar_service", lambda _settings, _client: Calendar())
+    monkeypatch.setattr("app.runtime.workflows.calendar_service", lambda _settings, _client, **kwargs: Calendar())
     settings = load_settings({"STOCK_MONITOR_XQ_ENABLED": "false"})
     assert run_etf(settings, client, at=AT) == "published"
     assert source.calls == 1
@@ -150,7 +152,8 @@ def test_etf_cooldown_classification_skip_and_recovery(monkeypatch, caplog, kind
     monkeypatch.setattr(source, "quotes", fail)
     client.advance(120)
     assert collector.collect(AT.replace(minute=34)) == "partial"
-    assert client.ttl(COOLDOWN_KEY) == seconds
+    cooling_key = risk_key("sina") if kind in {"403", "429"} else ordinary_key(COOLDOWN_KEY)
+    assert client.ttl(cooling_key) == seconds
     assert "private-source-token" not in caplog.text
     assert "分类" in caplog.text
     before = source.calls
@@ -158,7 +161,7 @@ def test_etf_cooldown_classification_skip_and_recovery(monkeypatch, caplog, kind
     caplog.clear()
     with caplog.at_level("INFO"):
         assert collector.collect(AT.replace(minute=36)) == "cooldown"
-    assert source.calls == before and client.ttl(COOLDOWN_KEY) == seconds - 120
+    assert source.calls == before and client.ttl(cooling_key) == seconds - 120
     assert "冷却跳过，剩余 TTL" in caplog.text
     assert not [record for record in caplog.records if record.levelno >= 30]
     item = json.loads(client.get(SNAPSHOT_KEY))["items"][0]

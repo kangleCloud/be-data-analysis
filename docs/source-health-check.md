@@ -21,7 +21,7 @@ python -m app sources --json > /tmp/be-data-analysis-sources.json
 | `collect/calendar-refresh/monitor-sample/etf-collect` | 完整业务流程 | 会写 Redis 锁、限频、日历、快照或曲线并可能发布更新 |
 | scheduler 固定 POST 刷新 | Java 与 Python 完整同步 | 可写 MySQL、Redis、锁和缓存，不能作为只读源健康检查 |
 
-当前 CLI 没有 `probe` 子命令。验证单个源应使用下述 Provider/标准化组合；`collect --force` 仍受交易日、时段、锁、间隔与冷却约束，不能用它绕过这些条件进行探测。
+当前 CLI 没有 `probe` 子命令。验证单个源应使用下述 Provider/标准化组合；`collect` 仍受交易日、时段、锁、间隔与冷却约束，不能用它绕过这些条件进行探测。
 
 ## 实际请求域名
 
@@ -78,8 +78,8 @@ danjuanfunds.com
 | `stock_info_bj_name_code()` | BSE分页；同上market=BJ | 同上 | 同上 | 同上，原POST分页串行 |
 | `stock_individual_basic_info_xq(symbol,token,timeout)` | 雪球stock；industry/listingDate/marketCap可空 | Python stock profiles按需；Java工作日16:30整体刷新/手动资料刷新 | 返回→`stock_monitor_profile` | 股票资料管理→股票监控基础资料；资料仍查原源，仅缺市值时复用同代码XQ/FRESH且120秒内报价市值；总闸＋授权Token |
 | `stock_individual_spot_xq(symbol,token,timeout)` | 雪球会话＋quote；现价/涨幅/量额/源时间/市值元 | 行情通道首；monitor-sample／jobs monitor；资料缺市值时补；同股120秒 | `stock:monitor:v1:quote:{symbol}`＋price-series/state-id/原频道 | 股票监控报价及价格曲线，市值供资料复用；源时间收盘严格>15:00；总闸＋授权Token |
-| `fund_etf_category_sina(symbol="ETF基金")` | 新浪vip；ETF代码/名称、交易价/量额 | 行情通道第二；etf-collect／jobs etf；Python dictionary按需优先当日缓存，缺失一次；Java工作日16:40整体刷新/手动字典刷新 | `stock:etf-monitor:v1:snapshot`、price-series及dictionary-source(TTL86400)；字典返回→`etf_symbol_dictionary` | ETF字典管理及ETF监控复用全表；非启用子集、非基金净值；公开源，总闸无关 |
-| `fund_info_ths(symbol=六位代码)` | 同花顺fund；八项基本资料至少一项有效 | Python etf profiles按需；Java工作日16:40整体刷新/手动资料刷新；同代码30分钟、≤10只串行、180秒批次 | 返回→`etf_monitor_profile`；控制锁/限频Redis，不保存原表 | ETF资料管理→ETF监控资料；成立日不作上市日；公开源，总闸无关 |
+| `fund_etf_category_sina(symbol="ETF基金")` | 新浪vip；ETF代码/名称、交易价/量额 | 行情通道第二；etf-collect／jobs etf；Python dictionary AUTO优先当日缓存，缺失一次；MANUAL强制一次新浪全表；Java工作日16:40整体刷新/手动字典刷新 | `stock:etf-monitor:v1:snapshot`、price-series及dictionary-source(TTL86400)；字典返回→`etf_symbol_dictionary` | ETF字典管理及ETF监控复用全表；非启用子集、非基金净值；公开源，总闸无关 |
+| `fund_info_ths(symbol=六位代码)` | 同花顺fund；八项基本资料至少一项有效 | Python etf profiles按需；Java工作日16:40整体刷新/手动资料刷新；AUTO同代码30分钟；manual跳过；两者≤10只串行、180秒批次 | 返回→`etf_monitor_profile`；控制锁/限频Redis，不保存原表 | ETF资料管理→ETF监控资料；成立日不作上市日；公开源，总闸无关 |
 | `fund_individual_detail_hold_xq(symbol,date,timeout)` | 蛋卷；资产类别/仓位百分比，请求期不作披露日 | 独立etf asset-allocation；只查指定报告期 | 返回→`etf_asset_allocation_report` | ETF资料/监控资产配置；公开状态由Java按MySQL报告＋总闸生成；服务要求总闸/已配Token，原函数无token参数 |
 
 ### 时间、单位与认证前提
@@ -92,37 +92,65 @@ danjuanfunds.com
 - 同花顺 ETF 成立日期≠上市日期、基金经理≠基金管理人，业绩基准不用于推导跟踪指数。雪球/蛋卷资产配置是资产类别占比，不是成分股持仓；`requestedReportPeriod` 只是请求期，不能当作真实披露日期。
 - 新浪/同花顺/交易所源不需要本服务的雪球 Token。雪球个股和 ETF 资产配置须先确认 `STOCK_MONITOR_XQ_ENABLED=true` 且 `XUEQIU_TOKEN` 已配置；总闸默认关闭。手动验证也遵守授权前提，日志只写“已配置/未配置”，不得打印 Token、Cookie、密码或原始响应。
 
-## 频率、超时与冷却
+## 常规auto频率、超时与冷却
 
 HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制读取上限。已有更短 scalar/tuple 超时保持不变，缺失/None 补齐。HTTP read 上限与**整次函数/批次预算**不同。
 
 | 业务 | 调用约束 |
 | --- | --- |
 | 市场行业/概念/个股/指数 | 整次源预算分别120/120/900/120秒；行情120秒间隔，快轮按未来定点节奏；慢轮耗时>=120秒完成回收后窗口内立即接续，不补旧轮、不重叠；THS分页>=1秒，新浪指数连续请求>=0.2秒。 |
-| 日历 | 子进程取结果等待 `SOURCE_TIMEOUT_SECONDS+10`（默认25秒），随后 join 最多2秒，超时终止回收；每月1日00:10、自动失败每日限频，手动600秒限频。 |
+| 日历 | 子进程取结果等待 `SOURCE_TIMEOUT_SECONDS+10`（默认25秒），随后 join 最多2秒，超时终止回收；每月1日00:10、自动失败每日限频，auto内部按需600秒限频，manual跳过。 |
 | 交易所字典 | 四组串行，全部成功并校验后合并；每次调用60秒（含等待/回收），每次HTTP>=1秒，清理缓存。 |
 | 雪球个股 | 同股报价TTL=120秒，跨股票串行；行情批次300秒、资料批次600秒、单次源300秒，会话及数据每次HTTP>=1秒，不能仅按一次read估算完整资料批次。 |
 | 新浪 ETF | 子进程总预算 `SOURCE_TIMEOUT_SECONDS+17`（默认32秒），预留2秒回收；SINA组跨入口实际HTTP>=0.2秒，行情120秒。固定函数目前一次 GET。 |
 | 同花顺 ETF 资料 | 同代码30分钟限频、最多10只、串行1路；批次180秒，源请求>=2秒，单次子进程不超过剩余批次预算；Python锁210秒，Java等待210秒。已发起请求的失败受既有资料限频保护；预算/配额耗尽且没有HTTP则SKIPPED并释放该次预留。 |
 | ETF 资产配置 | 单次子进程默认32秒；内部接口独立调用，不属于八个固定刷新入口，不使用 ETF 行情冷却键。 |
 
-市场HTTP403/429或明确风控拒绝共享源暂停7200秒；普通网络/读取超时、`AttributeError/IndexError`等解析失败及`SourceDataError`只暂停失败模块300秒。父进程与源子进程使用同一分类，按同一键NX写入，不扩大冷却范围、不续期。ETF**行情**403/429为7200秒，普通网络/超时/格式/标准化错误300秒；不把行情冷却规则误套到字典或资料路由。股票雪球认证拒绝/限流沿用7200秒保护。冷却跳过只记录INFO及剩余TTL，不访问源、不续期、不增加曲线点，保留旧有效数据为STALE。
+市场HTTP401/403/429或明确风控拒绝共享源暂停7200秒；普通网络/读取超时、`AttributeError/IndexError`等解析失败及`SourceDataError`只暂停失败模块300秒。父进程与源子进程使用同一分类，按同一键NX写入，不扩大冷却范围、不续期。ETF**行情**401/403/429为7200秒，普通网络/超时/格式/标准化错误300秒；不把行情冷却规则误套到字典或资料路由。股票雪球认证拒绝/限流沿用7200秒保护。冷却跳过只记录INFO及剩余TTL，不访问源、不续期、不增加曲线点，保留旧有效数据为STALE。
 
 直接调用Provider也需要Redis控制层，会写配额、HTTP速率和适用冷却键，但不写业务快照、曲线或事件。验证人员须使用正确环境的控制Redis，并确认保护状态，选一个源串行一次、不并行分页、不立即重复重试。未检查保护信息时记SKIPPED。
 
-## 双通道执行控制与及时发布
+## 双通道执行控制与及时发布（AUTO）
 
 - 一个服务父进程、两条固定自动调度循环，各有独立执行器、线程上下文、guard/deadline/cancelled；资金只取`stock_fund_flow_individual(symbol="即时")`，行情顺序股票报价→ETF→核心指数→行业→概念。同通道串行、启动间隔≥120秒；跨通道并行，慢资金完成回收后按当前窗口接续，不阻塞行情、不重叠、不补历史点。普通模块失败只降级自身；Redis控制失败或资源不足停止调用。
-- 固定入口`stock:source-control:v1:entry:quotes`、`:entry:funds`。CLI、内部API和直接Provider均受控，SourceCall仅将即时individual认作资金。资料/字典/日历/资产配置走quotes；同步完整market原子取得两个，否则立即locked/409且不留半把锁。令牌TTL30秒，每10秒续租；旧令牌不能删除新持有者。GET/SSE不取采集入口。
+- 固定入口`stock:source-control:v1:entry:quotes`、`:entry:funds`。CLI、默认/auto内部API和默认Provider均受控，SourceCall仅将即时individual认作资金。资料/字典/日历/资产配置走quotes；同步完整market原子取得两个，否则立即locked/409且不留半把锁。令牌TTL30秒，每10秒续租；旧令牌不能删除新持有者。GET/SSE不取采集入口。
 - 全局`slot:global:{0,1}`及每组`slot:{ths|sina|xq|sse|szse|bse}:{0,1}`各最多2，XQ含蛋卷。源进程回收后按令牌释放；子进程仅请求源/控制键，并转records释放DataFrame；服务父进程不导入AKShare/pandas。Session.send补丁仅在spawn源进程；会话/分页/重定向仍按原HTTP间隔、域名、源超时及冷却规则，分页串行、失败不继续后页。
 - 日历仍由quotes入口启动补建/月度循环维护。**资金只读当年合法、覆盖该日的缓存**；缺失/覆盖不足为UNKNOWN，只降级资金模块、不发日历HTTP、不跨占quotes入口、不消费日历AUTO_RETRY_KEY。缓存已覆盖但月刷新到期时，资金仍按有效日期判断，由行情/月度入口刷新。工作日不等同交易日，UNKNOWN/休市不请求业务源。
 - 每个行情模块只发布自身patch，不初始化或降级资金；资金只发布marketFundFlow，不修改指数/行业/概念。WATCH读取最新快照，再MULTI/EXEC合并本次模块；最多3次冲突重试（首次＋3次，共4次），每次重读base/version。冲突耗尽明确失败，保留其他已发布数据；模块各自时间保持真实，快照generatedAt不倒退。版本/市场通知同事务，连续previousSnapshotId链支持原REST全量＋SSE增量/缺口重同步。
 - 同一全市场资金批次生成汇总、宽度及启用≤10股票资金点，不逐股加请求。资金点只随成功发布一次；原monitor_event_lock序列化资金/报价的股票stateId事务。无新点但真实资金结果/日期/诊断变化仍通知当前启用股票；重试时间单独变化不重复发通知，不造点、不将报价/曲线落MySQL。
 - 股票资料仍调用原资料源；**只复用市值**：同代码、XQ、FRESH、collectedAt不超过120秒的有限有效值。删除当前报价生产者无法提供industry/listingDate的全缓存资料分支；缺市值补报价仍受同股120秒。Python无独立定期资料轮询；Java上海工作日16:30股票/16:40ETF整体刷新不改，工作日不保证交易。
-- 新浪ETF全表一次取回生成启用交易报价＋`dictionary-source`轻量全量字典，TTL86400，不永久保留原表、不缓存启用子集。字典优先合法上海当日缓存，否则一次源调用；写缓存失败属Redis故障而非源格式/冷却。ETF交易价不换净值；fundFlowStatus=NO_RELIABLE_SOURCE。资产配置状态仍由Java按MySQL报告/总闸生成，Python行情不推测报告状态。
+- 新浪ETF全表一次取回生成启用交易报价＋`dictionary-source`轻量全量字典，TTL86400，不永久保留原表、不缓存启用子集。AUTO字典优先合法上海当日缓存，否则一次源调用；MANUAL字典强制一次新浪全表源调用；写缓存失败属Redis故障而非源格式/冷却。ETF交易价不换净值；fundFlowStatus=NO_RELIABLE_SOURCE。资产配置状态仍由Java按MySQL报告/总闸生成，Python行情不推测报告状态。
 - Compose内存与memory+swap均1g（无额外swap），pids128/init及BLAS线程1保留。cgroup总内存≥800MiB停止准入并TERM/KILL/reap当前源；两源分别取消回收。RESOURCE不触发源冷却，Redis失败独立终止。日志记录init/request/serialization耗时、退出码/信号/取消原因、current/peak及可取得的oom_kill；SIGKILL不能直接认定OOM。
 - 资产配置固定detail.reason=RESOURCE/NO_DATA/DISABLED/SOURCE，忙409、冷却/间隔429、参数422、资源/关闭503、源/无数据502。NO_DATA仅真实空/指定期无有效类别；格式变化/未知错误SOURCE。不扫其他期、不重试。公开路径/schemaVersion/业务键及严格源时间>15:00收盘、15:02/04/06/08/10补收盘、雪球总闸不变。
 - 分包：api路由；runtime跨域工作流/配额/源执行/资源/双通道调度；providers源HTTP/THS分页/catalog；calendar、market、stock_monitor、etf_monitor各归领域。删除unused JOB_TIMEOUT_SECONDS、completed的忽略limit参数及全缓存资料分支，没有legacy别名或新jobId。Python没有HTML渲染点，JSON/SSE保持结构化原文，不做所有字符串Filter/全局escape；实际展示和HTTP/HTTPS外链由渲染端防护，业务库不存转义文本。
+
+## auto/manual 显式契约与源复用
+
+所有内部POST先验证X-Internal-Token，之后解析X-Collection-Mode：缺省auto，精确auto/manual有效，其它400；jobs四类、股票/ETF字典资料及资产配置沿原路径和同步响应。八个scheduler本机回环请求manual，admin/定时/CLI保持auto；资产配置并非八个固定入口，但可显式manual，雪球授权保持。
+
+模式通过API→工作流→日历/采集器→Provider→每请求独立SourceExecutor→不可变SourceCall→spawn子进程显式传递，无环境变量/进程全局可变开关。源清单仍13个唯一函数、14种参数组合，逐项参数、域名、路径、字段语义与标准化复用上表，不复制采集器或增加资料轮询。以下控制按请求作用于全部14种组合：
+
+| 规则 | auto | manual |
+| --- | --- | --- |
+| 采集任务/入口锁、全局2/同组2配额 | 保留 | 跳过，不续租/释放自动锁 |
+| 120秒/单股/资料1800秒/日历刷新间隔 | 保留 | 不读取、不写入 |
+| 普通网络/格式/数值校验冷却 | 原模块/ETF300秒 | 不读取、不写入 |
+| 实际HTTP间隔及串行分页 | THS1秒/基金资料2秒/SINA0.2秒/XQ及交易所1秒 | 完全共享同一Redis速率键 |
+| 401/403/429、明确风控与未知旧冷却 | 保留7200秒风控；旧键到期 | 相同，不猜TTL、不删除旧键 |
+| 认证、雪球授权、≤10、超时及资源/Redis故障停止 | 保留 | 相同 |
+| 业务事务、事件锁、短写锁、版本链 | 保留 | 相同，与auto交错合并实际点 |
+
+普通故障键为原适用冷却键加`:ordinary`；确认风控`stock:source-control:v1:risk:{ths|sina|xq|sse|szse|bse}`，值包含ORDINARY/RISK及HTTP状态。旧键无原因标识仍保守尊重TTL，不作迁移删除。ETF字典AUTO合法当日缓存零源调用；MANUAL强制一次新浪全表，成功更新轻量字典缓存，失败保留旧缓存；一次ETF行情全表仍同时喂报价和字典。股票资料仅市值可复用120秒有效报价，主资料源始终调用。
+
+窗口外/休市可manual请求。股票保留真实sourceTime/tradeDate，写入短临界区重检源时间不倒退，>15:00才确认收盘、不补历史点；市场/指数/ETF无可靠日期时tradeDate=null，仅快照及实际采集时间，成功或失败降级的日内series均为空，资金和价格曲线不加点，日历未知不能推算工作日。源域名及HTTP超时/截止、1GiB/800MiB保护不变。
+
+```bash
+curl -X POST http://127.0.0.1:8000/internal/etf-monitor/v1/dictionary \
+  -H "X-Internal-Token: ${STOCK_MONITOR_INTERNAL_TOKEN}" \
+  -H 'X-Collection-Mode: manual'
+```
+
+本轮以离线mock测试模式隔离、跨进程速率、风险/Redis/资源拒绝、预算/取消回收、并发曲线/报价/版本及窗口外语义。**真实源及1GiB Linux容器峰值未验证**：本机没有Docker运行环境，不安装运行时、不提高内存，也不使用生产Redis/Token测试。
 
 ## 即时个股分页修复与验证限制
 
@@ -311,6 +339,8 @@ keys = [
     "stock:etf-monitor:v1:min-interval", "stock:etf-monitor:v1:lock",
     "stock:monitor:v1:sample:lock",
 ]
+keys += [key+":ordinary" for key in keys if ":cooldown:" in key or key.endswith(":cooldown")]
+keys += ["stock:source-control:v1:risk:"+group for group in ("ths","sina","xq","sse","szse","bse")]
 client = None
 try:
     settings = load_settings()

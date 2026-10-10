@@ -221,7 +221,7 @@ def test_manual_market_workflow_uses_both_locks_and_quote_job_can_coexist_with_f
     from app.core.config import load_settings
     backend=FakeRedis()
     settings=load_settings({})
-    def market(settings,client,at,lane):
+    def market(settings,client,at,lane,mode="auto"):
         assert lane=='market'
         assert client.get(QUOTES_ENTRY_KEY)==client.get(FUNDS_ENTRY_KEY)
         return 'published'

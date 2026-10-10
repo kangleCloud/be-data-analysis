@@ -31,7 +31,7 @@ def headers():
 
 
 def test_all_jobs_require_existing_internal_token_and_have_no_status_route():
-    client = client_for(RedisClient(), lambda _kind: "published")
+    client = client_for(RedisClient(), lambda _kind, **kwargs: "published")
     for kind in ("calendar", "market", "monitor", "etf"):
         assert client.post(f"/internal/jobs/v1/{kind}/refresh").status_code == 401
         assert client.get(f"/internal/jobs/v1/{kind}/status", headers=headers()).status_code == 404
@@ -42,7 +42,7 @@ def test_post_waits_for_result_and_overlap_returns_409_without_queuing():
     started = threading.Event()
     calls = []
 
-    def runner(kind):
+    def runner(kind, **kwargs):
         calls.append(kind)
         started.set()
         assert gate.wait(2)
@@ -75,7 +75,7 @@ def test_business_outcomes_are_distinct_terminal_states():
         "calendar": "throttled", "market": "partial", "monitor": "disabled",
         "etf": "published",
     }
-    client = client_for(RedisClient(), lambda kind: outcomes[kind])
+    client = client_for(RedisClient(), lambda kind, **kwargs: outcomes[kind])
     for kind, state in (
         ("calendar", "SKIPPED"), ("market", "PARTIAL"),
         ("monitor", "SKIPPED"), ("etf", "SUCCEEDED")
@@ -87,12 +87,12 @@ def test_business_outcomes_are_distinct_terminal_states():
 
 
 def test_business_failure_and_worker_crash_are_not_success():
-    failed = client_for(RedisClient(), lambda _kind: "failed")
+    failed = client_for(RedisClient(), lambda _kind, **kwargs: "failed")
     response = failed.post("/internal/jobs/v1/calendar/refresh", headers=headers())
     assert response.status_code == 200
     assert response.json()["state"] == "FAILED"
 
-    def crash(_kind):
+    def crash(_kind, **kwargs):
         raise RuntimeError("secret credential")
 
     crashed = client_for(RedisClient(), crash)
@@ -108,7 +108,7 @@ def test_lock_redis_failure_is_503_and_does_not_run():
             raise ConnectionError("redis unavailable")
 
     calls = []
-    client = client_for(BrokenRedis(), lambda kind: calls.append(kind))
+    client = client_for(BrokenRedis(), lambda kind, **kwargs: calls.append(kind))
     response = client.post("/internal/jobs/v1/market/refresh", headers=headers())
     assert response.status_code == 503
     assert response.json()["state"] == "FAILED"
@@ -126,14 +126,14 @@ def test_default_dispatch_reuses_workflows_in_service_parent(monkeypatch):
         assert _run_default(key,settings,client) == 'published'
     assert [call[0] for call in calls] == ['calendar','market','monitor','etf']
     assert all(call[1] == (settings,client) for call in calls)
-    assert calls[0][2] == {'manual':True}
+    assert calls[0][2] == {'on_demand':True, 'mode':'auto'}
 
 
 def test_resource_failure_returns_503_and_releases_all_locks():
     from app.runtime.resources import SourceResourceError
     from app.runtime.gates import QUOTES_ENTRY_KEY
     backend = RedisClient()
-    def fail(kind):
+    def fail(kind, **kwargs):
         raise SourceResourceError('PROCESS_EXIT',exitcode=-9)
     response = client_for(backend,fail).post('/internal/jobs/v1/market/refresh',headers=headers())
     assert response.status_code == 503
@@ -145,7 +145,7 @@ def test_cross_kind_refresh_busy_immediately():
     from app.runtime.gates import QUOTES_ENTRY_KEY
     backend,calls = RedisClient(),[]
     backend.set(QUOTES_ENTRY_KEY,'another-kind',ex=30)
-    response = client_for(backend,lambda kind:calls.append(kind)).post('/internal/jobs/v1/etf/refresh',headers=headers())
+    response = client_for(backend,lambda kind, **kwargs:calls.append(kind)).post('/internal/jobs/v1/etf/refresh',headers=headers())
     assert response.status_code == 409 and response.json()['outcome'] == 'locked'
     assert calls == []
 
@@ -154,7 +154,7 @@ def test_complete_market_api_funds_busy_leaves_no_quotes_lock():
     from app.runtime.gates import QUOTES_ENTRY_KEY,FUNDS_ENTRY_KEY
     backend,calls=RedisClient(),[]
     backend.set(FUNDS_ENTRY_KEY,'auto-funds',ex=30)
-    response=client_for(backend,lambda kind:calls.append(kind)).post('/internal/jobs/v1/market/refresh',headers=headers())
+    response=client_for(backend,lambda kind, **kwargs:calls.append(kind)).post('/internal/jobs/v1/market/refresh',headers=headers())
     assert response.status_code==409 and response.json()['outcome']=='locked'
     assert calls==[] and backend.get(QUOTES_ENTRY_KEY) is None
     assert backend.get(FUNDS_ENTRY_KEY)=='auto-funds'

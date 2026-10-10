@@ -12,6 +12,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from app.runtime.resources import SourceResourceError
+from app.runtime.cooldown import remaining, record
 from app.providers.xueqiu import XueqiuSourceError
 from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, completed, source_batch
 import redis
@@ -179,10 +180,10 @@ class MonitorStore:
         self.client.eval(RELEASE_SCRIPT, 1, SAMPLE_LOCK_KEY, token)
 
     def cooldown_active(self) -> bool:
-        return bool(self.client.exists(XQ_COOLDOWN_KEY))
+        return remaining(self.client, (XQ_COOLDOWN_KEY,), "xq", "manual") is not None
 
     def start_cooldown(self) -> None:
-        self.client.set(XQ_COOLDOWN_KEY, "1", ex=COOLDOWN_SECONDS, nx=True)
+        record(self.client, (), "xq", "auto", {"category": "AUTH_REJECTED"})
 
     def quote(self, symbol: str) -> dict[str, Any] | None:
         raw = self.client.get(f"{QUOTE_PREFIX}{symbol}")
@@ -199,6 +200,13 @@ class MonitorStore:
 
     def _write_quote_transaction(self, quote: dict[str, Any], *, append_point: bool) -> None:
         symbol, trade_date = quote["symbol"], quote["tradeDate"]
+        previous = self.quote(symbol)
+        if previous:
+            old_time, new_time = _source_time(previous.get("sourceTime")), _source_time(quote.get("sourceTime"))
+            if old_time and (new_time is None or new_time < old_time):
+                return
+            if old_time == new_time and previous.get("collectedAt", "") > quote.get("collectedAt", ""):
+                return
         base_id = self.client.get(MONITOR_STATE_KEY)
         state_id = uuid4().hex
         pipe = self.client.pipeline(transaction=True)
@@ -241,9 +249,9 @@ class TradingCalendar(Protocol):
 
 class StockMonitorSampler:
     def __init__(self, store: MonitorStore, source: QuoteSource, calendar: TradingCalendar,
-                 *, xq_enabled: bool = False) -> None:
+                 *, xq_enabled: bool = False, mode: str = "auto") -> None:
         self.store, self.source, self.calendar = store, source, calendar
-        self.xq_enabled = xq_enabled
+        self.xq_enabled, self.mode = xq_enabled, mode
 
     def sample(self, at: datetime) -> str:
         started = time.monotonic()
@@ -251,17 +259,19 @@ class StockMonitorSampler:
             return "disabled"
         local = at.astimezone(SHANGHAI)
         close_retry = local.hour == 15 and local.minute in CLOSE_RETRY_MINUTES
-        if local.weekday() >= 5 or not (
+        in_window = local.weekday() < 5 and (
             day_time(9, 30) <= local.time() <= day_time(11, 30)
             or day_time(13) <= local.time() <= day_time(15)
             or close_retry
-        ):
+        )
+        if self.mode == "auto" and not in_window:
             return "skipped"
-        token = self.store.acquire()
-        if token is None:
+        token = self.store.acquire() if self.mode == "auto" else None
+        if self.mode == "auto" and token is None:
             return "locked"
         try:
-            if self.calendar.day_status(local.date(), local) is not True:
+            trading = self.calendar.day_status(local.date(), local)
+            if self.mode == "auto" and trading is not True:
                 return "skipped"
             stocks = self.store.enabled()
             if not stocks:
@@ -279,7 +289,7 @@ class StockMonitorSampler:
                 symbol = stock["symbol"]
                 if close_retry and self._close_confirmed(symbol, local.date()):
                     continue
-                if getattr(self.source, "executor", None) is None and not self.store.reserve_request(symbol):
+                if self.mode == "auto" and getattr(self.source, "executor", None) is None and not self.store.reserve_request(symbol):
                     if close_retry:
                         self._mark_failed(symbol, local)
                     continue
@@ -288,11 +298,11 @@ class StockMonitorSampler:
                         raise SourceCoolingError(self.store.client.ttl(XQ_COOLDOWN_KEY))
                     return self.source.quote(code)
                 candidates.append((symbol, "xq", fetch))
-            with source_batch(self.source, (SAMPLE_LOCK_KEY, token), started+300), closing(
+            with source_batch(self.source, (SAMPLE_LOCK_KEY, token) if self.mode == "auto" else None, started+300), closing(
                 completed(candidates, source=self.source)
             ) as results:
                 for symbol, raw, error, finished_at in results:
-                    if self.store.client.get(SAMPLE_LOCK_KEY) != token:
+                    if self.mode == "auto" and self.store.client.get(SAMPLE_LOCK_KEY) != token:
                         raise SourceControlError("业务任务锁已失效")
                     try:
                         if error:
@@ -302,6 +312,9 @@ class StockMonitorSampler:
                         source_time = datetime.fromisoformat(quote["sourceTime"])
                         previous = self.store.quote(symbol)
                         previous_time = _source_time(previous.get("sourceTime")) if previous else None
+                        if self.mode == "manual" and previous_time and previous_time >= source_time:
+                            # 手动重试取得旧报价，不降低并发成功报价的时间或状态。
+                            continue
                         if source_time.date() > local.date():
                             raise QuoteValidationError("source_date_in_future", "time")
                         if source_time.date() < local.date():
@@ -351,12 +364,13 @@ class StockMonitorSampler:
                             self.store.start_cooldown()
                         continue
                     # 业务写入失败直接退出，关闭结果迭代器后回收在途源进程。
-                    if self.store.client.get(SAMPLE_LOCK_KEY) != token:
+                    if self.mode == "auto" and self.store.client.get(SAMPLE_LOCK_KEY) != token:
                         raise SourceControlError("业务任务锁已失效")
-                    self.store.write_quote(quote, append_point=True)
+                    self.store.write_quote(quote, append_point=in_window and trading is True and source_time.date() == local.date())
             return "resource" if resource_failed else "partial" if failures else "published"
         finally:
-            self.store.release(token)
+            if self.mode == "auto":
+                self.store.release(token)
 
     def _preserve_stale(
         self, symbol: str, incoming: dict[str, Any], previous: dict[str, Any] | None,
@@ -382,6 +396,8 @@ class StockMonitorSampler:
 
     def _mark_failed(self, symbol: str, at: datetime) -> None:
         previous = self.store.quote(symbol)
+        if previous and previous.get("collectedAt", "") > at.isoformat(timespec="seconds"):
+            return
         if previous and previous.get("sourceTime") and previous.get("price") is not None:
             previous["status"] = "STALE"
             self.store.write_quote(previous, append_point=False)

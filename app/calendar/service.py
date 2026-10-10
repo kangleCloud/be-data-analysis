@@ -2,6 +2,7 @@
 
 import json
 from app.runtime.resources import SourceResourceError
+from app.stock_monitor.events import monitor_event_lock
 import logging
 import redis
 import re
@@ -32,13 +33,14 @@ class CalendarSource(Protocol):
 
 
 class AkShareCalendarSource:
-    def __init__(self, timeout_seconds: int = 15, *, executor: Any = None) -> None:
+    def __init__(self, timeout_seconds: int = 15, *, executor: Any = None, mode: str = "auto") -> None:
         self.timeout_seconds = timeout_seconds
-        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds)
+        self.mode = mode
+        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds, mode=mode)
 
     def dates(self) -> list[str]:
         frame = self.executor.call(SourceCall("tool_trade_date_hist_sina", "sina", {},
-            self.timeout_seconds+12, ("finance.sina.com.cn",)))
+            self.timeout_seconds+12, ("finance.sina.com.cn",), mode=self.mode))
         return [str(value) for value in frame["trade_date"]] if hasattr(frame,"columns") else [str(row["trade_date"]) for row in frame]
 
 
@@ -102,8 +104,8 @@ def _seconds_until_tomorrow(at: datetime) -> int:
 
 
 class CalendarService:
-    def __init__(self, client: Any, source: CalendarSource) -> None:
-        self.client, self.source = client, source
+    def __init__(self, client: Any, source: CalendarSource, *, mode: str = "auto") -> None:
+        self.client, self.source, self.mode = client, source, mode
 
     def load(self) -> dict[str, Any] | None:
         raw = self.client.get(CACHE_KEY)
@@ -141,29 +143,32 @@ class CalendarService:
             return None
         return day.isoformat() in cache["dates"]
 
-    def refresh(self, at: datetime, *, manual: bool = False) -> str:
+    def refresh(self, at: datetime, *, on_demand: bool = False) -> str:
         local = at.astimezone(SHANGHAI)
         token = uuid4().hex
-        if not self.client.set(LOCK_KEY, token, nx=True, ex=LOCK_SECONDS):
+        if self.mode == "auto" and not self.client.set(LOCK_KEY, token, nx=True, ex=LOCK_SECONDS):
             return "locked"
         try:
-            gate = MANUAL_INTERVAL_KEY if manual else AUTO_RETRY_KEY
-            ttl = MANUAL_INTERVAL_SECONDS if manual else _seconds_until_tomorrow(local)
-            if not self.client.set(gate, "1", nx=True, ex=ttl):
+            gate = MANUAL_INTERVAL_KEY if on_demand else AUTO_RETRY_KEY
+            ttl = MANUAL_INTERVAL_SECONDS if on_demand else _seconds_until_tomorrow(local)
+            if self.mode == "auto" and not self.client.set(gate, "1", nx=True, ex=ttl):
                 return "throttled"
-            old = self.load()
             try:
-                with source_batch(self.source, (LOCK_KEY, token)):
+                with source_batch(self.source, (LOCK_KEY, token) if self.mode == "auto" else None):
                     payload = normalize_dates(self.source.dates(), local)
                 if payload["lastDate"] < local.date().isoformat():
                     raise ValueError("交易日历未覆盖当前日期")
-                if (old is not None and old["year"] == payload["year"]
-                        and payload["lastDate"] < old["lastDate"]):
-                    raise ValueError("交易日历源范围倒退")
-                if self.client.get(LOCK_KEY) != token:
+                if self.mode == "auto" and self.client.get(LOCK_KEY) != token:
                     raise SourceControlError("业务任务锁已失效")
-                if not self.client.set(CACHE_KEY, json.dumps(payload, ensure_ascii=False)):
-                    raise RuntimeError("交易日历缓存写入失败")
+                with monitor_event_lock(self.client, key=f"{CACHE_KEY}:write-lock"):
+                    old = self.load()
+                    if (old is not None and old["year"] == payload["year"]
+                            and payload["lastDate"] < old["lastDate"]):
+                        raise ValueError("交易日历源范围倒退")
+                    if old and old["refreshedAt"] > payload["refreshedAt"]:
+                        return "refreshed"
+                    if not self.client.set(CACHE_KEY, json.dumps(payload, ensure_ascii=False)):
+                        raise RuntimeError("交易日历缓存写入失败")
                 return "refreshed"
             except SourceResourceError:
                 raise
@@ -175,4 +180,5 @@ class CalendarService:
                 LOGGER.warning("交易日历刷新失败，异常 %s", type(exc).__name__)
                 return "failed"
         finally:
-            self.client.eval(RELEASE_SCRIPT, 1, LOCK_KEY, token)
+            if self.mode == "auto":
+                self.client.eval(RELEASE_SCRIPT, 1, LOCK_KEY, token)

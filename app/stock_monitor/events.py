@@ -16,11 +16,11 @@ return 0
 
 
 @contextmanager
-def monitor_event_lock(client: Any) -> Iterator[None]:
+def monitor_event_lock(client: Any, *, key: str = EVENT_LOCK_KEY) -> Iterator[None]:
     """短临界区只覆盖状态 ID 读取与 Redis 事务提交。"""
     token = uuid4().hex
     for _ in range(40):
-        if client.set(EVENT_LOCK_KEY, token, nx=True, ex=EVENT_LOCK_SECONDS):
+        if client.set(key, token, nx=True, ex=EVENT_LOCK_SECONDS):
             break
         time.sleep(0.05)
     else:
@@ -28,4 +28,4 @@ def monitor_event_lock(client: Any) -> Iterator[None]:
     try:
         yield
     finally:
-        client.eval(RELEASE_SCRIPT, 1, EVENT_LOCK_KEY, token)
+        client.eval(RELEASE_SCRIPT, 1, key, token)

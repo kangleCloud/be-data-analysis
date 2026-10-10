@@ -17,6 +17,7 @@ from redis.backoff import NoBackoff
 from redis.retry import Retry
 
 from app.runtime.gates import collection_entry, check_entry
+from app.runtime.cooldown import protected_keys, record, risk_rejection
 from app.runtime.resources import SourceResourceError, check_memory, memory_state
 from app.providers.ths_paging import IndividualPaging
 from app.providers.http import bounded_timeout, error_metadata, quiet_progress
@@ -51,7 +52,7 @@ if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
 return redis.call('expire', KEYS[1], ARGV[2])
 """
 RATE_SCRIPT = """
-if redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('get', KEYS[2]) ~= ARGV[1] then return {-1,0} end
+if ARGV[6] ~= 'manual' and (redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('get', KEYS[2]) ~= ARGV[1]) then return {-1,0} end
 if ARGV[4] ~= '' and redis.call('get', KEYS[5]) ~= ARGV[4] then return {-1,0} end
 for i=7,#KEYS do if redis.call('exists', KEYS[i]) == 1 then return {-2,redis.call('ttl', KEYS[i])} end end
 local interval = tonumber(ARGV[5])
@@ -123,6 +124,7 @@ class SourceCall:
     fund_profile: bool = False
     interval_key: str | None = None
     interval_seconds: int = 120
+    mode: str = "auto"
 
     @property
     def lane(self):
@@ -146,26 +148,28 @@ class SourceControl:
     def release(self, keys: tuple[str, str], token: str) -> None:
         self.client.eval(RELEASE_SCRIPT, 2, *keys, token)
 
-    def check(self, keys: tuple[str, str], token: str,
+    def check(self, keys: tuple[str, str] | None, token: str,
               guard: tuple[str, str] | None = None) -> None:
-        if any(self.client.get(key) != token for key in keys):
+        if keys is None:
+            self.client.get(f"{PREFIX}health")
+        elif any(self.client.get(key) != token for key in keys):
             raise SourceControlError("源调用配额已失效")
         if guard is not None and self.client.get(guard[0]) != guard[1]:
             raise SourceControlError("业务任务锁已失效")
 
-    def request_turn(self, call: SourceCall, keys: tuple[str, str], token: str,
+    def request_turn(self, call: SourceCall, keys: tuple[str, str] | None, token: str,
                      guard: tuple[str, str] | None, deadline: float) -> None:
         interval = 0.2 if call.group == "sina" else 1
         rate_keys = [f"{PREFIX}rate:{call.group}",
                      f"{PREFIX}rate:ths:fund" if call.fund_profile else f"{PREFIX}rate:{call.group}"]
-        all_keys = [*keys, *rate_keys, guard[0] if guard else f"{PREFIX}no-guard",
-                    call.interval_key or f"{PREFIX}no-interval", *call.cooldown_keys]
+        all_keys = [*(keys or (f"{PREFIX}no-slot", f"{PREFIX}no-slot")), *rate_keys, guard[0] if guard else f"{PREFIX}no-guard",
+                    call.interval_key or f"{PREFIX}no-interval", *protected_keys(call.cooldown_keys, call.group, call.mode)]
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("源调用预算已耗尽")
             status, value = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
                                              int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
-                                             guard[1] if guard else "", call.interval_seconds if call.interval_key else 0)
+                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" else 0, call.mode)
             if status == -1:
                 raise SourceControlError("源配额或业务锁已失效")
             if status == -2:
@@ -177,27 +181,13 @@ class SourceControl:
             time.sleep(min(0.1, value / 1000, max(0, deadline-time.monotonic())))
 
     def cool(self, call: SourceCall, metadata: dict[str, Any]) -> None:
-        status = metadata["http_status"]
-        seconds = None
-        key = call.cooldown_keys[0] if call.cooldown_keys else None
-        if call.cooldown_policy == "market":
-            shared, seconds = market_cooldown(metadata)
-            index = 0 if shared else 1
-            key = call.cooldown_keys[index] if len(call.cooldown_keys) > index else None
-        elif call.cooldown_policy == "etf":
-            seconds = 7200 if status in {403, 429} else 300
-        elif call.cooldown_policy == "stock" and (status in {401, 403, 429}
-                or metadata["exception_type"] == "RateLimitError" or metadata["category"] == "AUTH_REJECTED"):
-            seconds = 7200
-        if seconds and key:
-            self.client.set(key, "1", ex=seconds, nx=True)
+        keys = call.cooldown_keys if call.cooldown_policy in {"market", "etf"} else ()
+        record(self.client, keys, call.group, call.mode, metadata)
 
 
 def market_cooldown(metadata: dict[str, Any]) -> tuple[bool, int]:
     """只有明确风控拒绝才暂停共享源；普通失败仅暂停当前市场模块。"""
-    shared = (metadata["http_status"] in {403, 429}
-              or metadata["category"] == "SOURCE_REJECTED"
-              or metadata["exception_type"] == "RateLimitError")
+    shared = risk_rejection(metadata)
     return shared, 7200 if shared else 300
 
 
@@ -207,7 +197,7 @@ def _client(url: str) -> redis.Redis:
 
 
 @contextmanager
-def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, str], token: str,
+def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, str] | None, token: str,
                     guard: tuple[str, str] | None, deadline: float, read_seconds: float,
                     started_event: Any = None) -> Iterator[None]:
     """Session.send 覆盖 get/post、雪球会话、重定向，每次物理 HTTP 都先取共享速率许可。"""
@@ -244,7 +234,7 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
         requests.Session.send = original
 
 
-def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str], token: str,
+def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str] | None, token: str,
                    guard: tuple[str, str] | None, deadline: float, read_seconds: float, parent_pid: int,
                    started_event: Any) -> None:
     client = _client(url)
@@ -329,9 +319,11 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
 class SourceExecutor:
     """父进程等待/续租/回收独立 spawn 源进程，不写任何业务快照。"""
     def __init__(self, redis_url: str, read_seconds: float = 15, *, client: Any = None,
-                 context: Any = None, lane: str = "quotes", worker: Callable[..., None] = _source_worker) -> None:
+                 context: Any = None, lane: str = "quotes", mode: str = "auto", worker: Callable[..., None] = _source_worker) -> None:
+        if mode not in {"auto", "manual"}:
+            raise ValueError("采集模式必须为 auto 或 manual")
         self.redis_url, self.read_seconds = redis_url, read_seconds
-        self.lane = lane
+        self.lane, self.mode = lane, mode
         self.control = SourceControl(client if client is not None else _client(redis_url))
         self.context = context or mp.get_context("spawn")
         self.worker = worker
@@ -340,16 +332,16 @@ class SourceExecutor:
         self.deadline: float | None = None
 
     @classmethod
-    def configured(cls, read_seconds: float | None = None) -> "SourceExecutor":
+    def configured(cls, read_seconds: float | None = None, *, mode: str = "auto") -> "SourceExecutor":
         from app.core.config import get_settings
         settings = get_settings()
         return cls(settings.redis_url.get_secret_value(),
-                   settings.source_timeout_seconds if read_seconds is None else read_seconds)
+                   settings.source_timeout_seconds if read_seconds is None else read_seconds, mode=mode)
 
     @contextmanager
     def batch(self, guard: tuple[str, str] | None = None,
               deadline: float | None = None) -> Iterator[None]:
-        with collection_entry(self.control.client, lane=self.lane) as acquired:
+        with collection_entry(self.control.client, lane=self.lane, mode=self.mode) as acquired:
             if not acquired:
                 raise SourceBusyError('其他采集任务正在运行')
             with self._batch_locked(guard,deadline):
@@ -358,6 +350,8 @@ class SourceExecutor:
     @contextmanager
     def _batch_locked(self, guard: tuple[str, str] | None = None,
               deadline: float | None = None) -> Iterator[None]:
+        if self.mode == "manual":
+            guard = None
         self.cancelled.clear()
         self.guard, self.deadline = guard, deadline
         stop_renewal = threading.Event()
@@ -398,12 +392,14 @@ class SourceExecutor:
             raise SourceControlError("业务任务锁已失效")
 
     def call(self, call: SourceCall) -> Any:
-        with collection_entry(self.control.client, lane=call.lane) as acquired:
+        with collection_entry(self.control.client, lane=call.lane, mode=self.mode) as acquired:
             if not acquired:
                 raise SourceBusyError('其他采集任务正在运行')
             return self._call_locked(call)
 
     def _call_locked(self, call: SourceCall) -> Any:
+        if call.mode != self.mode:
+            raise ValueError("Provider 与源执行器采集模式不一致")
         if call.group not in GROUPS:
             raise ValueError("未知来源组")
         started = time.monotonic()
@@ -421,9 +417,11 @@ class SourceExecutor:
                 self._check()
                 if time.monotonic() >= request_deadline:
                     raise SourceNotStartedError("等待源配额超过预算，尚未发起请求")
-                for key in call.cooldown_keys:
+                for key in protected_keys(call.cooldown_keys, call.group, call.mode):
                     if self.control.client.exists(key):
                         raise SourceCoolingError(self.control.client.ttl(key))
+                if self.mode == "manual":
+                    break
                 keys = self.control.acquire(call.group, token)
                 if keys is None:
                     time.sleep(min(0.1, max(0, request_deadline-time.monotonic())))
@@ -440,7 +438,7 @@ class SourceExecutor:
                     if not requested.is_set():
                         raise SourceNotStartedError("源预算结束，尚未发起请求")
                     raise TimeoutError("源调用超过预算")
-                if now - renewed >= RENEW_SECONDS:
+                if keys is not None and now - renewed >= RENEW_SECONDS:
                     self.control.renew(keys, token)
                     renewed = now
                 try:

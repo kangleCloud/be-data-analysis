@@ -46,7 +46,7 @@ def _call(function: Any, *, symbol: str, token: str,
 
 
 class XueqiuProvider:
-    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None) -> None:
+    def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None, mode: str = "auto") -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
         # AKShare 1.18.97 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
@@ -55,7 +55,8 @@ class XueqiuProvider:
         self._token = token
         self._timeout = bounded_timeout(None, timeout_seconds)
         self._api = api
-        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds))
+        self.mode = mode
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, mode=mode))
 
     def _frame(self, function: str, symbol: str) -> dict[str, Any]:
         if self._api is not None:
@@ -65,7 +66,7 @@ class XueqiuProvider:
                 "symbol": symbol, "token": self._token, "timeout": self._timeout,
             }, 300, ("xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
                 interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
-                if function == "stock_individual_spot_xq" else None))
+                if function == "stock_individual_spot_xq" else None, mode=self.mode))
             return _items(frame)
         except SourceCallError as exc:
             raise XueqiuSourceError("雪球接口请求失败", cooldown=exc.http_status in {401,403,429}

@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from app.core.config import Settings
+from app.runtime.mode import collection_mode
 from app.runtime.source_execution import SourceExecutor, completed, source_batch, SourceBusyError, SourceThrottledError, SourceCoolingError
 from app.runtime.gates import collection_entry
 from app.runtime.resources import SourceResourceError
@@ -79,15 +80,18 @@ def create_monitor_router(
     @router.post("/exchange-dictionary", summary="同步交易所 A 股字典")
     def exchange_dictionary(
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         source = exchange_factory() if exchange_factory else ExchangeStockProvider(
             settings.source_timeout_seconds,
-            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
+            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
+            mode=mode,
         )
         store = new_store()
         try:
-            with collection_entry(store.client) as entered:
+            with collection_entry(store.client, mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
                 return {"schemaVersion":1,"stocks":source.all_a_stocks()}
@@ -105,8 +109,10 @@ def create_monitor_router(
     def profiles(
         request: ProfileRequest,
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         if not settings.stock_monitor_xq_enabled:
             raise HTTPException(status_code=503, detail="雪球生产采集已关闭")
         token = settings.xueqiu_token.get_secret_value()
@@ -121,13 +127,14 @@ def create_monitor_router(
         try:
             if store.cooldown_active():
                 raise HTTPException(status_code=429, detail="雪球源冷却中")
-            lock = store.acquire(lock_seconds=10 * 60)
-            if lock is None:
+            lock = store.acquire(lock_seconds=10 * 60) if mode == "auto" else None
+            if mode == "auto" and lock is None:
                 raise HTTPException(status_code=409, detail="雪球采集任务正在运行")
             try:
                 source = xq_factory() if xq_factory else XueqiuProvider(
                     token, settings.source_timeout_seconds,
-                    executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
+                    executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
+                    mode=mode,
                 )
                 def fetch(symbol: str) -> dict[str, Any]:
                     cached = fresh_profile_quote(store.quote(symbol),symbol,datetime.now(SHANGHAI))
@@ -140,10 +147,10 @@ def create_monitor_router(
                     return profile
                 actions = [(symbol, "xq", lambda code=symbol: fetch(code)) for symbol in symbols]
                 profiles_by_symbol = {}
-                with collection_entry(store.client) as entered:
+                with collection_entry(store.client, mode=mode) as entered:
                     if not entered:
                         raise HTTPException(status_code=409,detail="采集入口忙碌")
-                    with source_batch(source, (SAMPLE_LOCK_KEY, lock), time.monotonic()+600), closing(
+                    with source_batch(source, (SAMPLE_LOCK_KEY, lock) if mode == "auto" else None, time.monotonic()+600), closing(
                         completed(actions, source=source)
                     ) as results:
                         for symbol, profile, error, finished_at in results:
@@ -153,7 +160,8 @@ def create_monitor_router(
                 result = [profiles_by_symbol[symbol] for symbol in symbols]
                 return {"schemaVersion": 1, "profiles": result}
             finally:
-                store.release(lock)
+                if mode == "auto":
+                    store.release(lock)
         except HTTPException:
             raise
         except SourceBusyError as exc:

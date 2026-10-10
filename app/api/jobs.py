@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.core.config import Settings
+from app.runtime.mode import collection_mode
 from app.runtime.gates import collection_entry
 from app.runtime.resources import SourceResourceError
 from app.runtime.source_execution import SourceBusyError
@@ -57,15 +58,15 @@ def _state(outcome: str) -> str:
     return "FAILED"
 
 
-def _run_default(kind: Kind,settings: Settings,client: Any) -> str:
+def _run_default(kind: Kind,settings: Settings,client: Any, *, mode: str = "auto") -> str:
     if kind == 'calendar':
-        return run_calendar(settings,client,manual=True)
-    return {'market':run_market,'monitor':run_monitor,'etf':run_etf}[kind](settings,client)
+        return run_calendar(settings,client,on_demand=True,mode=mode)
+    return {'market':run_market,'monitor':run_monitor,'etf':run_etf}[kind](settings,client,mode=mode)
 
 
 def create_jobs_router(
     settings: Settings, *, redis_factory: Callable[[], Any] | None = None,
-    runner: Callable[[Kind], str] | None = None,
+    runner: Callable[..., str] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/internal/jobs/v1", tags=["内部手动任务"])
 
@@ -80,8 +81,10 @@ def create_jobs_router(
     def refresh(
         kind: Kind,
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> JSONResponse:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         started_at = _now()
         try:
             client = redis_factory() if redis_factory else redis.Redis.from_url(
@@ -101,17 +104,17 @@ def create_jobs_router(
         outcome = "failed"
         message = "任务执行失败"
         try:
-            acquired = bool(client.set(lock_key, token, nx=True, ex=LOCK_SECONDS))
-            if not acquired:
+            acquired = mode == "auto" and bool(client.set(lock_key, token, nx=True, ex=LOCK_SECONDS))
+            if mode == "auto" and not acquired:
                 status_code, outcome, message = 409, "locked", MESSAGES["locked"]
             else:
                 try:
-                    with collection_entry(client, lane="market" if kind == "market" else "quotes") as entered:
+                    with collection_entry(client, lane="market" if kind == "market" else "quotes", mode=mode) as entered:
                         if not entered:
                             outcome = 'locked'
                             status_code = 409
                         else:
-                            outcome = runner(kind) if runner else _run_default(kind,settings,client)
+                            outcome = runner(kind, mode=mode) if runner else _run_default(kind,settings,client,mode=mode)
                     if not isinstance(outcome, str) or outcome not in MESSAGES:
                         raise ValueError("任务返回无效结果")
                     message = MESSAGES[outcome]

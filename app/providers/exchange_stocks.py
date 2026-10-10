@@ -6,9 +6,10 @@ from app.runtime.source_execution import SourceCall, SourceExecutor, completed, 
 
 
 class ExchangeStockProvider:
-    def __init__(self, timeout_seconds: int = 15, source: Any = None, *, executor: Any = None) -> None:
+    def __init__(self, timeout_seconds: int = 15, source: Any = None, *, executor: Any = None, mode: str = "auto") -> None:
         self._source = source
-        self.executor = executor if executor is not None else (None if source is not None else SourceExecutor.configured(timeout_seconds))
+        self.mode = mode
+        self.executor = executor if executor is not None else (None if source is not None else SourceExecutor.configured(timeout_seconds, mode=mode))
         self._timeout_seconds = timeout_seconds
 
     def _frame(self, function: str, group: str, parameters: dict) -> Any:
@@ -19,7 +20,7 @@ class ExchangeStockProvider:
                 clear_cache()
             return method(**parameters)
         host = {"sse": "query.sse.com.cn", "szse": "www.szse.cn", "bse": "www.bse.cn"}[group]
-        return self.executor.call(SourceCall(function, group, parameters, 60, (host,)))
+        return self.executor.call(SourceCall(function, group, parameters, 60, (host,), mode=self.mode))
 
     def all_a_stocks(self) -> list[dict[str, str]]:
         combinations = (

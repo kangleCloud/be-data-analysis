@@ -10,12 +10,13 @@ from zoneinfo import ZoneInfo
 
 from app.market.normalize import SourceDataError, normalize_core_indices, normalize_individual_batch, normalize_sectors
 from app.runtime.resources import SourceResourceError
+from app.runtime.cooldown import remaining, record
 from app.core.logging import log_failure, redis_failure_kind
 from app.providers.akshare_market import MarketSource
 from app.providers.http import error_metadata
-from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch, market_cooldown
+from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch
 from app.runtime.gates import collection_entry
-from app.market.snapshot import SnapshotStore
+from app.market.snapshot import SnapshotStore, undated_module
 from app.calendar.service import CalendarService
 
 LOGGER = logging.getLogger(__name__)
@@ -44,9 +45,8 @@ def _reusable_prior(key: str, prior: Any) -> bool:
     """旧快照须符合新契约，避免把 Top5 或东财数据误当成可用历史。"""
     if not isinstance(prior, dict) or prior.get("status") not in {"FRESH", "STALE"}:
         return False
-    if prior.get("tradeDateBasis") != "CALENDAR" or not all(
-        isinstance(prior.get(field), str) for field in ("tradeDate", "lastSuccessAt")
-    ):
+    if (prior.get("tradeDateBasis") != "CALENDAR" or not isinstance(prior.get("lastSuccessAt"), str)
+            or prior.get("tradeDate") is not None and not isinstance(prior.get("tradeDate"), str)):
         return False
     data = prior.get("data")
     if not isinstance(data, dict):
@@ -122,28 +122,28 @@ def _fallback(key: str, prior: Any, timestamp: str, message: str) -> dict[str, A
 
 class MarketCollector:
     def __init__(self, provider: MarketSource, store: SnapshotStore,
-                 calendar: CalendarService, *, lane: str = "market") -> None:
+                 calendar: CalendarService, *, lane: str = "market", mode: str = "auto") -> None:
         self._provider = provider
         self._store = store
         self._calendar = calendar
-        self.lane = lane
+        self.lane, self.mode = lane, mode
         self.module_keys = ("marketFundFlow",) if lane == "funds" else ("coreIndices","industrySectors","conceptSectors") if lane == "quotes" else MODULE_KEYS
 
-    def collect(self, at: datetime, *, force: bool = False) -> str:
-        with collection_entry(self._store._client,lane=self.lane) as acquired:
+    def collect(self, at: datetime) -> str:
+        with collection_entry(self._store._client,lane=self.lane, mode=self.mode) as acquired:
             if not acquired:
                 return "locked"
-            return self._collect(at,force=force)
+            return self._collect(at)
 
-    def _collect(self, at: datetime, *, force: bool = False) -> str:
-        """手动 force 只允许主动触发，不绕过交易日、时段、锁、间隔或冷却。"""
+    def _collect(self, at: datetime) -> str:
+        """源无可靠日期时，窗口外手动刷新只更新快照，不生成曲线点。"""
         if at.tzinfo is None:
             raise ValueError("采集时间必须带时区")
         local = at.astimezone(SHANGHAI)
-        if not _in_collection_window(local):
+        if self.mode == "auto" and not _in_collection_window(local):
             return "skipped"
-        token = self._store.acquire()
-        if token is None:
+        token = self._store.acquire() if self.mode == "auto" else None
+        if self.mode == "auto" and token is None:
             return "locked"
         started = clock.monotonic()
         def collected_time() -> str:
@@ -151,8 +151,9 @@ class MarketCollector:
                 timespec="seconds"
             )
         try:
-            self._store.start_renewal(token)
-            if not self._store.reserve_slot(local):
+            if self.mode == "auto":
+                self._store.start_renewal(token)
+            if self.mode == "auto" and not self._store.reserve_slot(local):
                 return "throttled"
             timestamp = local.isoformat(timespec="seconds")
             previous = self._store.load() or {}
@@ -165,16 +166,16 @@ class MarketCollector:
                     raise
                 LOGGER.warning("交易日历失败，异常 %s", type(exc).__name__)
                 trading_status = None
-            if trading_status is None:
+            if self.mode == "auto" and trading_status is None:
                 modules = {
                     key: _fallback(key, old_modules.get(key), timestamp, "交易日历未知，展示上次成功数据")
                     for key in self.module_keys
                 }
                 self._publish(token, collected_time(), modules)
                 return "partial"
-            if not trading_status:
+            if self.mode == "auto" and not trading_status:
                 return "skipped"
-            day = local.date().isoformat()
+            day = local.date().isoformat() if trading_status is True and _in_collection_window(local) else None
             modules = {key: old_modules.get(key) if _reusable_prior(key, old_modules.get(key))
                        else _error_module(timestamp, "暂无可用数据") for key in self.module_keys}
             failures = 0
@@ -188,13 +189,14 @@ class MarketCollector:
             actions = [action for action in actions if action[0] in self.module_keys]
             def fetch(key: str, group: str, function: Any) -> Any:
                 source = "ths" if group == "ths" else "sina-index"
-                for scope in (source, f"module:{key}"):
-                    if self._store.cooldown_active(scope):
-                        raise SourceCoolingError(self._store.cooldown_remaining(scope))
+                scopes = (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{key}")
+                ttl = remaining(self._store._client, scopes, group, self.mode)
+                if ttl is not None:
+                    raise SourceCoolingError(ttl)
                 return function()
             guarded = [(key, group, lambda k=key,g=group,f=function: fetch(k,g,f))
                        for key,group,function in actions]
-            with source_batch(self._provider, (self._store.lock_key, token), started+1380), closing(
+            with source_batch(self._provider, (self._store.lock_key, token) if self.mode == "auto" else None, started+1380), closing(
                 completed(guarded, source=self._provider)
             ) as results:
                 for key, frame, error, finished_at in results:
@@ -208,12 +210,11 @@ class MarketCollector:
                             data = normalize_sectors(frame, "industry" if key == "industrySectors" else "concept")
                         elif key == "marketFundFlow":
                             data, by_code = normalize_individual_batch(frame, source_finished)
-                            selected = self._store.enabled_symbols()
-                            fund_points = {symbol: by_code[symbol[2:]] for symbol in selected if symbol[2:] in by_code}
-                            data = self._append_market_series(data, old_modules.get(key), day)
+                            if day is not None:
+                                selected = self._store.enabled_symbols()
+                                fund_points = {symbol: by_code[symbol[2:]] for symbol in selected if symbol[2:] in by_code}
                         else:
-                            data = self._append_index_series(normalize_core_indices(frame, source_finished),
-                                                             old_modules.get(key), day)
+                            data = normalize_core_indices(frame, source_finished)
                         modules[key] = {"status": "FRESH", "tradeDate": day, "tradeDateBasis": "CALENDAR",
                                         "lastSuccessAt": source_finished, "lastAttemptAt": timestamp,
                                         "message": None, "data": data}
@@ -237,8 +238,8 @@ class MarketCollector:
                         if isinstance(exc, SourceControlError) or redis_failure_kind(exc):
                             raise
                         failures += 1
-                        shared, seconds = market_cooldown(error_metadata(exc))
-                        self._store.start_cooldown(source if shared else f"module:{key}", seconds=seconds)
+                        record(self._store._client, (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{key}"),
+                               "sina" if key == "coreIndices" else "ths", self.mode, error_metadata(exc))
                         if not isinstance(exc, SourceDataError) and error_metadata(exc)["category"] == "UNEXPECTED":
                             log_failure(LOGGER, key, exc)
                         else:
@@ -247,6 +248,8 @@ class MarketCollector:
                         modules[key] = _fallback(key, old_modules.get(key), timestamp,
                                                  "资金源分页或数值校验失败，保留上次有效数据" if key == "marketFundFlow" and getattr(exc,"reason",None) else "本轮采集失败，展示上次成功数据")
                         fund_points = None
+                    if day is None:
+                        modules[key] = undated_module(key, modules[key])
                     # 每个完成模块仅发布一次；尚未完成模块保持原数据/时间。
                     self._publish(token, collected_time(), {key:modules[key]}, day, fund_points)
                     frame = None
@@ -255,48 +258,18 @@ class MarketCollector:
                         return "resource"
             return "resource" if resource_failed else "partial" if failures else "published"
         finally:
-            self._store.stop_renewal()
-            self._store.release(token)
+            if self.mode == "auto":
+                self._store.stop_renewal()
+                self._store.release(token)
             LOGGER.info("采集总耗时 %.2f 秒", clock.monotonic() - started)
 
     def _publish(
-        self, token: str, timestamp: str, modules: dict[str, Any],
+        self, token: str | None, timestamp: str, modules: dict[str, Any],
         trade_date: str | None = None, fund_points: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        if not self._store.renew(token):
+        if self.mode == "auto" and not self._store.renew(token):
             raise RuntimeError("市场采集锁已失效，拒绝发布快照")
         self._store.save({
             "schemaVersion": 1, "provider": "akshare",
             "generatedAt": timestamp, "modules": modules,
         }, trade_date=trade_date, fund_points=fund_points)
-
-    @staticmethod
-    def _append_market_series(data: dict[str, Any], prior: Any, day: str) -> dict[str, Any]:
-        point = data["series"][0]
-        if _reusable_prior("marketFundFlow", prior) and prior["tradeDate"] == day:
-            series = [
-                {**old, "netAmount": old["inflow"] - old["outflow"]}
-                for old in prior["data"]["series"]
-                if old["collectedAt"] != point["collectedAt"]
-            ]
-            series.append(point)
-            series.sort(key=lambda old: old["collectedAt"])
-            data["series"] = series
-        return data
-
-    @staticmethod
-    def _append_index_series(data: dict[str, Any], prior: Any, day: str) -> dict[str, Any]:
-        if not _reusable_prior("coreIndices", prior) or prior["tradeDate"] != day:
-            return data
-        old_by_code = {item["code"]: item for item in prior["data"]["items"]}
-        for item in data["items"]:
-            previous = old_by_code.get(item["code"])
-            if previous is None:
-                continue
-            point = item["series"][0]
-            series = [old for old in previous["series"]
-                      if old.get("collectedAt") != point["collectedAt"]]
-            series.append(point)
-            series.sort(key=lambda old: old["collectedAt"])
-            item["series"] = series
-        return data

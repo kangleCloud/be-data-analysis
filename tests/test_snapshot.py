@@ -362,7 +362,7 @@ def test_fund_status_without_points_notifies_enabled_symbols_atomically_only_on_
     first_state=client.get(MONITOR_STATE_KEY)
     save({**module,'lastAttemptAt':'2026-10-09T10:02:00+08:00'})
     assert client.get(MONITOR_STATE_KEY)==first_state
-    save({**module,'message':'采集资源不足或源进程退出，保留上次有效数据'})
+    save({**module,'lastAttemptAt':'2026-10-09T10:04:00+08:00','message':'采集资源不足或源进程退出，保留上次有效数据'})
     assert client.get(MONITOR_STATE_KEY)!=first_state
     notices=[json.loads(value) for action,key,value in client.events if action=='publish' and key==MONITOR_UPDATES_CHANNEL]
     assert len(notices)==2 and notices[-1]['baseStateId']==first_state

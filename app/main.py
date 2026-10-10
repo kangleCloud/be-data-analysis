@@ -29,7 +29,7 @@ def create_app(
     xq_factory: Callable[[], Any] | None = None,
     etf_factory: Callable[[], Any] | None = None,
     redis_factory: Callable[[], Any] | None = None,
-    job_runner: Callable[[str], str] | None = None,
+    job_runner: Callable[..., str] | None = None,
 ) -> FastAPI:
     configured = settings or get_settings()
 

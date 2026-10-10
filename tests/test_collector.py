@@ -91,11 +91,11 @@ def test_two_minute_interval_and_force_keep_safety_gates(flow_rows, market_rows)
     provider, client, store, collector = setup(flow_rows, market_rows)
     assert collector.collect(TRADING_AT) == "published"
     before = list(provider.calls)
-    assert collector.collect(TRADING_AT.replace(minute=1), force=True) == "throttled"
+    assert collector.collect(TRADING_AT.replace(minute=1)) == "throttled"
     assert provider.calls == before
     client.advance(120)
-    assert collector.collect(TRADING_AT.replace(minute=2), force=True) == "published"
-    assert collector.collect(TRADING_AT.replace(hour=15, minute=12), force=True) == "skipped"
+    assert collector.collect(TRADING_AT.replace(minute=2)) == "published"
+    assert collector.collect(TRADING_AT.replace(hour=15, minute=12)) == "skipped"
     assert provider.calls.count("market") == 2
 
 
@@ -179,7 +179,7 @@ def test_holiday_closed_market_and_overlap_do_not_fetch(flow_rows, market_rows):
     assert collector.collect(TRADING_AT.replace(hour=12)) == "skipped"
     assert provider.calls == []
     provider.calendar_date = date(2026, 9, 22)
-    assert collector.collect(TRADING_AT, force=True) == "skipped"
+    assert collector.collect(TRADING_AT) == "skipped"
     assert store.load() is None
     client.advance(120)
     provider.calendar_date = date(2026, 9, 23)

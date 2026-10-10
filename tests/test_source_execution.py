@@ -1,5 +1,7 @@
 """共享配额/HTTP速率和 spawn 回收的离线模拟，无真实 Redis/源请求。"""
 
+from app.runtime.cooldown import risk_key, ordinary_key
+
 import multiprocessing as mp
 import os
 import signal
@@ -71,8 +73,8 @@ class ControlRedis(FakeRedis):
                 self.expiry[keys[0]] = self.now+args[1]
                 return 1
             if script == RATE_SCRIPT:
-                token, interval, extra, guard, symbol_interval = args
-                if any(self.get(key) != token for key in keys[:2]):
+                token, interval, extra, guard, symbol_interval, mode = args
+                if mode == "auto" and any(self.get(key) != token for key in keys[:2]):
                     return [-1, 0]
                 if guard and self.get(keys[4]) != guard:
                     return [-1, 0]
@@ -179,7 +181,7 @@ def test_cooldown_blocks_next_http_without_renewing_ttl(monkeypatch):
         control.request_turn(call, keys, 'token', None, time.monotonic()+3)
     assert error.value.ttl == 7080
     control.cool(call, {'http_status':429,'category':'HTTP_REJECTED','exception_type':'HTTPError'})
-    assert backend.ttl('cooling') == 7080
+    assert backend.ttl(risk_key('ths')) == 7080
 
 # Manager 后端由独立服务进程提供；不同父进程共享原子控制状态。
 from multiprocessing.managers import BaseManager
@@ -418,7 +420,7 @@ def test_http_rejection_prevents_following_page_and_preserves_short_timeout(monk
         with pytest.raises(SourceCoolingError):
             requests.get('https://offline.test/page/2', timeout=(2,4))
     assert len(calls) == 1 and calls[0]['timeout'] == (2,4)
-    assert backend.ttl('cool') == 7200
+    assert backend.ttl(risk_key('ths')) == 7200
 
 
 def test_deadline_kills_started_term_ignoring_worker_within_original_budget():
@@ -541,7 +543,7 @@ def test_market_child_and_parent_share_cooldown_scope_without_expansion(category
     metadata = {'http_status':status,'category':category,'exception_type':kind}
     control.cool(call,metadata)
     shared, seconds = market_cooldown(metadata)
-    key, other = ('shared','module') if shared else ('module','shared')
+    key, other = (risk_key('ths'),ordinary_key('module')) if shared else (ordinary_key('module'),risk_key('ths'))
     assert client.ttl(key) == seconds and client.get(other) is None
     client.expire(key,seconds-120)
     control.cool(call,metadata)  # 父层重写同键也不得续期/扩范围。
@@ -568,7 +570,7 @@ def test_ordinary_market_http_failure_does_not_block_sibling_module(monkeypatch)
             requests.get('https://offline.test/industry')
         with pytest.raises(SourceCoolingError):
             requests.get('https://offline.test/industry/page/2')
-    assert backend.get('ths') is None and backend.ttl('industry') == 300
+    assert backend.get('ths') is None and backend.ttl(ordinary_key('industry')) == 300
     control.release(keys,'first')
     sibling = control.acquire('ths','second')
     with controlled_http(control,other,sibling,'second',None,time.monotonic()+5,15):

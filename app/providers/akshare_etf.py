@@ -17,10 +17,11 @@ ALLOWED_HOSTS = {
 
 
 class AkShareEtfProvider:
-    def __init__(self, timeout_seconds: int = 15, *, executor: Any = None, market_quotes: bool = False) -> None:
+    def __init__(self, timeout_seconds: int = 15, *, executor: Any = None, market_quotes: bool = False, mode: str = "auto") -> None:
         self.timeout_seconds = timeout_seconds
         self.market_quotes = market_quotes
-        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds)
+        self.mode = mode
+        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds, mode=mode)
 
     def _call(self, kind: str, *, budget_seconds: float | None = None,
               **arguments: str) -> list[dict[str, Any]]:
@@ -39,7 +40,7 @@ class AkShareEtfProvider:
             cooldown, policy = (), "none"
         try:
             frame = self.executor.call(SourceCall(function, group, parameters, budget,
-                tuple(ALLOWED_HOSTS[kind]), cooldown, policy, kind == "profile"))
+                tuple(ALLOWED_HOSTS[kind]), cooldown, policy, kind == "profile", mode=self.mode))
         except SourceCallError as exc:
             raise EtfSourceError(error_metadata(exc)) from exc
         return frame.to_dict("records") if hasattr(frame,"to_dict") else frame

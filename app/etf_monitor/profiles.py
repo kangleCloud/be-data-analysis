@@ -36,10 +36,10 @@ class ProfileBatchError(RuntimeError):
 
 
 def collect_profiles(source: Any, client: Any,
-                     symbols: list[str]) -> dict[str, Any]:
+                     symbols: list[str], *, mode: str = "auto") -> dict[str, Any]:
     """单批串行同步；此锁由 Python 持有，不使用 Java 整体刷新锁。"""
     token = uuid4().hex
-    if not client.set(LOCK_KEY, token, nx=True, ex=LOCK_SECONDS):
+    if mode == "auto" and not client.set(LOCK_KEY, token, nx=True, ex=LOCK_SECONDS):
         raise ProfileBatchError(409, "ETF 资料批次正在运行")
     try:
         deadline = time.monotonic() + BATCH_SECONDS
@@ -52,19 +52,21 @@ def collect_profiles(source: Any, client: Any,
             if remaining <= 2:
                 return None
             interval_key = f"{INTERVAL_PREFIX}{symbol}"
-            if not client.set(interval_key, token, nx=True, ex=INTERVAL_SECONDS):
+            if mode == "auto" and not client.set(interval_key, token, nx=True, ex=INTERVAL_SECONDS):
                 return None
             remaining = deadline-time.monotonic()
             if remaining <= 2:
-                client.eval(RELEASE_SCRIPT, 1, interval_key, token)
+                if mode == "auto":
+                    client.eval(RELEASE_SCRIPT, 1, interval_key, token)
                 return None
             try:
                 return source.profile(symbol[2:], budget_seconds=remaining)
             except SourceNotStartedError:
-                client.eval(RELEASE_SCRIPT, 1, interval_key, token)
+                if mode == "auto":
+                    client.eval(RELEASE_SCRIPT, 1, interval_key, token)
                 raise
         actions = [(symbol, "ths", lambda code=symbol: fetch(code)) for symbol in symbols]
-        with source_batch(source, (LOCK_KEY, token), deadline), closing(
+        with source_batch(source, (LOCK_KEY, token) if mode == "auto" else None, deadline), closing(
             completed(actions, source=source)
         ) as results:
             for symbol, rows, error, finished_at in results:
@@ -101,4 +103,5 @@ def collect_profiles(source: Any, client: Any,
             "profiles": profiles, "sourceStatus": states,
         }
     finally:
-        client.eval(RELEASE_SCRIPT, 1, LOCK_KEY, token)
+        if mode == "auto":
+            client.eval(RELEASE_SCRIPT, 1, LOCK_KEY, token)

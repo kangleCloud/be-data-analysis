@@ -52,4 +52,4 @@ Python 自己持有 `stock:etf-monitor:v1:profiles:python:lock`（210 秒）和 
 
 `POST /internal/etf-monitor/v1/asset-allocation` 接收 `{ "symbol":"SH510050", "reportPeriod":"20260630" }`，仅在 `STOCK_MONITOR_XQ_ENABLED=true` 且令牌已配置时查询，返回资产类型和仓位百分比。
 
-手动任务为 `POST /internal/jobs/v1/etf/refresh`，在交易窗口内遵守交易日历、Redis 锁、120 秒间隔与源冷却。可直接运行 `python -m app etf-collect` 作同等采样。交易时间外返回跳过，不用工作日猜测交易日。
+任务入口为`POST /internal/jobs/v1/etf/refresh`，先验证内部Token，再解析X-Collection-Mode（缺省auto，auto/manual外400）。auto及CLI `python -m app etf-collect`在交易窗口内遵守日历、采集锁、120秒间隔与普通冷却，窗口外跳过。manual可休市或窗口外刷新，跳过采集锁/入口/源配额、任务间隔及普通冷却；HTTP共享限速、401/403/429及确认风控、资源与事务写入保护仍生效。无可靠源日期时tradeDate=null，只更新快照/实际collectedAt，不生成价格/资金日内点，不以工作日推测交易日。ETF字典auto复用合法当日缓存，manual强制一次新浪全表，失败保留旧缓存。

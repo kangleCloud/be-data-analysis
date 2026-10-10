@@ -10,6 +10,8 @@ from contextlib import ExitStack
 from zoneinfo import ZoneInfo
 
 from app.etf_monitor.dictionary import save_dictionary
+from app.stock_monitor.events import monitor_event_lock
+from app.runtime.cooldown import remaining, record
 from app.runtime.resources import SourceResourceError
 from app.market.collector import _in_collection_window
 from app.core.logging import log_failure, redis_failure_kind
@@ -78,15 +80,6 @@ class EtfStore:
     def reserve_slot(self) -> bool:
         return bool(self.client.set(INTERVAL_KEY, "1", nx=True, ex=120))
 
-    def cooldown_active(self) -> bool:
-        return bool(self.client.exists(COOLDOWN_KEY))
-
-    def cooldown_remaining(self) -> int:
-        return self.client.ttl(COOLDOWN_KEY)
-
-    def start_cooldown(self, seconds: int = 300) -> None:
-        self.client.set(COOLDOWN_KEY, "1", ex=seconds, nx=True)
-
     def load(self) -> dict[str, Any] | None:
         raw = self.client.get(SNAPSHOT_KEY)
         if raw is None:
@@ -101,9 +94,31 @@ class EtfStore:
         return json.loads(raw) if raw else []
 
     def publish(self, snapshot: dict[str, Any]) -> None:
+        with monitor_event_lock(self.client, key=f"{SNAPSHOT_KEY}:write-lock"):
+            self._publish_transaction(snapshot)
+
+    def _publish_transaction(self, snapshot: dict[str, Any]) -> None:
         previous = self.load() or {}
+        if previous.get("generatedAt", "") > snapshot["generatedAt"]:
+            return
         previous_items = {item["symbol"]: item for item in previous.get("items", [])}
         current_items = {item["symbol"]: item for item in snapshot["items"]}
+        for symbol, item in list(current_items.items()):
+            old = previous_items.get(symbol)
+            if old and old.get("quote"):
+                quote = item.get("quote")
+                if quote is None or old["quote"].get("collectedAt", "") > quote.get("collectedAt", ""):
+                    current_items[symbol] = old
+                elif quote.get("status") == "STALE":
+                    current_items[symbol] = {**old, **item, "quote": {**old["quote"], "status": "STALE"},
+                                             "priceSeries": old.get("priceSeries", [])}
+        if snapshot.get("tradeDate") is None:
+            # 窗口外成功及失败降级都只展示快照，保留历史Redis曲线键而不带入响应。
+            current_items = {symbol: {**item, "priceSeries": [], "fundSeries": [],
+                                     "quote": {**item["quote"], "tradeDate": None} if item.get("quote") else None}
+                             for symbol, item in current_items.items()}
+        snapshot = {**snapshot, "items": list(current_items.values()),
+                    "generatedAt": max(snapshot["generatedAt"], previous.get("generatedAt", ""))}
         changed = sorted(symbol for symbol in set(previous_items) | set(current_items)
                          if previous_items.get(symbol) != current_items.get(symbol))
         base_id = self.client.get(STATE_KEY)
@@ -113,7 +128,9 @@ class EtfStore:
         fresh = [item for item in snapshot["items"]
                  if isinstance(item.get("quote"), dict)
                  and item["quote"].get("status") == "FRESH"
-                 and item["quote"].get("price") is not None]
+                 and item["quote"].get("price") is not None
+                 and snapshot.get("tradeDate") is not None
+                 and item["quote"].get("tradeDate") == snapshot["tradeDate"]]
         if fresh:
             day = snapshot["tradeDate"]
             old_dates = json.loads(self.client.get(PRICE_DATES_KEY) or "[]")
@@ -121,6 +138,9 @@ class EtfStore:
             symbols_key = f"{PRICE_SYMBOLS_PREFIX}{day}"
             old_symbols = json.loads(self.client.get(symbols_key) or "[]")
             for item in fresh:
+                points = {p["collectedAt"]: p for p in self.series(day, item["symbol"])}
+                points.update({p["collectedAt"]: p for p in item["priceSeries"]})
+                item["priceSeries"] = sorted(points.values(), key=lambda p: p["collectedAt"])
                 pipe.set(f"{PRICE_PREFIX}{day}:{item['symbol']}",
                          json.dumps(item["priceSeries"], ensure_ascii=False, allow_nan=False))
             pipe.set(symbols_key, json.dumps(sorted(set(old_symbols) | {
@@ -143,30 +163,34 @@ class EtfStore:
 
 class EtfCollector:
     def __init__(self, source: EtfQuoteSource, store: EtfStore,
-                 calendar: CalendarService) -> None:
+                 calendar: CalendarService, *, mode: str = "auto") -> None:
         self.source, self.store, self.calendar = source, store, calendar
+        self.mode = mode
 
     def collect(self, at: datetime) -> str:
         local = at.astimezone(SHANGHAI)
-        if not _in_collection_window(local):
+        if self.mode == "auto" and not _in_collection_window(local):
             return "skipped"
-        token = self.store.acquire()
-        if token is None:
+        token = self.store.acquire() if self.mode == "auto" else None
+        if self.mode == "auto" and token is None:
             return "locked"
         started = time.monotonic()
         try:
             with ExitStack() as stack:
-                stack.enter_context(source_batch(self.source, (LOCK_KEY, token), started+120))
+                stack.enter_context(source_batch(self.source, (LOCK_KEY, token) if self.mode == "auto" else None, started+120))
                 return self._collect_locked(local, started, token)
         finally:
-            self.store.release(token)
+            if self.mode == "auto":
+                self.store.release(token)
             LOGGER.info("ETF 采集总耗时 %.2f 秒", time.monotonic() - started)
 
-    def _collect_locked(self, local: datetime, started: float, token: str) -> str:
-        if not self.store.reserve_slot():
+    def _collect_locked(self, local: datetime, started: float, token: str | None) -> str:
+        if self.mode == "auto" and not self.store.reserve_slot():
             return "throttled"
-        if self.calendar.day_status(local.date(), local) is not True:
+        trading = self.calendar.day_status(local.date(), local)
+        if self.mode == "auto" and trading is not True:
             return "skipped"
+        day = local.date().isoformat() if trading is True and _in_collection_window(local) else None
         enabled = self.store.enabled()
         if not enabled:
             return "skipped"
@@ -176,9 +200,10 @@ class EtfCollector:
         failed = 0
         resource_failed = False
         source_finished = None
-        cooling = self.store.cooldown_active()
+        cooldown_ttl = remaining(self.store.client, (COOLDOWN_KEY,), "sina", self.mode)
+        cooling = cooldown_ttl is not None
         if cooling:
-            LOGGER.info("ETF 新浪源冷却跳过，剩余 TTL %d 秒", self.store.cooldown_remaining())
+            LOGGER.info("ETF 新浪源冷却跳过，剩余 TTL %d 秒", cooldown_ttl)
             quotes = {}
             failed = len(symbols)
         else:
@@ -215,7 +240,7 @@ class EtfCollector:
                     LOGGER.warning("ETF 行情批次失败，类型 %s，底层 %s，HTTP %s，分类 %s",
                                    metadata["exception_type"], metadata["root_type"],
                                    metadata["http_status"], metadata["category"])
-                self.store.start_cooldown(7200 if metadata["http_status"] in {403, 429} else 300)
+                record(self.store.client, (COOLDOWN_KEY,), "sina", self.mode, metadata)
                 quotes = {}
                 failed = len(symbols)
         collected_at = (local + timedelta(seconds=(source_finished if source_finished is not None else time.monotonic()) - started)).isoformat(
@@ -238,24 +263,25 @@ class EtfCollector:
                                   "fundFlowStatus": "NO_RELIABLE_SOURCE"})
                 continue
             point = {"collectedAt": collected_at, "price": quote["price"]}
-            series = [entry for entry in self.store.series(local.date().isoformat(), symbol)
+            series = [entry for entry in (self.store.series(day, symbol) if day else [])
                       if entry.get("collectedAt") != collected_at]
-            series.append(point)
+            if day is not None:
+                series.append(point)
             series.sort(key=lambda entry: entry["collectedAt"])
             items.append({
                 **entry,
                 "quote": {key: value for key, value in quote.items()
                           if key not in {"symbol", "code", "name", "market", "closeConfirmed"}}
-                | {"source": "SINA_ETF", "tradeDate": local.date().isoformat(),
+                | {"source": "SINA_ETF", "tradeDate": day,
                    "collectedAt": collected_at, "status": "FRESH"},
                 "priceSeries": series, "fundSeries": [],
                 "fundFlowStatus": "NO_RELIABLE_SOURCE",
             })
-        if self.store.client.get(LOCK_KEY) != token:
+        if self.mode == "auto" and self.store.client.get(LOCK_KEY) != token:
             raise SourceControlError("业务任务锁已失效")
         self.store.publish({
             "schemaVersion": 1, "source": "AKShare.fund_etf_category_sina",
-            "generatedAt": collected_at, "tradeDate": local.date().isoformat(),
+            "generatedAt": collected_at, "tradeDate": day,
             "items": items,
         })
         return "resource" if resource_failed else "cooldown" if cooling else "partial" if failed else "published"

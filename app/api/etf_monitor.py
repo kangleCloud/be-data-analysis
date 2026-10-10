@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from app.core.config import Settings
+from app.runtime.mode import collection_mode
 from app.runtime.source_execution import SourceExecutor, SourceBusyError, SourceCoolingError, SourceThrottledError
 from app.runtime.resources import SourceResourceError
 from app.runtime.gates import collection_entry
@@ -47,10 +48,11 @@ def create_etf_router(
         if token is None or not hmac.compare_digest(token, expected):
             raise HTTPException(status_code=401, detail="内部接口认证失败")
 
-    def provider() -> Any:
+    def provider(mode: str) -> Any:
         return provider_factory() if provider_factory else AkShareEtfProvider(
             settings.source_timeout_seconds,
-            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds),
+            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
+            mode=mode,
         )
 
     def redis_client():
@@ -69,19 +71,21 @@ def create_etf_router(
     @router.post("/dictionary", summary="同步非东财 ETF 字典")
     def dictionary(
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         client = None
         try:
             client = redis_client()
             now = datetime.now(SHANGHAI)
-            cached = load_dictionary(client,now)
+            cached = load_dictionary(client,now) if mode == "auto" else None
             if cached:
                 return dictionary_response(cached)
-            with collection_entry(client) as entered:
+            with collection_entry(client, mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
-                rows = provider().quotes()
+                rows = provider(mode).quotes()
                 return dictionary_response(save_dictionary(client,rows,datetime.now(SHANGHAI)))
         except HTTPException:
             raise
@@ -100,8 +104,10 @@ def create_etf_router(
     def profile_list(
         request: ProfilesRequest,
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         symbols = [etf_symbol(value) for value in request.symbols]
         if (not symbols or len(symbols) > 10 or None in symbols
                 or len(set(symbols)) != len(symbols)):
@@ -116,10 +122,10 @@ def create_etf_router(
                 settings.redis_url.get_secret_value(), decode_responses=True,
                 socket_timeout=5, socket_connect_timeout=5,
             )
-            with collection_entry(client) as entered:
+            with collection_entry(client, mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
-                return collect_profiles(provider(),client,symbols)
+                return collect_profiles(provider(mode),client,symbols,mode=mode)
         except HTTPException:
             raise
         except SourceResourceError as exc:
@@ -139,8 +145,10 @@ def create_etf_router(
     def allocation(
         request: AllocationRequest,
         x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+        x_collection_mode: str | None = Header(default=None, alias="X-Collection-Mode"),
     ) -> dict[str, Any]:
         authorize(x_internal_token)
+        mode = collection_mode(x_collection_mode)
         if not settings.stock_monitor_xq_enabled or not settings.xueqiu_token.get_secret_value():
             raise HTTPException(status_code=503, detail={"reason":"DISABLED","message":"雪球生产采集未启用"})
         symbol = etf_symbol(request.symbol)
@@ -149,10 +157,10 @@ def create_etf_router(
         client = None
         try:
             client = redis_client()
-            with collection_entry(client) as entered:
+            with collection_entry(client, mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
-                rows = provider().asset_allocation(symbol[2:],request.reportPeriod)
+                rows = provider(mode).asset_allocation(symbol[2:],request.reportPeriod)
                 now = datetime.now(SHANGHAI).isoformat(timespec='seconds')
                 return asset_allocation(rows,symbol,request.reportPeriod,now)
         except HTTPException:

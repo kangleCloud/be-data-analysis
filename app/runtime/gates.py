@@ -44,7 +44,17 @@ def entry_guard(lane):
 
 
 @contextmanager
-def collection_entry(client, cancel=None, *, lane='quotes'):
+def collection_entry(client, cancel=None, *, lane='quotes', mode='auto'):
+    if mode == 'manual':
+        if cancel is not None and cancel.is_set():
+            from app.runtime.source_execution import SourceControlError
+            raise SourceControlError('采集已取消')
+        # 保留 Redis 可用性检查，不占用自动任务入口。
+        if not client.ping():
+            from app.runtime.source_execution import SourceControlError
+            raise SourceControlError("Redis 控制不可用")
+        yield True
+        return
     entries = _ENTRY.get()
     check_entry()
     owned = {key for entry in entries for key in entry['keys']}

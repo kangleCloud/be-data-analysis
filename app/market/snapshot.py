@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from app.stock_monitor.events import monitor_event_lock
+from app.runtime.cooldown import remaining
 from app.core.logging import log_failure
 
 SNAPSHOT_KEY = "stock:market:v1:snapshot"
@@ -21,7 +22,6 @@ LOCK_KEY = "stock:market:v1:lock"
 MIN_INTERVAL_KEY = "stock:market:v1:min-interval"
 COOLDOWN_KEY_PREFIX = "stock:market:v1:cooldown:"
 MIN_INTERVAL_SECONDS = 120
-SOURCE_COOLDOWN_SECONDS = 2 * 60 * 60
 LOGGER = logging.getLogger(__name__)
 RELEASE_LOCK_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -61,14 +61,46 @@ class SnapshotStore(Protocol):
 
     def cooldown_remaining(self, source: str) -> int: ...
 
-    def start_cooldown(self, source: str, seconds: int = SOURCE_COOLDOWN_SECONDS) -> None: ...
-
 
 def _fund_state(module):
     if not isinstance(module,dict):
         return None
     # 仅重试时刻变化不改变资金状态，不重复唤醒；真实结果/日期/诊断变化则通知。
     return tuple(module.get(key) for key in ('status','tradeDate','lastSuccessAt','message'))
+
+
+def reusable_module(key, module):
+    from app.market.collector import _reusable_prior
+    return _reusable_prior(key, module)
+
+
+def undated_module(key, module):
+    """没有可靠交易日期的刷新只提供快照；旧降级数据也不能带日内曲线。"""
+    data = module.get("data")
+    if isinstance(data, dict):
+        if key == "marketFundFlow":
+            data = {**data, "series": []}
+        elif key == "coreIndices":
+            data = {**data, "items": [{**item, "series": []} for item in data.get("items", [])]}
+    return {**module, "tradeDate": None, "data": data}
+
+
+def merge_series(key, old, incoming):
+    if not isinstance(old, dict) or not isinstance(incoming, dict):
+        return incoming
+    def points(previous, current):
+        merged = {point["collectedAt"]: point for point in previous}
+        merged.update({point["collectedAt"]: point for point in current})
+        return sorted(merged.values(), key=lambda point: point["collectedAt"])
+    if old.get("source") != incoming.get("source"):
+        return incoming
+    if key == "marketFundFlow":
+        series = points(old.get("series", []), incoming.get("series", []))
+        return {**incoming, "series": [{**point, "netAmount": point["inflow"] - point["outflow"]} for point in series]}
+    if key == "coreIndices":
+        prior = {item["code"]: item for item in old.get("items", [])}
+        return {**incoming, "items": [{**item, "series": points(prior.get(item["code"], {}).get("series", []), item.get("series", []))} for item in incoming.get("items", [])]}
+    return incoming
 
 
 class RedisSnapshotStore:
@@ -134,15 +166,10 @@ class RedisSnapshotStore:
 
 
     def cooldown_active(self, source: str) -> bool:
-        return bool(self._client.exists(f"{COOLDOWN_KEY_PREFIX}{source}"))
+        return remaining(self._client, (f"{COOLDOWN_KEY_PREFIX}{source}",), "sina" if source in {"sina-index", "module:coreIndices"} else "ths", "auto") is not None
 
     def cooldown_remaining(self, source: str) -> int:
-        return self._client.ttl(f"{COOLDOWN_KEY_PREFIX}{source}")
-
-    def start_cooldown(self, source: str, seconds: int = SOURCE_COOLDOWN_SECONDS) -> None:
-        self._client.set(
-            f"{COOLDOWN_KEY_PREFIX}{source}", "1", ex=seconds, nx=True,
-        )
+        return remaining(self._client, (f"{COOLDOWN_KEY_PREFIX}{source}",), "sina" if source in {"sina-index", "module:coreIndices"} else "ths", "auto") or 0
 
     def load(self) -> dict[str, Any] | None:
         raw = self._client.get(SNAPSHOT_KEY)
@@ -195,6 +222,26 @@ class RedisSnapshotStore:
             previous_id = None
         patch_modules = snapshot.get("modules") or {}
         old_modules = previous.get("modules") or {}
+        patch_modules = dict(patch_modules)
+        for key, incoming in list(patch_modules.items()):
+            prior = old_modules.get(key)
+            if not isinstance(prior, dict) or not isinstance(incoming, dict):
+                continue
+            if incoming.get("status") == "FRESH":
+                if (prior.get("lastSuccessAt") or "") > (incoming.get("lastSuccessAt") or ""):
+                    patch_modules[key] = ({**prior, "data": merge_series(key, incoming.get("data"), prior.get("data"))}
+                                          if incoming.get("tradeDate") and prior.get("tradeDate") == incoming.get("tradeDate") else prior)
+                    continue
+                if incoming.get("tradeDate") and prior.get("tradeDate") == incoming.get("tradeDate"):
+                    incoming = {**incoming, "data": merge_series(key, prior.get("data"), incoming.get("data"))}
+                    patch_modules[key] = incoming
+            elif (prior.get("lastAttemptAt") or "") > (incoming.get("lastAttemptAt") or "") or (prior.get("lastSuccessAt") or "") > (incoming.get("lastAttemptAt") or ""):
+                patch_modules[key] = prior
+            elif prior.get("data") is not None and reusable_module(key, prior):
+                # 降级时只修改最新有效数据的状态，不用采集开始前的副本覆盖并发成功。
+                patch_modules[key] = {**prior, "status": "STALE", "lastAttemptAt": incoming.get("lastAttemptAt"), "message": incoming.get("message")}
+                if incoming.get("tradeDate") is None:
+                    patch_modules[key] = undated_module(key, patch_modules[key])
         new_modules = {**old_modules,**patch_modules} if isinstance(old_modules,dict) and isinstance(patch_modules,dict) else None
         if not isinstance(new_modules, dict) or not isinstance(old_modules, dict):
             raise ValueError("Redis 快照模块格式无效")

@@ -10,11 +10,11 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 - 配置参考 `.env.example`。本地默认读取被 Git 忽略的 `.env.dev`；`APP_ENV=prod` 选择 `.env.prod`。运行时环境变量覆盖文件配置，文件中的密码不作变量展开
 
 ```bash
-python -m app collect --force
+python -m app collect
 python -m app serve
 ```
 
-`serve` 启动健康接口与内置调度：北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。`collect --force` 可在采集窗口内手动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
+`serve` 启动健康接口与内置调度：北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。CLI `collect` 使用 auto，可在采集窗口内主动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
 
 交易日历通过 AKShare 新浪接口独立刷新后缓存在 Redis DB 2；启动时补建，每月 1 日北京时间 00:10 常规刷新，失败自动重试每天最多一次。缓存未覆盖当天时不会凭工作日推断交易日，市场快照降级、个股跳过。`python -m app calendar-refresh` 可手动触发受限频保护的自动刷新。受保护的同步手动任务接口见 [交易日历与内部任务 V1](docs/trading-calendar-jobs-v1.md)。
 
@@ -60,6 +60,27 @@ tail -f /data/logs/be-data-analysis/service.log
 市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、同花顺基金基本资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。同花顺资料独立同步，不受雪球总闸限制，采用 30 分钟资料限频与 180 秒批次预算。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/index-etf-sources-v1.md)。
 
 同花顺三组即时接口没有可靠源交易日期或源时间；快照的 `tradeDate` 仅依据交易日历，`lastSuccessAt` 和市场曲线的 `collectedAt` 是采集时间。
+
+## 本机手动刷新模式
+
+内部 POST 先验证 `X-Internal-Token`，再验证 `X-Collection-Mode`：缺省为 `auto`，仅接受精确的 `auto`、`manual`，其他值返回400。四种 jobs 刷新、股票/ETF字典和资料以及ETF资产配置均支持，同步返回原响应，不新增jobId。Java只有八个scheduler本机回环POST明确发送manual；admin、定时与CLI保持auto。
+
+manual每请求独立执行器，按原业务顺序串行，跳过采集任务/入口锁、全局及分组源配额、普通故障冷却、120秒/单股/资料1800秒/日历刷新间隔。manual成功与普通失败不读取、写入或续期AUTO普通冷却/间隔/采集锁。
+
+两模式共享每次物理HTTP启动间隔：THS≥1秒、THS资料≥2秒、新浪≥0.2秒、雪球/交易所≥1秒；保留401/403/429及确认风控、雪球总闸/Token、最多10只监控、源超时/批次截止/TERM/KILL回收、1GiB容器/800MiB阈值及Redis失败停止。普通冷却使用原适用键加`:ordinary`，确认风控使用`stock:source-control:v1:risk:{group}`，值包含原因。原因未知的旧冷却键两模式均等待自然过期，不按TTL猜测原因、不自动删除。
+
+manual允许休市及窗口外刷新。股票使用真实源日期/时间，写入临界区再次检查不倒退；收盘须源时间严格大于15:00，不补历史点。无可靠源日期的市场/指数/ETF在窗口外或日历未知/休市只更新快照与实际采集时间，tradeDate=null，成功或失败降级的日内series均为空，不生成资金/价格日内点；当年日历覆盖校验仍保留。所有采集复用同一标准化与缓存，市场WATCH/MULTI/EXEC、股票事件锁及日历/ETF/字典短写锁仍生效，交错写入合并实际曲线点且版本通知同事务。
+
+AUTO字典复用当天合法缓存；MANUAL字典强制一次新浪全表重新采集并更新轻量缓存，失败保留旧缓存。股票资料主请求始终执行，有效120秒报价市值仅用于缺失字段补充。
+
+```bash
+# 在本机服务上同步刷新；令牌从已配置环境获取，不在命令中写真实值。
+curl -X POST http://127.0.0.1:8000/internal/jobs/v1/market/refresh \
+  -H "X-Internal-Token: ${STOCK_MONITOR_INTERNAL_TOKEN}" \
+  -H 'X-Collection-Mode: manual'
+```
+
+生产端口映射沿用现有Compose，配置仍默认`.env.dev`、`APP_ENV=prod`选择`.env.prod`。手动模式接口说明见[源依赖与验证](docs/source-health-check.md)。
 
 ## Redis 契约
 
