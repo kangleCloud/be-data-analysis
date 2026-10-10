@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from app.resources import MEMORY_LIMIT_BYTES,SourceResourceError,check_memory,memory_state
-from app.source_execution import SourceCall,SourceExecutor
+from app.runtime.resources import MEMORY_LIMIT_BYTES,SourceResourceError,check_memory,memory_state
+from app.runtime.source_execution import SourceCall,SourceExecutor
 from tests.test_source_execution import ControlRedis,ignore_term_worker
 
 
@@ -39,7 +39,7 @@ def test_cgroup_v1_usage_is_total_memory(tmp_path):
 
 def test_pressure_stops_admission_without_source_cooldown(monkeypatch):
     backend=ControlRedis()
-    monkeypatch.setattr('app.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES})
+    monkeypatch.setattr('app.runtime.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES})
     source=SourceExecutor('redis://offline',client=backend,worker=exit_worker)
     with pytest.raises(SourceResourceError):
         source.call(SourceCall('fake','ths',cooldown_keys=('cool',),cooldown_policy='market'))
@@ -49,7 +49,7 @@ def test_pressure_stops_admission_without_source_cooldown(monkeypatch):
 def test_pressure_reaps_current_term_ignoring_child_and_releases(monkeypatch):
     backend,ready=ControlRedis(),mp.get_context('spawn').Event()
     high=threading.Event()
-    monkeypatch.setattr('app.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES if high.is_set() else 0})
+    monkeypatch.setattr('app.runtime.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES if high.is_set() else 0})
     source=SourceExecutor('redis://offline',client=backend,worker=ignore_term_worker)
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending=pool.submit(source.call,SourceCall('fake','ths',{'ready':ready},900,cooldown_keys=('cool',),cooldown_policy='market'))

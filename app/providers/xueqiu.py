@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 from app.providers.http import bounded_timeout
-from app.source_execution import SourceCall, SourceCallError, SourceExecutor
+from app.runtime.source_execution import SourceCall, SourceCallError, SourceExecutor
 
 
 class XueqiuSourceError(RuntimeError):

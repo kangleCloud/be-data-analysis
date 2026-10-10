@@ -11,7 +11,7 @@ import pytest
 import redis
 import requests
 
-from app.source_execution import (
+from app.runtime.source_execution import (
     ACQUIRE_SCRIPT, RENEW_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, TASK_RENEW_SCRIPT,
     GLOBAL_LIMIT, SOURCE_LIMIT, PREFIX, SourceCall, SourceCallError, SourceControl, SourceControlError, SourceCoolingError,
     SourceExecutor, SourceBusyError, controlled_http,
@@ -128,8 +128,8 @@ def test_http_start_spacing_covers_session_and_different_executors(monkeypatch):
     backend = ControlRedis()
     clock = [0.0]
     backend.rate_now = lambda: clock[0]*1000
-    monkeypatch.setattr('app.source_execution.time.monotonic', lambda: clock[0])
-    monkeypatch.setattr('app.source_execution.time.sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    monkeypatch.setattr('app.runtime.source_execution.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('app.runtime.source_execution.time.sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
     calls = []
     def send(session, request, **kwargs):
         calls.append((request.url, clock[0], kwargs['timeout']))
@@ -153,8 +153,8 @@ def test_ths_market_and_fund_intervals_are_shared(monkeypatch):
     backend = ControlRedis()
     clock = [0.0]
     backend.rate_now = lambda: clock[0]*1000
-    monkeypatch.setattr('app.source_execution.time.monotonic', lambda: clock[0])
-    monkeypatch.setattr('app.source_execution.time.sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    monkeypatch.setattr('app.runtime.source_execution.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('app.runtime.source_execution.time.sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
     control = SourceControl(backend)
     keys = control.acquire('ths','token')
     fund = SourceCall('fund_info_ths','ths',fund_profile=True)
@@ -186,7 +186,7 @@ from multiprocessing.managers import BaseManager
 from types import SimpleNamespace
 from contextlib import closing
 
-from app.source_execution import SourceNotStartedError, SourceThrottledError, completed
+from app.runtime.source_execution import SourceNotStartedError, SourceThrottledError, completed
 
 
 def control_metrics(self):
@@ -205,11 +205,12 @@ class RedisManager(BaseManager):
 RedisManager.register('ControlRedis', ControlRedis)
 
 
-def parent_entry(backend, barrier, queue, group):
+def parent_entry(backend, barrier, queue, group, lane="quotes"):
     executor = SourceExecutor('redis://offline', client=backend, worker=frame_worker)
     barrier.wait(timeout=10)
     try:
-        queue.put(executor.call(SourceCall('fake', group, {'delay': 0.4}, 10)))
+        function = 'stock_fund_flow_individual' if lane == 'funds' else 'fake'
+        queue.put(executor.call(SourceCall(function, group, {'delay':0.8,'symbol':'即时'},10)))
     except Exception as exc:
         queue.put(type(exc).__name__)
 
@@ -218,9 +219,9 @@ def test_independent_parent_processes_share_atomic_quotas():
     context = mp.get_context('spawn')
     with RedisManager(ctx=context) as manager:
         backend = manager.ControlRedis()
-        groups = ['ths']*2+['sina']*2
+        groups = [('ths','quotes')]*2+[('ths','funds')]*2
         barrier, queue = context.Barrier(len(groups)), context.Queue()
-        parents = [context.Process(target=parent_entry, args=(backend, barrier, queue, group)) for group in groups]
+        parents = [context.Process(target=parent_entry, args=(backend, barrier, queue, group,lane)) for group,lane in groups]
         try:
             for process in parents:
                 process.start()
@@ -229,10 +230,11 @@ def test_independent_parent_processes_share_atomic_quotas():
                 process.join(timeout=3)
                 assert process.exitcode == 0
             assert results.count({'name':'fake'}) == 1
-            assert results.count('SourceBusyError') == len(groups)-1
+            assert results.count({'name':'stock_fund_flow_individual'}) == 1
+            assert results.count('SourceBusyError') == len(groups)-2
             maximum, groups_max, releases, remaining = backend.metrics()
-            assert maximum == 1 and max(groups_max.values()) == 1
-            assert releases == 1 and remaining == []
+            assert maximum == 2 and groups_max == {"ths":2}
+            assert releases == 2 and remaining == []
         finally:
             for process in parents:
                 if process.is_alive():
@@ -247,7 +249,7 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     control = SourceControl(client)
     first = control.acquire('ths', 'first')
     second = control.acquire('ths', 'second')
-    assert second is None
+    assert second is not None
     assert control.acquire('ths', 'fifth') is None
     assert all(0 < client.ttl(key) <= 30 for key in first)
     control.renew(first, 'first')
@@ -267,14 +269,15 @@ def test_actual_lua_tokens_leases_rates_and_cooldown():
     control.release(first, 'first')
     assert client.get(first[0]) == 'replacement'
     assert client.get(first[1]) is None
+    control.release(second,"second")
 
 
 @pytest.mark.parametrize('group,interval', [('sina', .2), ('xq', 1), ('sse', 1), ('szse', 1), ('bse', 1)])
 def test_every_page_http_has_shared_group_gap(monkeypatch, group, interval):
     backend, clock = ControlRedis(), [0.0]
     backend.rate_now = lambda: clock[0]*1000
-    monkeypatch.setattr('app.source_execution.time.monotonic', lambda: clock[0])
-    monkeypatch.setattr('app.source_execution.time.sleep', lambda value: clock.__setitem__(0, clock[0]+value))
+    monkeypatch.setattr('app.runtime.source_execution.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('app.runtime.source_execution.time.sleep', lambda value: clock.__setitem__(0, clock[0]+value))
     points = []
     def send(session, request, **kwargs):
         points.append(clock[0])
@@ -295,8 +298,8 @@ def test_every_page_http_has_shared_group_gap(monkeypatch, group, interval):
 def test_same_symbol_interval_is_reserved_only_at_first_http(monkeypatch):
     backend, clock = ControlRedis(), [0.0]
     backend.rate_now = lambda: clock[0]*1000
-    monkeypatch.setattr('app.source_execution.time.monotonic', lambda: clock[0])
-    monkeypatch.setattr('app.source_execution.time.sleep', lambda value: clock.__setitem__(0, clock[0]+value))
+    monkeypatch.setattr('app.runtime.source_execution.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('app.runtime.source_execution.time.sleep', lambda value: clock.__setitem__(0, clock[0]+value))
     control = SourceControl(backend)
     keys = control.acquire('xq', 'first')
     call = SourceCall('quote', 'xq', interval_key='stock:monitor:v1:sample:lastRequest:SH600000')
@@ -314,12 +317,12 @@ def test_same_symbol_interval_is_reserved_only_at_first_http(monkeypatch):
 def test_quota_wait_budget_never_starts_worker():
     backend = ControlRedis()
     control = SourceControl(backend)
-    held = [control.acquire('ths', 'one')]
+    held = [control.acquire('ths',token) for token in ('one','two')]
     executor = SourceExecutor('redis://offline', client=backend, worker=frame_worker)
     with pytest.raises(SourceNotStartedError):
         executor.call(SourceCall('fake', 'ths', budget_seconds=2.05))
     assert backend.releases == 0
-    for keys, token in zip(held, ('one',)):
+    for keys, token in zip(held, ('one','two')):
         control.release(keys, token)
 
 
@@ -352,7 +355,7 @@ def test_redis_control_failure_aborts_before_spawn_and_no_secret_message():
 
 def test_shortened_renewal_schedule_preserves_owned_slots(monkeypatch):
     backend = ControlRedis()
-    monkeypatch.setattr('app.source_execution.RENEW_SECONDS', .05)
+    monkeypatch.setattr('app.runtime.source_execution.RENEW_SECONDS', .05)
     executor = SourceExecutor('redis://offline', client=backend, worker=frame_worker)
     assert executor.call(SourceCall('fake', 'ths', {'delay': .3}, 5)) == {'name':'fake'}
     assert backend.renewals >= 2
@@ -369,7 +372,7 @@ def test_close_completed_iterator_cancels_inflight_before_more_candidates():
     later = []
     actions = [('fast','ths',fast), ('slow','ths',lambda: executor.call(SourceCall('fake','ths',{'ready':ready},900))),
                ('later','ths',lambda: later.append(True))]
-    with executor.batch(), closing(completed(actions, source=source, limit=2)) as results:
+    with executor.batch(), closing(completed(actions, source=source)) as results:
         key, value, error, finished_at = next(results)
         assert (key,value,error) == ('fast','fast',None)
         assert finished_at <= time.monotonic()
@@ -381,14 +384,14 @@ def test_close_completed_iterator_cancels_inflight_before_more_candidates():
 def test_no_http_timeout_does_not_start_cooldown(monkeypatch):
     import sys
     import queue
-    from app.source_execution import _source_worker
+    from app.runtime.source_execution import _source_worker
     backend, messages = ControlRedis(), queue.Queue()
     control = SourceControl(backend)
     keys = control.acquire('sina','token')
     def function():
         raise TimeoutError('等待初始化超时')
     monkeypatch.setitem(sys.modules, 'akshare', SimpleNamespace(fake=function))
-    monkeypatch.setattr('app.source_execution._client', lambda url: backend)
+    monkeypatch.setattr('app.runtime.source_execution._client', lambda url: backend)
     event = threading.Event()
     _source_worker(messages,'redis://offline', SourceCall('fake','sina',cooldown_keys=('cool',),cooldown_policy='etf'),
                    keys,'token',None,time.monotonic()+10,15,os.getpid(),event)
@@ -454,7 +457,7 @@ def test_redis_read_failure_after_spawn_stops_and_reaps_child():
 
 def lost_parent_worker(queue, url, call, keys, token, guard, deadline, read, parent, started_event):
     import sys
-    import app.source_execution as execution
+    import app.runtime.source_execution as execution
     backend = call.parameters['backend']
     execution._client = lambda url: backend
     def function(**parameters):
@@ -489,10 +492,11 @@ def http_frame_worker(queue, url, call, keys, token, guard, deadline, read, pare
     queue.put(('ok',points))
 
 
-def http_parent_entry(backend, barrier, queue):
+def http_parent_entry(backend, barrier, queue, lane="quotes", group="sina"):
     barrier.wait(timeout=10)
     executor = SourceExecutor('redis://offline', client=backend, worker=http_frame_worker)
-    queue.put(executor.call(SourceCall('fake','sina',{'backend':backend},10,('offline.test',))))
+    function = 'stock_fund_flow_individual' if lane == 'funds' else 'fake'
+    queue.put(executor.call(SourceCall(function,group,{'backend':backend,'symbol':'即时'},20,('offline.test',))))
 
 
 def test_actual_http_start_gaps_across_independent_parents_and_source_children():
@@ -530,7 +534,7 @@ def test_actual_http_start_gaps_across_independent_parents_and_source_children()
 ])
 def test_market_child_and_parent_share_cooldown_scope_without_expansion(category,status,kind):
     import fakeredis
-    from app.source_execution import market_cooldown
+    from app.runtime.source_execution import market_cooldown
     client = fakeredis.FakeRedis(decode_responses=True)
     control = SourceControl(client)
     call = SourceCall('fake','ths',cooldown_keys=('shared','module'),cooldown_policy='market')
@@ -570,3 +574,29 @@ def test_ordinary_market_http_failure_does_not_block_sibling_module(monkeypatch)
     with controlled_http(control,other,sibling,'second',None,time.monotonic()+5,15):
         assert requests.get('https://offline.test/concept').status_code == 200
     assert len(sends) == 2
+
+
+def test_actual_http_gap_between_two_concurrent_ths_channels():
+    context = mp.get_context('spawn')
+    with RedisManager(ctx=context) as manager:
+        backend = manager.ControlRedis()
+        barrier,queue = context.Barrier(2),context.Queue()
+        parents = [context.Process(target=http_parent_entry,args=(backend,barrier,queue,lane,'ths'))
+                   for lane in ('quotes','funds')]
+        try:
+            for process in parents:
+                process.start()
+            points = sorted(point for _ in parents for point in queue.get(timeout=20))
+            for process in parents:
+                process.join(timeout=3)
+                assert process.exitcode == 0
+            assert len(points) == 4
+            assert all(later-earlier >= .98 for earlier,later in zip(points,points[1:]))
+            maximum,groups,releases,remaining = backend.metrics()
+            assert maximum == 2 and groups == {'ths':2} and releases == 2 and remaining == []
+        finally:
+            for process in parents:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=2)
+            queue.close()

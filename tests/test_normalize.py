@@ -5,7 +5,7 @@ import json
 import pandas as pd
 import pytest
 
-from app.normalize import SourceDataError, normalize_individual_aggregate, normalize_sectors
+from app.market.normalize import SourceDataError, normalize_individual_aggregate, normalize_sectors
 
 COLLECTED_AT = "2026-09-23T10:00:00+08:00"
 

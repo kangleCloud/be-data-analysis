@@ -6,7 +6,9 @@
 
 ## 项目结构与模块组织
 
-项目使用 Python 3.12。`app/cli.py` 提供单次采集命令；`app/providers/akshare_market.py` 隔离 AKShare 调用；`app/normalize.py` 标准化源字段；`app/collector.py` 编排采集和降级；`app/snapshot.py` 负责 Redis JSON 契约。`app/main.py` 只提供可选健康接口。测试放在 `tests/`。
+项目使用 Python 3.12。根目录`app/main.py`、`cli.py`、`__main__.py`提供服务与命令入口；`core`保留配置/日志。`api`仅放内部路由；`runtime`放固定双通道工作流、调度、入口租约、源执行与资源保护；`providers`隔离第三方调用、HTTP控制、THS分页审计与纯静态源清单。`calendar`、`market`、`stock_monitor`、`etf_monitor`分别放领域采集、标准化、存储及相关时段规则，不添加legacy导入别名。测试放在`tests/`。
+
+行情与资金为两条固定通道：同通道串行、跨通道并行，全局/同来源最多2个源进程。只有市场即时资金榜走资金通道，其他源走行情通道；完整market刷新原子取得两个入口。市场发布只合并本次模块，WATCH冲突最多重试3次（含首次共4次），保持V1业务键、版本链、事务通知及公共GET/SSE契约。资金通道仅只读日历，未知时由行情/月度任务补建。容器预算1GiB，cgroup保护阈值800MiB，资源异常不触发源冷却。
 
 新增市场数据时先在 Provider 中隔离源接口，再在纯函数中完成标准化。不要让 AKShare 的 DataFrame、中文列名或异常进入 Redis 契约。
 
@@ -16,7 +18,7 @@
 - `pip install -r requirements-dev.txt`：安装本地运行与测试依赖；生产镜像只安装 `requirements.txt`。
 - `set -a && source .env.example && set +a`：加载本地示例配置。
 - `python -m app collect`：执行一轮采集并退出。
-- `python -m app probe`：只读检查大盘资金流源数据日期。
+- `python -m app sources --json`：纯静态输出源依赖，不读取配置或访问Redis/源站。
 - `python -m app serve`：启动可选健康接口。
 - `python -m compileall app`：执行提交前语法检查。
 - `python -m pytest`：运行全部自动化测试。

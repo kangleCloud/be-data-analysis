@@ -4,8 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import load_settings
-from app.etf_normalize import ths_profile
-from app.etf_profiles import INTERVAL_PREFIX, LOCK_KEY, ProfileBatchError, collect_profiles
+from app.etf_monitor.normalize import ths_profile
+from app.etf_monitor.profiles import INTERVAL_PREFIX, LOCK_KEY, ProfileBatchError, collect_profiles
 from app.main import create_app
 from tests.test_etf_api import HEADERS, RedisClient
 
@@ -29,8 +29,8 @@ class Clock:
 @pytest.fixture
 def clock(monkeypatch):
     value = Clock()
-    monkeypatch.setattr("app.etf_profiles.time.monotonic", value.monotonic)
-    monkeypatch.setattr("app.etf_profiles.time.sleep", value.sleep)
+    monkeypatch.setattr("app.etf_monitor.profiles.time.monotonic", value.monotonic)
+    monkeypatch.setattr("app.etf_monitor.profiles.time.sleep", value.sleep)
     return value
 
 
@@ -170,7 +170,7 @@ def test_422_logs_field_and_reason_without_request_values(caplog):
 
 
 def test_no_http_budget_skip_releases_code_reservation_and_preserves_order(clock):
-    from app.source_execution import SourceNotStartedError
+    from app.runtime.source_execution import SourceNotStartedError
     class NoRequestSource(Source):
         def profile(self, code, *, budget_seconds):
             if code == '510050':

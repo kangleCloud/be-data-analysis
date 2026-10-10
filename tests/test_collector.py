@@ -5,8 +5,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.collector import MarketCollector
-from app.snapshot import SNAPSHOT_KEY, UPDATES_CHANNEL, RedisSnapshotStore
+from app.market.collector import MarketCollector
+from app.market.snapshot import SNAPSHOT_KEY, UPDATES_CHANNEL, RedisSnapshotStore
 from tests.test_snapshot import FakeRedis
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -52,6 +52,9 @@ class FakeProvider:
 class FakeCalendar:
     def __init__(self, provider):
         self.provider = provider
+
+    def cached_day_status(self,day):
+        return self.day_status(day,None)
 
     def day_status(self, day, _at):
         self.provider.calls.append("calendar")
@@ -235,8 +238,8 @@ def test_snapshot_set_failure_does_not_notify(flow_rows, market_rows):
 def test_same_market_batch_writes_only_enabled_fund_points(flow_rows, market_rows):
     import json
     import pandas as pd
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY
 
     extra = pd.DataFrame([
         {"股票代码": f"{600001 + index:06d}", "股票简称": f"股票{index}",
@@ -271,8 +274,8 @@ def test_same_market_batch_writes_only_enabled_fund_points(flow_rows, market_row
 
 def test_market_source_failure_leaves_fund_series_and_snapshot_stale(flow_rows, market_rows):
     import json
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY
 
     provider, client, store, collector = setup(flow_rows, market_rows)
     client.set(ENABLED_KEY, json.dumps([{
@@ -293,8 +296,8 @@ def test_market_source_failure_leaves_fund_series_and_snapshot_stale(flow_rows, 
 
 def test_fund_history_keeps_two_data_days_and_holiday_does_not_prune(flow_rows, market_rows):
     import json
-    from app.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY
+    from app.market.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY
 
     provider, client, _, collector = setup(flow_rows, market_rows)
     client.set(ENABLED_KEY, json.dumps([{
@@ -315,8 +318,8 @@ def test_fund_history_keeps_two_data_days_and_holiday_does_not_prune(flow_rows, 
 
 def test_snapshot_transaction_failure_writes_neither_snapshot_nor_fund_point(flow_rows, market_rows):
     import json
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY
 
     _, client, _, collector = setup(flow_rows, market_rows)
     client.set(ENABLED_KEY, json.dumps([{
@@ -347,8 +350,8 @@ def test_new_snapshot_reconciles_legacy_market_curve_points(flow_rows, market_ro
 
 def test_enabled_stock_missing_from_next_batch_leaves_fund_gap(flow_rows, market_rows):
     import json
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY
 
     provider, client, store, collector = setup(flow_rows, market_rows)
     client.set(ENABLED_KEY, json.dumps([
@@ -461,8 +464,8 @@ def test_fast_module_publishes_before_slow_and_versions_chain(flow_rows, market_
     import json
     import threading
     from concurrent.futures import ThreadPoolExecutor
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import ENABLED_KEY, MONITOR_UPDATES_CHANNEL
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import ENABLED_KEY, MONITOR_UPDATES_CHANNEL
     provider, client, store, collector = setup(flow_rows, market_rows)
     assert collector.collect(TRADING_AT) == 'published'
     old = store.load()['modules']['marketFundFlow']

@@ -83,7 +83,7 @@ def test_shared_executor_preserves_deadlines_parameters_and_cooldown_keys():
 
 
 def test_cooling_provider_logs_only_info_with_ttl(caplog):
-    from app.source_execution import SourceCoolingError
+    from app.runtime.source_execution import SourceCoolingError
     def cool(call):
         raise SourceCoolingError(300)
     provider = AkShareMarketProvider(15, executor=SimpleNamespace(call=cool))

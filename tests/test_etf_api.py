@@ -1,7 +1,7 @@
 """ETF 同步接口的鉴权、数据边界与总闸。"""
 
 import pytest
-from app.resources import SourceResourceError
+from app.runtime.resources import SourceResourceError
 from fastapi.testclient import TestClient
 
 from app.core.config import load_settings
@@ -93,7 +93,7 @@ def test_dictionary_uses_today_cache_and_refreshes_previous_day():
     import json
     from datetime import datetime,timedelta
     from zoneinfo import ZoneInfo
-    from app.etf_dictionary import KEY,save_dictionary
+    from app.etf_monitor.dictionary import KEY,save_dictionary
     source,backend=Source(),RedisClient()
     settings=load_settings({'STOCK_MONITOR_INTERNAL_TOKEN':'service-secret'})
     client=TestClient(create_app(scheduler_enabled=False,settings=settings,etf_factory=lambda:source,redis_factory=lambda:backend))
@@ -129,9 +129,9 @@ def test_allocation_reason_is_frozen_and_does_not_scan_periods(error,status,reas
 
 
 def test_allocation_shared_busy_entry_does_not_call_source():
-    from app.collection_gate import ENTRY_KEY
+    from app.runtime.gates import QUOTES_ENTRY_KEY
     backend,source=RedisClient(),Source()
-    backend.set(ENTRY_KEY,'auto',ex=30)
+    backend.set(QUOTES_ENTRY_KEY,'auto',ex=30)
     settings=load_settings({'STOCK_MONITOR_INTERNAL_TOKEN':'service-secret','STOCK_MONITOR_XQ_ENABLED':'true','XUEQIU_TOKEN':'offline'})
     client=TestClient(create_app(scheduler_enabled=False,settings=settings,etf_factory=lambda:source,redis_factory=lambda:backend))
     response=client.post('/internal/etf-monitor/v1/asset-allocation',headers=HEADERS,json={'symbol':'SH510050','reportPeriod':'20260630'})

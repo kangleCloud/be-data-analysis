@@ -60,7 +60,7 @@ def test_disabled_profiles_reject_before_xueqiu_or_redis():
 
 def test_enabled_profiles_return_only_limited_basic_fields(monkeypatch):
     calls = []
-    monkeypatch.setattr("app.stock_monitor_api.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.api.stock_monitor.time.sleep", lambda _seconds: None)
 
     class Xueqiu:
         def profile(self, symbol):
@@ -121,12 +121,12 @@ def test_profiles_keep_request_order_and_reject_entire_batch_on_one_failure():
     assert 'profiles' not in response.json()
 
 
-@pytest.mark.parametrize('age,full,expected',[(0,True,[]),(120,True,[]),(121,True,['profile','quote']),(0,False,['profile'])])
+@pytest.mark.parametrize('age,full,expected',[(0,True,['profile']),(120,True,['profile']),(121,True,['profile','quote']),(0,False,['profile'])])
 def test_profiles_reuse_only_fresh_same_symbol_quote_fields(age,full,expected):
     import json
     from datetime import datetime,timedelta
     from zoneinfo import ZoneInfo
-    from app.stock_monitor import QUOTE_PREFIX
+    from app.stock_monitor.service import QUOTE_PREFIX
     backend,calls=RedisClient(),[]
     quote={'symbol':'SH600000','source':'XQ','status':'FRESH','marketCap':100,
            'collectedAt':(datetime.now(ZoneInfo('Asia/Shanghai'))-timedelta(seconds=age-.5)).isoformat()}
@@ -152,7 +152,7 @@ def test_profiles_reuse_only_fresh_same_symbol_quote_fields(age,full,expected):
 def test_profile_quote_reuse_rejects_wrong_source_symbol_status_or_capital(field,value):
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    from app.stock_monitor_api import fresh_profile_quote
+    from app.api.stock_monitor import fresh_profile_quote
     now=datetime.now(ZoneInfo('Asia/Shanghai'))
     quote={'symbol':'SH600000','source':'XQ','status':'FRESH','marketCap':100,'collectedAt':now.isoformat()}
     quote[field]=value

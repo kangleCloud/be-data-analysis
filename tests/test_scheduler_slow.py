@@ -9,19 +9,19 @@ from tests.test_snapshot import FakeRedis
 
 
 def test_round_order_short_tasks_first_with_one_parent(monkeypatch):
-    import app.workflows as module
+    import app.runtime.workflows as module
     calls = []
-    for name in ('run_monitor','run_etf','run_market'):
+    for name in ('run_monitor','run_etf','_market'):
         monkeypatch.setattr(module,name,lambda *a,_name=name,**kw:calls.append(_name) or 'published')
-    assert module.run_auto(load_settings({}),FakeRedis()) == {
+    assert module.run_quotes(load_settings({}),FakeRedis()) == {
         'monitor':'published','etf':'published','market':'published'}
-    assert calls == ['run_monitor','run_etf','run_market']
+    assert calls == ['run_monitor','run_etf','_market']
 
 
 def test_scheduler_shutdown_cancels_and_waits_current_round(monkeypatch):
-    import app.scheduler as module
+    import app.runtime.scheduler as module
     entered,stopped = threading.Event(),threading.Event()
-    def work(settings,cancel):
+    def work(settings,cancel,*args):
         entered.set()
         assert cancel.wait(2)
         stopped.set()
@@ -41,13 +41,13 @@ def test_scheduler_shutdown_cancels_and_waits_current_round(monkeypatch):
 
 
 def test_calendar_shutdown_cancels_and_waits_source(monkeypatch):
-    from app.calendar_scheduler import _run_cancellable
+    from app.calendar.scheduler import _run_cancellable
     entered,stopped=threading.Event(),threading.Event()
-    def work(settings,cancel):
+    def work(settings,cancel,*args):
         entered.set()
         assert cancel.wait(2)
         stopped.set()
-        from app.source_execution import SourceControlError
+        from app.runtime.source_execution import SourceControlError
         raise SourceControlError('已取消源进程')
     async def run():
         task=asyncio.create_task(_run_cancellable(work,load_settings({})))

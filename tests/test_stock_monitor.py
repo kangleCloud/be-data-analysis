@@ -8,12 +8,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.providers.xueqiu import XueqiuProvider, XueqiuSourceError
-from app.stock_monitor import (
+from app.stock_monitor.service import (
     ENABLED_KEY, LAST_TRADE_DATE_KEY, QUOTE_PREFIX, SERIES_PREFIX,
     MonitorStore, QuoteValidationError, StockMonitorSampler, normalize_profile,
     normalize_quote,
 )
-from app.trading_calendar import CACHE_KEY, CalendarService, normalize_dates
+from app.calendar.service import CACHE_KEY, CalendarService, normalize_dates
 from tests.test_snapshot import FakeRedis
 
 
@@ -98,7 +98,7 @@ def test_sampler_writes_quote_and_real_points_without_duplicate_or_gap_fill(monk
     client = RedisClient()
     client.set(ENABLED_KEY, json.dumps(STOCKS))
     source = QuoteSource()
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
     assert sampler.sample(AT) == "published"
     key = f"{SERIES_PREFIX}2026-09-28:SH600000"
@@ -126,7 +126,7 @@ def test_cooldown_stops_remaining_symbols_and_keeps_stale_data(monkeypatch):
     client = RedisClient()
     client.set(ENABLED_KEY, json.dumps(STOCKS))
     source = QuoteSource()
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
     sampler.sample(AT)
     source.calls.clear()
@@ -200,7 +200,7 @@ def test_close_retries_require_source_time_strictly_after_1500_and_stop_after_co
     client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
     source = QuoteSource()
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     source.time = int(AT.replace(hour=15, minute=0).timestamp() * 1000)
     assert sampler.sample(AT.replace(hour=15, minute=0)) == "published"
     key = f"{SERIES_PREFIX}2026-09-28:SH600000"
@@ -228,7 +228,7 @@ def test_close_retries_throttle_same_symbol_and_expire_at_1510(monkeypatch):
     source = QuoteSource()
     source.time = int(AT.replace(hour=15, minute=0).timestamp() * 1000)
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     assert sampler.sample(AT.replace(hour=15, minute=2)) == "published"
     assert sampler.sample(AT.replace(hour=15, minute=2, second=30)) == "published"
     assert set(source.calls) <= {"SH600000", "SZ000001"}
@@ -249,7 +249,7 @@ def test_close_cooldown_preserves_history_without_network(monkeypatch):
     client.set(ENABLED_KEY, json.dumps(STOCKS[:1]))
     source = QuoteSource()
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     assert sampler.sample(AT) == "published"
     key = f"{SERIES_PREFIX}2026-09-28:SH600000"
     client.set("stock:monitor:v1:xq:cooldown", "1", ex=7200)
@@ -353,7 +353,7 @@ def test_four_symbols_with_akshare_dataframe_previous_day_are_stale_without_poin
         ], columns=["item", "value"])
 
     source = XueqiuProvider("fake-token", api=SimpleNamespace(stock_individual_spot_xq=spot))
-    monkeypatch.setattr("app.stock_monitor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("app.stock_monitor.service.time.sleep", lambda _seconds: None)
     sampler = StockMonitorSampler(MonitorStore(client), source, Calendar(), xq_enabled=True)
     with caplog.at_level("INFO"):
         assert sampler.sample(at) == "published"
@@ -431,7 +431,7 @@ def test_price_history_retains_two_data_days_across_year_end():
 
 
 def test_quote_and_price_point_publish_monitor_state_in_same_transaction():
-    from app.stock_monitor import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
+    from app.stock_monitor.service import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
 
     client = RedisClient()
     store = MonitorStore(client)
@@ -472,7 +472,7 @@ def test_1456_quote_does_not_confirm_close_at_1502():
 
 def test_collected_at_includes_calendar_and_candidate_preparation(monkeypatch):
     clock = [100.0]
-    monkeypatch.setattr('app.stock_monitor.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('app.stock_monitor.service.time.monotonic', lambda: clock[0])
     class SlowCalendar:
         def day_status(self, today, at):
             clock[0] += 7
@@ -489,7 +489,7 @@ def test_collected_at_includes_calendar_and_candidate_preparation(monkeypatch):
 
 
 def test_mid_batch_cooldown_is_partial_not_false_published():
-    from app.source_execution import SourceCoolingError
+    from app.runtime.source_execution import SourceCoolingError
     class CoolingSource(QuoteSource):
         def quote(self, symbol):
             raise SourceCoolingError(7080)

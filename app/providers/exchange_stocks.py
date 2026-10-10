@@ -2,7 +2,7 @@
 
 from contextlib import closing
 from typing import Any
-from app.source_execution import SourceCall, SourceExecutor, completed, source_batch
+from app.runtime.source_execution import SourceCall, SourceExecutor, completed, source_batch
 
 
 class ExchangeStockProvider:

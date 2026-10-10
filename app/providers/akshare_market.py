@@ -5,7 +5,7 @@ import time
 from typing import Any, Protocol
 
 from app.providers.http import error_metadata
-from app.source_execution import SourceCall, SourceExecutor, SourceCoolingError
+from app.runtime.source_execution import SourceCall, SourceExecutor, SourceCoolingError
 
 LOGGER = logging.getLogger(__name__)
 THS_SECTOR_TIMEOUT_SECONDS = 120

@@ -5,11 +5,11 @@ import pytest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.etf_monitor import (
+from app.etf_monitor.collector import (
     ENABLED_KEY, PRICE_PREFIX, SNAPSHOT_KEY, UPDATES_CHANNEL, EtfCollector, EtfStore,
 )
 from app.core.config import load_settings
-from app.workflows import run_etf
+from app.runtime.workflows import run_etf
 from tests.test_snapshot import FakeRedis
 
 AT = datetime(2026, 9, 28, 9, 32, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -116,8 +116,8 @@ def test_etf_partial_symbol_does_not_invent_price():
 
 def test_etf_workflow_collects_sina_quotes_with_xueqiu_gate_disabled(monkeypatch):
     client, source = _setup()
-    monkeypatch.setattr("app.workflows.AkShareEtfProvider", lambda _timeout, **_kwargs: source)
-    monkeypatch.setattr("app.workflows.calendar_service", lambda _settings, _client: Calendar())
+    monkeypatch.setattr("app.runtime.workflows.AkShareEtfProvider", lambda _timeout, **_kwargs: source)
+    monkeypatch.setattr("app.runtime.workflows.calendar_service", lambda _settings, _client: Calendar())
     settings = load_settings({"STOCK_MONITOR_XQ_ENABLED": "false"})
     assert run_etf(settings, client, at=AT) == "published"
     assert source.calls == 1
@@ -132,7 +132,7 @@ def test_etf_workflow_collects_sina_quotes_with_xueqiu_gate_disabled(monkeypatch
     ("format", 300), ("normalize", 300),
 ])
 def test_etf_cooldown_classification_skip_and_recovery(monkeypatch, caplog, kind, seconds):
-    from app.etf_monitor import COOLDOWN_KEY
+    from app.etf_monitor.collector import COOLDOWN_KEY
     from app.providers.akshare_etf import EtfSourceError
     client, source = _setup()
     collector = EtfCollector(source, EtfStore(client), Calendar())
@@ -176,7 +176,7 @@ def test_etf_cooldown_classification_skip_and_recovery(monkeypatch, caplog, kind
 def test_etf_collected_at_reflects_source_completion(monkeypatch):
     client, source = _setup()
     clock = [0]
-    monkeypatch.setattr("app.etf_monitor.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("app.etf_monitor.collector.time.monotonic", lambda: clock[0])
     original = source.quotes
     def slow():
         clock[0] += 20
@@ -211,8 +211,8 @@ def test_etf_unexpected_program_error_keeps_traceback(monkeypatch, caplog, wrapp
 
 
 def test_mid_call_cooldown_is_info_and_keeps_original_ttl(monkeypatch, caplog):
-    from app.source_execution import SourceCoolingError
-    from app.etf_monitor import COOLDOWN_KEY
+    from app.runtime.source_execution import SourceCoolingError
+    from app.etf_monitor.collector import COOLDOWN_KEY
     client, source = _setup()
     collector = EtfCollector(source,EtfStore(client),Calendar())
     assert collector.collect(AT) == 'published'
@@ -233,7 +233,7 @@ def test_mid_call_cooldown_is_info_and_keeps_original_ttl(monkeypatch, caplog):
 
 
 def test_one_full_sina_table_feeds_enabled_quotes_and_dictionary():
-    from app.etf_dictionary import KEY
+    from app.etf_monitor.dictionary import KEY
     client,source = _setup()
     source.rows.append({'代码':'sz159919','名称':'300ETF','最新价':'4.1'})
     assert EtfCollector(source,EtfStore(client),Calendar()).collect(AT)=='published'
@@ -247,8 +247,8 @@ def test_one_full_sina_table_feeds_enabled_quotes_and_dictionary():
 
 def test_dictionary_redis_failure_preserves_previous_snapshot_without_source_cooldown():
     import redis
-    from app.etf_dictionary import KEY
-    from app.etf_monitor import COOLDOWN_KEY
+    from app.etf_monitor.dictionary import KEY
+    from app.etf_monitor.collector import COOLDOWN_KEY
     client,source=_setup()
     collector=EtfCollector(source,EtfStore(client),Calendar())
     assert collector.collect(AT)=='published'

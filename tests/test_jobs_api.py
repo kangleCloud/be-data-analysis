@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi.testclient import TestClient
 
 from app.core.config import load_settings
-from app.jobs_api import LOCK_PREFIX, _run_default
+from app.api.jobs import LOCK_PREFIX, _run_default
 from app.main import create_app
 from tests.test_snapshot import FakeRedis
 
@@ -117,7 +117,7 @@ def test_lock_redis_failure_is_503_and_does_not_run():
 
 
 def test_default_dispatch_reuses_workflows_in_service_parent(monkeypatch):
-    import app.jobs_api as module
+    import app.api.jobs as module
     calls = []
     for key in ('calendar','market','monitor','etf'):
         monkeypatch.setattr(module,'run_'+key,lambda *args,_key=key,**kwargs:calls.append((_key,args,kwargs)) or 'published')
@@ -130,21 +130,31 @@ def test_default_dispatch_reuses_workflows_in_service_parent(monkeypatch):
 
 
 def test_resource_failure_returns_503_and_releases_all_locks():
-    from app.resources import SourceResourceError
-    from app.collection_gate import ENTRY_KEY
+    from app.runtime.resources import SourceResourceError
+    from app.runtime.gates import QUOTES_ENTRY_KEY
     backend = RedisClient()
     def fail(kind):
         raise SourceResourceError('PROCESS_EXIT',exitcode=-9)
     response = client_for(backend,fail).post('/internal/jobs/v1/market/refresh',headers=headers())
     assert response.status_code == 503
     assert response.json()['outcome'] == 'resource' and response.json()['state'] == 'FAILED'
-    assert backend.get(LOCK_PREFIX+'market') is None and backend.get(ENTRY_KEY) is None
+    assert backend.get(LOCK_PREFIX+'market') is None and backend.get(QUOTES_ENTRY_KEY) is None
 
 
 def test_cross_kind_refresh_busy_immediately():
-    from app.collection_gate import ENTRY_KEY
+    from app.runtime.gates import QUOTES_ENTRY_KEY
     backend,calls = RedisClient(),[]
-    backend.set(ENTRY_KEY,'another-kind',ex=30)
+    backend.set(QUOTES_ENTRY_KEY,'another-kind',ex=30)
     response = client_for(backend,lambda kind:calls.append(kind)).post('/internal/jobs/v1/etf/refresh',headers=headers())
     assert response.status_code == 409 and response.json()['outcome'] == 'locked'
     assert calls == []
+
+
+def test_complete_market_api_funds_busy_leaves_no_quotes_lock():
+    from app.runtime.gates import QUOTES_ENTRY_KEY,FUNDS_ENTRY_KEY
+    backend,calls=RedisClient(),[]
+    backend.set(FUNDS_ENTRY_KEY,'auto-funds',ex=30)
+    response=client_for(backend,lambda kind:calls.append(kind)).post('/internal/jobs/v1/market/refresh',headers=headers())
+    assert response.status_code==409 and response.json()['outcome']=='locked'
+    assert calls==[] and backend.get(QUOTES_ENTRY_KEY) is None
+    assert backend.get(FUNDS_ENTRY_KEY)=='auto-funds'

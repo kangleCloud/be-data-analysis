@@ -20,7 +20,7 @@ def main() -> int:
     sources.add_argument("--json", action="store_true", help="输出完整静态元数据 JSON")
     args = parser.parse_args()
     if args.command == "sources":
-        from app.source_catalog import render_sources
+        from app.providers.catalog import render_sources
         print(render_sources(as_json=args.json))
         return 0
 
@@ -28,7 +28,7 @@ def main() -> int:
     import uvicorn
     from app.core.config import get_settings
     from app.core.logging import configure_logging, log_failure, server_log_config
-    from app.workflows import run_calendar, run_etf, run_market, run_monitor
+    from app.runtime.workflows import run_calendar, run_etf, run_market, run_monitor
 
     settings = get_settings()
     configure_logging(settings.service_log_level, args.command)

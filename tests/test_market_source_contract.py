@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import requests
 
-from app.normalize import SourceDataError, normalize_individual_batch, normalize_sectors
+from app.market.normalize import SourceDataError, normalize_individual_batch, normalize_sectors
 from app.providers.http import quiet_progress
 
 
@@ -79,15 +79,15 @@ def paging_html(codes,page=None,total=2):
 
 
 def test_fixed_akshare_multi_page_rewrites_only_instant_individual_and_reuses_batch(monkeypatch):
-    from app.source_execution import SourceCall,SourceControl,controlled_http
+    from app.runtime.source_execution import SourceCall,SourceControl,controlled_http
     from tests.test_source_execution import ControlRedis
     module = __import__(akshare.stock_fund_flow_individual.__module__,fromlist=['dummy'])
     monkeypatch.setattr(module.py_mini_racer,'MiniRacer',lambda:SimpleNamespace(eval=lambda text:None,call=lambda name:'offline'))
     monkeypatch.setattr(module,'_get_file_content_ths',lambda name:'')
     backend,clock = ControlRedis(),[0.0]
     backend.rate_now = lambda:clock[0]*1000
-    monkeypatch.setattr('app.source_execution.time.monotonic',lambda:clock[0])
-    monkeypatch.setattr('app.source_execution.time.sleep',lambda t:clock.__setitem__(0,clock[0]+t))
+    monkeypatch.setattr('app.runtime.source_execution.time.monotonic',lambda:clock[0])
+    monkeypatch.setattr('app.runtime.source_execution.time.sleep',lambda t:clock.__setitem__(0,clock[0]+t))
     urls=[]
     def send(session,request,**kwargs):
         urls.append(request.url)
@@ -122,8 +122,8 @@ def test_fixed_akshare_multi_page_rewrites_only_instant_individual_and_reuses_ba
     ('stock_fund_flow_individual','即时','elsewhere.test','/funds/ggzjl/field/zdf/order/desc/page/1/ajax/1/free/1/'),
 ])
 def test_paging_does_not_rewrite_other_calls(function,symbol,domain,path):
-    from app.source_execution import SourceCall
-    from app.ths_paging import IndividualPaging
+    from app.runtime.source_execution import SourceCall
+    from app.providers.ths_paging import IndividualPaging
     request = requests.Request('GET','http://'+domain+path).prepare()
     audit = IndividualPaging(SourceCall(function,'ths',{'symbol':symbol}))
     original = request.url
@@ -138,8 +138,8 @@ def test_paging_does_not_rewrite_other_calls(function,symbol,domain,path):
     ([([],1)],'EMPTY_PAGE'),
 ])
 def test_paging_rejects_duplicate_unstable_out_of_order_and_empty(pages,reason):
-    from app.source_execution import SourceCall
-    from app.ths_paging import IndividualPaging
+    from app.runtime.source_execution import SourceCall
+    from app.providers.ths_paging import IndividualPaging
     audit = IndividualPaging(SourceCall('stock_fund_flow_individual','ths',{'symbol':'即时'}))
     audit.response(0,SimpleNamespace(text='<span class="page_info">1/2</span>'))
     with pytest.raises(SourceDataError) as exc:
@@ -149,8 +149,8 @@ def test_paging_rejects_duplicate_unstable_out_of_order_and_empty(pages,reason):
 
 
 def test_paging_requires_initial_counter_and_all_pages_raw_count():
-    from app.source_execution import SourceCall
-    from app.ths_paging import IndividualPaging
+    from app.runtime.source_execution import SourceCall
+    from app.providers.ths_paging import IndividualPaging
     audit = IndividualPaging(SourceCall('stock_fund_flow_individual','ths',{'symbol':'即时'}))
     with pytest.raises(SourceDataError,match='分页'):
         audit.response(0,SimpleNamespace(text='<html></html>'))

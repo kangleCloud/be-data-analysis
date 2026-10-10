@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.calendar_scheduler import next_monthly_slot
-from app.trading_calendar import (
+from app.calendar.scheduler import next_monthly_slot
+from app.calendar.service import (
     CACHE_KEY, LOCK_KEY, AkShareCalendarSource, CalendarService, normalize_dates,
 )
 from tests.test_snapshot import FakeRedis
@@ -35,7 +35,7 @@ def large_fake_worker(queue, url, call, keys, token, guard, deadline, read, pare
 
 
 def test_calendar_source_reads_large_child_result_before_join():
-    from app.source_execution import SourceExecutor
+    from app.runtime.source_execution import SourceExecutor
     from tests.test_source_execution import ControlRedis
     backend = ControlRedis()
     executor = SourceExecutor('redis://offline', client=backend, worker=large_fake_worker)
@@ -192,8 +192,8 @@ def test_old_multiyear_payload_without_year_is_rejected():
 
 
 def test_calendar_resource_error_is_distinct_and_preserves_cache():
-    from app.resources import SourceResourceError
-    from app.trading_calendar import CACHE_KEY
+    from app.runtime.resources import SourceResourceError
+    from app.calendar.service import CACHE_KEY
     from tests.test_snapshot import FakeRedis
     client=FakeRedis()
     client.set(CACHE_KEY,'previous')

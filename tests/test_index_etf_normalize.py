@@ -2,8 +2,8 @@
 
 import pytest
 
-from app.etf_normalize import asset_allocation, quote_rows
-from app.normalize import CORE_INDICES, SourceDataError, normalize_core_indices
+from app.etf_monitor.normalize import asset_allocation, quote_rows
+from app.market.normalize import CORE_INDICES, SourceDataError, normalize_core_indices
 
 COLLECTED_AT = "2026-09-28T09:32:00+08:00"
 

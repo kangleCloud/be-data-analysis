@@ -8,9 +8,9 @@ from tests.test_snapshot import FakeRedis
 
 import app.main as main_module
 import app.cli as cli_module
-import app.workflows as workflows_module
+import app.runtime.workflows as workflows_module
 from app.core.config import load_settings
-from app.stock_monitor_scheduler import next_sample_slot
+from app.stock_monitor.scheduler import next_sample_slot
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -34,6 +34,7 @@ def test_serve_passes_gate_to_the_single_automatic_scheduler(monkeypatch):
         await asyncio.Event().wait()
     monkeypatch.setattr(main_module,'run_scheduler',scheduler)
     monkeypatch.setattr(main_module,'run_calendar_scheduler',calendar)
+    monkeypatch.setattr(main_module,'run_funds_scheduler',calendar)
     for flag in ('false','true'):
         with TestClient(main_module.create_app(settings=load_settings({'STOCK_MONITOR_XQ_ENABLED':flag}),redis_factory=FakeRedis)) as client:
             assert client.get('/health').status_code == 200

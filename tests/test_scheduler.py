@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.core.config import load_settings
-from app.scheduler import next_slot
+from app.runtime.scheduler import next_slot
 from tests.test_snapshot import FakeRedis
 
 SHANGHAI = ZoneInfo('Asia/Shanghai')
@@ -32,13 +32,14 @@ def test_serve_lifespan_starts_one_quote_loop_and_one_calendar_loop(monkeypatch)
             events.append('stop')
     monkeypatch.setattr(main_module,'run_scheduler',scheduler)
     monkeypatch.setattr(main_module,'run_calendar_scheduler',scheduler)
+    monkeypatch.setattr(main_module,'run_funds_scheduler',scheduler)
     with TestClient(main_module.create_app(redis_factory=FakeRedis)) as client:
         assert client.get('/health').status_code == 200
-    assert events == ['start','start','stop','stop']
+    assert events == ['start','start','start','stop','stop','stop']
 
 
-def simulate_scheduler(monkeypatch,start,durations,startup_lag=0):
-    import app.scheduler as module
+def simulate_scheduler(monkeypatch,start,durations,startup_lag=0,lane="quotes"):
+    import app.runtime.scheduler as module
     clock,starts,sleeps = [start],[],[]
     running = [False]
     class Clock(datetime):
@@ -51,7 +52,7 @@ def simulate_scheduler(monkeypatch,start,durations,startup_lag=0):
         assert not running[0]
         sleeps.append(seconds)
         clock[0] += timedelta(seconds=seconds+(startup_lag if not starts else 0))
-    async def to_thread(function,settings,cancel):
+    async def to_thread(function,settings,cancel,lane):
         assert not running[0]
         running[0] = True
         starts.append(clock[0])
@@ -65,19 +66,21 @@ def simulate_scheduler(monkeypatch,start,durations,startup_lag=0):
     monkeypatch.setattr(module.asyncio,'sleep',sleep)
     monkeypatch.setattr(module.asyncio,'to_thread',to_thread)
     with pytest.raises(Done):
-        asyncio.run(module.run_scheduler(load_settings({})))
+        asyncio.run(module.run_scheduler(load_settings({}),lane=lane))
     return starts,sleeps
 
 
-def test_slow_round_continues_at_actual_completion(monkeypatch):
-    starts,sleeps = simulate_scheduler(monkeypatch,datetime(2026,10,8,10,0,tzinfo=SHANGHAI),[181,10])
+@pytest.mark.parametrize("lane",["quotes","funds"])
+def test_slow_round_continues_at_actual_completion(monkeypatch,lane):
+    starts,sleeps = simulate_scheduler(monkeypatch,datetime(2026,10,8,10,0,tzinfo=SHANGHAI),[181,10],lane=lane)
     assert [at.strftime('%H:%M:%S') for at in starts] == ['10:02:00','10:05:01']
     assert sleeps == [120,0]
 
 
+@pytest.mark.parametrize('lane',['quotes','funds'])
 @pytest.mark.parametrize('duration',[0,1,119,120])
-def test_minimum_start_spacing_and_no_busy_loop(monkeypatch,duration):
-    starts,sleeps = simulate_scheduler(monkeypatch,datetime(2026,10,8,10,0,tzinfo=SHANGHAI),[duration,0],startup_lag=10)
+def test_minimum_start_spacing_and_no_busy_loop(monkeypatch,duration,lane):
+    starts,sleeps = simulate_scheduler(monkeypatch,datetime(2026,10,8,10,0,tzinfo=SHANGHAI),[duration,0],startup_lag=10,lane=lane)
     spacing = 230 if duration == 119 else 120
     assert (starts[1]-starts[0]).total_seconds() == spacing
     assert sleeps[1] == spacing-duration

@@ -27,12 +27,12 @@ def test_deployment_code_check_shows_features_without_configuration_values(monke
     assert secret not in output
     record = json.loads(output)
     assert record['akshareVersion'] == '1.18.97'
-    source = record['files']['source_execution.py']
-    assert (source['GLOBAL_LIMIT'],source['SOURCE_LIMIT']) == (1,1)
+    source = record['files']['runtime/source_execution.py']
+    assert (source['GLOBAL_LIMIT'],source['SOURCE_LIMIT']) == (2,2)
     assert (source['LEASE_SECONDS'],source['RENEW_SECONDS']) == (30,10)
     assert source['currentCoolingName'] and not source['oldCoolingName']
     assert record['files']['providers/http.py']['disableTqdm']
-    assert record['files']['source_execution.py']['quietProgress']
+    assert record['files']['runtime/source_execution.py']['quietProgress']
 
 
 def test_documented_redis_check_only_reads_ttl_and_never_prints_connection(monkeypatch,capsys):

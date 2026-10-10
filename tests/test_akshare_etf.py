@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 from app.providers.akshare_etf import AkShareEtfProvider, EtfSourceError
-from app.source_execution import SourceCallError
+from app.runtime.source_execution import SourceCallError
 
 
 class Executor:

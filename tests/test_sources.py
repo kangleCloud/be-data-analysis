@@ -21,7 +21,7 @@ def test_sources_does_not_read_configuration_import_runtime_or_access_network(mo
     forbidden = {"redis", "uvicorn", "akshare", "pandas", "dotenv", "pydantic", "fastapi"}
     def restricted_import(name, *args, **kwargs):
         assert name.split(".")[0] not in forbidden
-        assert name not in {"app.core.config", "app.core.logging", "app.workflows"}
+        assert name not in {"app.core.config", "app.core.logging", "app.runtime.workflows"}
         return original_import(name, *args, **kwargs)
     def forbidden_io(*args, **kwargs):
         pytest.fail("sources 不得读配置文件或访问网络")
@@ -63,7 +63,7 @@ def test_json_catalog_covers_current_provider_functions_and_literal_parameter_co
         [sys.executable, "-S", "-m", "app", "sources", "--json"], cwd=ROOT,
         check=True, capture_output=True, text=True, timeout=5,
     ).stdout)
-    provider_files = [*sorted((ROOT / "app/providers").glob("*.py")), ROOT / "app/trading_calendar.py"]
+    provider_files = [*sorted(path for path in (ROOT / "app/providers").glob("*.py") if path.name != "catalog.py"), ROOT / "app/calendar/service.py"]
     functions = set()
     fixed_combinations = set()
     for path in provider_files:

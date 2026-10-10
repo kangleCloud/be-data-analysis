@@ -1,10 +1,13 @@
 """Redis JSON 契约和锁释放。"""
 
 import json
+import threading
+import redis
+from app.runtime.gates import ACQUIRE, RENEW, RELEASE
 
 import pytest
 
-from app.snapshot import (
+from app.market.snapshot import (
     LOCK_KEY, RENEW_LOCK_SCRIPT, SNAPSHOT_KEY, UPDATES_CHANNEL,
     RedisSnapshotStore,
 )
@@ -12,6 +15,8 @@ from app.snapshot import (
 
 class FakeRedis:
     def __init__(self):
+        self.mutex = threading.RLock()
+        self.versions = {}
         self.values = {}
         self.expiry = {}
         self.now = 0
@@ -49,6 +54,7 @@ class FakeRedis:
         if nx and self.get(key) is not None:
             return False
         self.values[key] = value
+        self.versions[key] = self.versions.get(key,0)+1
         if ex is not None:
             self.expiry[key] = self.now + int(ex)
         self.events.append(("set", key, value))
@@ -61,6 +67,17 @@ class FakeRedis:
         class Pipeline:
             def __init__(self):
                 self.commands = []
+                self.watched = {}
+
+            def watch(self,*keys):
+                with client.mutex:
+                    self.watched = {key:client.versions.get(key,0) for key in keys}
+
+            def multi(self):
+                pass
+
+            def reset(self):
+                self.watched = {}
 
             def set(self, key, value):
                 self.commands.append(("set", key, value))
@@ -75,6 +92,12 @@ class FakeRedis:
                 return self
 
             def execute(self):
+                with client.mutex:
+                    return self._execute()
+
+            def _execute(self):
+                if any(client.versions.get(key,0) != version for key,version in self.watched.items()):
+                    raise redis.WatchError('模拟并发更新')
                 if client.fail_set and any(
                     command[:2] == ("set", SNAPSHOT_KEY) for command in self.commands
                 ):
@@ -101,6 +124,25 @@ class FakeRedis:
         return 0
 
     def eval(self, script, count, *args):
+        if script in (ACQUIRE,RENEW,RELEASE):
+            with self.mutex:
+                keys,args = args[:count],args[count:]
+                if script == ACQUIRE:
+                    if any(self.get(key) is not None for key in keys):
+                        return 0
+                    for key in keys:
+                        self.set(key,args[0],ex=args[1])
+                elif script == RENEW:
+                    if any(self.get(key) != args[0] for key in keys):
+                        return 0
+                    for key in keys:
+                        self.expiry[key] = self.now+args[1]
+                else:
+                    for key in keys:
+                        if self.get(key) == args[0]:
+                            self.values.pop(key,None)
+                            self.expiry.pop(key,None)
+                return 1
         if script == RENEW_LOCK_SCRIPT or (count == 1 and len(args) == 3):
             key, token, seconds = args
             if self.get(key) != token:
@@ -229,7 +271,7 @@ def test_unsupported_snapshot_version_is_rejected():
 
 
 def test_fund_series_dedupes_sample_time_and_keeps_two_cross_year_dates():
-    from app.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
+    from app.market.snapshot import FUND_DATES_KEY, FUND_SERIES_PREFIX
 
     client = FakeRedis()
     store = RedisSnapshotStore(client, 240)
@@ -276,8 +318,8 @@ def test_market_snapshot_ids_link_and_only_changed_modules_are_listed():
 
 
 def test_fund_point_market_and_monitor_events_follow_atomic_business_writes():
-    from app.snapshot import FUND_SERIES_PREFIX
-    from app.stock_monitor import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
+    from app.market.snapshot import FUND_SERIES_PREFIX
+    from app.stock_monitor.service import MONITOR_STATE_KEY, MONITOR_UPDATES_CHANNEL
 
     client = FakeRedis()
     store = RedisSnapshotStore(client, 240)
@@ -308,7 +350,7 @@ def test_fund_point_market_and_monitor_events_follow_atomic_business_writes():
 
 
 def test_fund_status_without_points_notifies_enabled_symbols_atomically_only_on_change():
-    from app.stock_monitor import ENABLED_KEY,MONITOR_STATE_KEY,MONITOR_UPDATES_CHANNEL
+    from app.stock_monitor.service import ENABLED_KEY,MONITOR_STATE_KEY,MONITOR_UPDATES_CHANNEL
     client=FakeRedis()
     client.set(ENABLED_KEY,json.dumps([{'symbol':'SH600000','code':'600000','name':'浦发银行','market':'SH'}]))
     store=RedisSnapshotStore(client,240)

@@ -15,11 +15,11 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from app.core import msg
 from app.core.config import Settings, get_settings
 from app.core.logging import log_failure
-from app.etf_api import create_etf_router
-from app.jobs_api import create_jobs_router
-from app.scheduler import run_scheduler
-from app.calendar_scheduler import run_calendar_scheduler
-from app.stock_monitor_api import create_monitor_router
+from app.api.etf_monitor import create_etf_router
+from app.api.jobs import create_jobs_router
+from app.runtime.scheduler import run_scheduler, run_funds_scheduler
+from app.calendar.scheduler import run_calendar_scheduler
+from app.api.stock_monitor import create_monitor_router
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,13 +36,16 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         task = asyncio.create_task(run_scheduler(configured)) if scheduler_enabled else None
+        funds_task = asyncio.create_task(run_funds_scheduler(configured)) if scheduler_enabled else None
         calendar_task = asyncio.create_task(run_calendar_scheduler(configured)) if scheduler_enabled else None
         try:
             yield
         finally:
-            for running in (task,calendar_task):
+            for running in (task,funds_task,calendar_task):
                 if running is not None:
                     running.cancel()
+            for running in (task,funds_task,calendar_task):
+                if running is not None:
                     with suppress(asyncio.CancelledError):
                         await running
 
