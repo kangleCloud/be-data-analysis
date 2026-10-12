@@ -37,6 +37,7 @@ def main() -> int:
             "app.main:app", host=settings.service_host,
             port=settings.service_port, log_level=settings.service_log_level,
             log_config=server_log_config(),
+            timeout_graceful_shutdown=30,
         )
         return 0
 

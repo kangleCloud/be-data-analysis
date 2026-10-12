@@ -92,7 +92,7 @@ def create_etf_router(
         except SourceBusyError as exc:
             raise HTTPException(status_code=409,detail='采集入口忙碌') from exc
         except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except Exception as exc:
             LOGGER.warning("ETF 字典同步失败，异常 %s",type(exc).__name__)
             raise HTTPException(status_code=502,detail='ETF 字典同步失败') from exc
@@ -129,7 +129,7 @@ def create_etf_router(
         except HTTPException:
             raise
         except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except ProfileBatchError as exc:
             raise HTTPException(status_code=exc.status_code, detail={
                 "message": str(exc), "sourceStatus": exc.states,
@@ -170,7 +170,7 @@ def create_etf_router(
         except (SourceCoolingError,SourceThrottledError) as exc:
             raise HTTPException(status_code=429,detail='源保护或请求间隔未满足') from exc
         except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except AllocationNoData as exc:
             raise HTTPException(status_code=502,detail={'reason':'NO_DATA','message':'该报告期无有效资产配置'}) from exc
         except Exception as exc:

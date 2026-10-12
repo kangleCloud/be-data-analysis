@@ -18,7 +18,7 @@ from redis.retry import Retry
 
 from app.runtime.gates import collection_entry, check_entry
 from app.runtime.cooldown import protected_keys, record, risk_rejection
-from app.runtime.resources import SourceResourceError, check_memory, memory_state
+from app.runtime.resources import SourceResourceError
 from app.providers.ths_paging import IndividualPaging
 from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 
@@ -208,7 +208,6 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
         if urlparse(request.url).hostname not in call.domains:
             raise SourceControlError("源请求域名不在审计清单中")
         page = paging.prepare(request)
-        check_memory()
         control.request_turn(call, keys, token, guard, deadline)
         remaining = max(0.001, deadline - time.monotonic())
         connect, read = bounded_timeout(kwargs.get("timeout"), read_seconds)
@@ -247,10 +246,7 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
                     os._exit(77)
                 if time.monotonic() >= deadline:
                     os._exit(76)
-                check_memory()
                 control.check(keys, token, guard)
-            except SourceResourceError:
-                os._exit(72)
             except redis.RedisError:
                 os._exit(73)
             except SourceControlError:
@@ -264,9 +260,8 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
         initialized = time.monotonic()
         from app.core.logging import configure_logging
         configure_logging("info", "source:"+call.function)
-        check_memory()
         import akshare
-        LOGGER.info("源初始化耗时 %.2f 秒 memory=%s", time.monotonic()-initialized, memory_state())
+        LOGGER.info("源初始化耗时 %.2f 秒", time.monotonic()-initialized)
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
         with controlled_http(control, call, keys, token, guard, deadline, read_seconds, started_event) as paging, quiet_progress():
@@ -276,15 +271,13 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
                 clear()
             fetched = time.monotonic()
             frame = function(**call.parameters)
-            LOGGER.info("源请求耗时 %.2f 秒 memory=%s", time.monotonic()-fetched, memory_state())
+            LOGGER.info("源请求耗时 %.2f 秒", time.monotonic()-fetched)
             serialized = time.monotonic()
             rows = frame.to_dict("records")
             paging.finish(rows)
             del frame
-            LOGGER.info("源转换耗时 %.2f 秒 rows=%d memory=%s",time.monotonic()-serialized,len(rows),memory_state())
+            LOGGER.info("源转换耗时 %.2f 秒 rows=%d",time.monotonic()-serialized,len(rows))
         queue.put(("ok", rows))
-    except SourceResourceError as exc:
-        queue.put(("resource", {"reason":exc.reason,"state":exc.state}))
     except SourceThrottledError as exc:
         queue.put(("throttled", exc.ttl))
     except SourceCoolingError as exc:
@@ -385,7 +378,6 @@ class SourceExecutor:
 
     def _check(self) -> None:
         check_entry()
-        check_memory()
         if self.cancelled.is_set():
             raise SourceControlError("源批次已取消")
         if self.guard and self.control.client.get(self.guard[0]) != self.guard[1]:
@@ -456,11 +448,9 @@ class SourceExecutor:
                             raise TimeoutError("源调用超过预算")
                         if process.exitcode in {73,74,77}:
                             raise SourceControlError("源控制失效 exitcode="+str(process.exitcode))
-                        raise SourceResourceError("MEMORY_PRESSURE" if process.exitcode == 72 else "PROCESS_EXIT",state=memory_state(),exitcode=process.exitcode)
+                        raise SourceResourceError(exitcode=process.exitcode)
             self._check()
             self.control.check(keys, token, self.guard)
-            if status == "resource":
-                raise SourceResourceError(result["reason"],state=result["state"])
             if status == "throttled":
                 raise SourceThrottledError(result)
             if status == "cooldown":
@@ -473,7 +463,7 @@ class SourceExecutor:
                 raise SourceCallError(result)
             return result
         except BaseException as exc:
-            LOGGER.warning("源取消 function=%s reason=%s elapsed=%.2f memory=%s exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,memory_state(),process.exitcode if process else None)
+            LOGGER.warning("源取消 function=%s reason=%s elapsed=%.2f exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,process.exitcode if process else None)
             if process is not None:
                 self._reap(process, deadline)
                 exitcode = process.exitcode
@@ -489,7 +479,7 @@ class SourceExecutor:
                 queue.close()
             if keys is not None:
                 self.control.release(keys, token)
-            LOGGER.info("源 %s 总耗时 %.2f 秒 memory=%s exitcode=%s",call.function,time.monotonic()-started,memory_state(),exitcode)
+            LOGGER.info("源 %s 总耗时 %.2f 秒 exitcode=%s",call.function,time.monotonic()-started,exitcode)
 
     @staticmethod
     def _reap(process: Any, deadline: float) -> None:
@@ -505,7 +495,7 @@ class SourceExecutor:
         if process.is_alive():
             raise SourceControlError("源进程未完成回收，拒绝释放名额")
         process.join(timeout=0)
-        LOGGER.info("源回收 exitcode=%s signal=%s memory=%s",process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None,memory_state())
+        LOGGER.info("源回收 exitcode=%s signal=%s",process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None)
 
 
 @contextmanager

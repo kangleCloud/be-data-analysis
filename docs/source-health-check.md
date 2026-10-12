@@ -112,7 +112,7 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 
 ## 双通道执行控制与及时发布（AUTO）
 
-- 一个服务父进程、两条固定自动调度循环，各有独立执行器、线程上下文、guard/deadline/cancelled；资金只取`stock_fund_flow_individual(symbol="即时")`，行情顺序股票报价→ETF→核心指数→行业→概念。同通道串行、启动间隔≥120秒；跨通道并行，慢资金完成回收后按当前窗口接续，不阻塞行情、不重叠、不补历史点。普通模块失败只降级自身；Redis控制失败或资源不足停止调用。
+- 一个服务父进程、两条固定自动调度循环，各有独立执行器、线程上下文、guard/deadline/cancelled；资金只取`stock_fund_flow_individual(symbol="即时")`，行情顺序股票报价→ETF→核心指数→行业→概念。同通道串行、启动间隔≥120秒；跨通道并行，慢资金完成回收后按当前窗口接续，不阻塞行情、不重叠、不补历史点。普通模块失败只降级自身；Redis控制失败或源进程异常退出停止调用。
 - 固定入口`stock:source-control:v1:entry:quotes`、`:entry:funds`。CLI、默认/auto内部API和默认Provider均受控，SourceCall仅将即时individual认作资金。资料/字典/日历/资产配置走quotes；同步完整market原子取得两个，否则立即locked/409且不留半把锁。令牌TTL30秒，每10秒续租；旧令牌不能删除新持有者。GET/SSE不取采集入口。
 - 全局`slot:global:{0,1}`及每组`slot:{ths|sina|xq|sse|szse|bse}:{0,1}`各最多2，XQ含蛋卷。源进程回收后按令牌释放；子进程仅请求源/控制键，并转records释放DataFrame；服务父进程不导入AKShare/pandas。Session.send补丁仅在spawn源进程；会话/分页/重定向仍按原HTTP间隔、域名、源超时及冷却规则，分页串行、失败不继续后页。
 - 日历仍由quotes入口启动补建/月度循环维护。**资金只读当年合法、覆盖该日的缓存**；缺失/覆盖不足为UNKNOWN，只降级资金模块、不发日历HTTP、不跨占quotes入口、不消费日历AUTO_RETRY_KEY。缓存已覆盖但月刷新到期时，资金仍按有效日期判断，由行情/月度入口刷新。工作日不等同交易日，UNKNOWN/休市不请求业务源。
@@ -120,7 +120,7 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 - 同一全市场资金批次生成汇总、宽度及启用≤10股票资金点，不逐股加请求。资金点只随成功发布一次；原monitor_event_lock序列化资金/报价的股票stateId事务。无新点但真实资金结果/日期/诊断变化仍通知当前启用股票；重试时间单独变化不重复发通知，不造点、不将报价/曲线落MySQL。
 - 股票资料仍调用原资料源；**只复用市值**：同代码、XQ、FRESH、collectedAt不超过120秒的有限有效值。删除当前报价生产者无法提供industry/listingDate的全缓存资料分支；缺市值补报价仍受同股120秒。Python无独立定期资料轮询；Java上海工作日16:30股票/16:40ETF整体刷新不改，工作日不保证交易。
 - 新浪ETF全表一次取回生成启用交易报价＋`dictionary-source`轻量全量字典，TTL86400，不永久保留原表、不缓存启用子集。AUTO字典优先合法上海当日缓存，否则一次源调用；MANUAL字典强制一次新浪全表源调用；写缓存失败属Redis故障而非源格式/冷却。ETF交易价不换净值；fundFlowStatus=NO_RELIABLE_SOURCE。资产配置状态仍由Java按MySQL报告/总闸生成，Python行情不推测报告状态。
-- Compose内存与memory+swap均1g（无额外swap），pids128/init及BLAS线程1保留。cgroup总内存≥800MiB停止准入并TERM/KILL/reap当前源；两源分别取消回收。RESOURCE不触发源冷却，Redis失败独立终止。日志记录init/request/serialization耗时、退出码/信号/取消原因、current/peak及可取得的oom_kill；SIGKILL不能直接认定OOM。
+- 两个通道保留独立超时/取消及TERM/KILL/reap。源异常退出沿用RESOURCE分类而不触发源冷却，Redis失败独立终止。日志记录init/request/serialization耗时、退出码/信号及取消原因；SIGKILL不能直接认定OOM。
 - 资产配置固定detail.reason=RESOURCE/NO_DATA/DISABLED/SOURCE，忙409、冷却/间隔429、参数422、资源/关闭503、源/无数据502。NO_DATA仅真实空/指定期无有效类别；格式变化/未知错误SOURCE。不扫其他期、不重试。公开路径/schemaVersion/业务键及严格源时间>15:00收盘、15:02/04/06/08/10补收盘、雪球总闸不变。
 - 分包：api路由；runtime跨域工作流/配额/源执行/资源/双通道调度；providers源HTTP/THS分页/catalog；calendar、market、stock_monitor、etf_monitor各归领域。删除unused JOB_TIMEOUT_SECONDS、completed的忽略limit参数及全缓存资料分支，没有legacy别名或新jobId。Python没有HTML渲染点，JSON/SSE保持结构化原文，不做所有字符串Filter/全局escape；实际展示和HTTP/HTTPS外链由渲染端防护，业务库不存转义文本。
 
@@ -142,7 +142,7 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 
 普通故障键为原适用冷却键加`:ordinary`；确认风控`stock:source-control:v1:risk:{ths|sina|xq|sse|szse|bse}`，值包含ORDINARY/RISK及HTTP状态。旧键无原因标识仍保守尊重TTL，不作迁移删除。ETF字典AUTO合法当日缓存零源调用；MANUAL强制一次新浪全表，成功更新轻量字典缓存，失败保留旧缓存；一次ETF行情全表仍同时喂报价和字典。股票资料仅市值可复用120秒有效报价，主资料源始终调用。
 
-窗口外/休市可manual请求。股票保留真实sourceTime/tradeDate，写入短临界区重检源时间不倒退，>15:00才确认收盘、不补历史点；市场/指数/ETF无可靠日期时tradeDate=null，仅快照及实际采集时间，成功或失败降级的日内series均为空，资金和价格曲线不加点，日历未知不能推算工作日。源域名及HTTP超时/截止、1GiB/800MiB保护不变。
+窗口外/休市可manual请求。股票保留真实sourceTime/tradeDate，写入短临界区重检源时间不倒退，>15:00才确认收盘、不补历史点；市场/指数/ETF无可靠日期时tradeDate=null，仅快照及实际采集时间，成功或失败降级的日内series均为空，资金和价格曲线不加点，日历未知不能推算工作日。源域名及HTTP超时/截止、进程异常退出保护不变。
 
 ```bash
 curl -X POST http://127.0.0.1:8000/internal/etf-monitor/v1/dictionary \
@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:8000/internal/etf-monitor/v1/dictionary \
   -H 'X-Collection-Mode: manual'
 ```
 
-本轮以离线mock测试模式隔离、跨进程速率、风险/Redis/资源拒绝、预算/取消回收、并发曲线/报价/版本及窗口外语义。**真实源及1GiB Linux容器峰值未验证**：本机没有Docker运行环境，不安装运行时、不提高内存，也不使用生产Redis/Token测试。
+本轮以离线mock测试模式隔离、跨进程速率、风险/Redis/资源拒绝、预算/取消回收、并发曲线/报价/版本及窗口外语义。**真实源和Linux原生服务实际启停/日志/连通性未验证**：本机不运行目标systemd，也不使用生产Redis/Token测试。
 
 ## 即时个股分页修复与验证限制
 
@@ -158,7 +158,7 @@ curl -X POST http://127.0.0.1:8000/internal/etf-monitor/v1/dictionary \
 
 现仅对`stock_fund_flow_individual(symbol="即时")`、`data.10jqka.com.cn`准确`/funds/ggzjl/field/zdf/order/desc/page/{n}/ajax/1/free/1/`改为`field/code`；初始取页数请求不变，金额仍由原AKShare解析。行业/概念和3/5/10/20日参数不改。审计初始总页数、页序、非空页面、六位代码严格倒序、全批无重复及原始行数；分页响应若带page_info则核对，无该字段时按初始页数及请求顺序审计。源不支持稳定代码排序或出现缺页/重复/冲突时拒绝全批；不做最后值覆盖和不完整汇总。关键金额与有限聚合校验保持严格。
 
-离线mock固定AKShare真实解析覆盖多页/单位、精确改写范围、重复/排序/缺页/行数、关键金额以及资源/事件/缓存/调用次数。**本机没有Docker，1GiB受限Linux容器实测未执行，真实单轮未执行**；生产日志未提供OOM计数/证据，不宣称早退是OOM。后续仅在非生产、1GiB受限容器中最多单轮验证，不接生产Redis或Token，失败停止；记录cgroup总峰值、函数耗时、行数、业务校验及退出原因，不把离线通过等同源当前可用。
+离线mock固定AKShare真实解析覆盖多页/单位、精确改写范围、重复/排序/缺页/行数、关键金额以及资源/事件/缓存/调用次数。**目标Linux服务实测及真实单轮未执行**；不根据SIGKILL推断OOM。后续仅在已授权非生产环境最多单轮验证，不接生产Redis或Token，失败停止；记录函数耗时、行数、业务校验及退出原因，不把离线通过等同源当前可用。
 
 ## 只读业务数据的单源验证步骤
 

@@ -40,7 +40,7 @@ MESSAGES = {
     "disabled": "雪球采集总闸关闭",
     "missing_token": "雪球令牌未配置",
     "failed": "源刷新失败，原缓存已保留",
-    "resource": "采集资源不足，原数据已保留",
+    "resource": "采集源进程异常退出，原数据已保留",
 }
 
 

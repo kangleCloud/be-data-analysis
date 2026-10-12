@@ -12,7 +12,6 @@ import redis
 from app.runtime.gates import (ACQUIRE,RELEASE,RENEW,QUOTES_ENTRY_KEY,FUNDS_ENTRY_KEY,
                                collection_entry,check_entry)
 from app.runtime.source_execution import SourceCall,SourceExecutor,SourceControlError
-from app.runtime.resources import MEMORY_LIMIT_BYTES,SourceResourceError
 from app.market.collector import MarketCollector
 from app.market.snapshot import RedisSnapshotStore,SNAPSHOT_KEY,UPDATES_CHANNEL,FUND_SERIES_PREFIX
 from app.stock_monitor.service import ENABLED_KEY,MONITOR_UPDATES_CHANNEL
@@ -158,27 +157,6 @@ def test_actual_redis_watch_detects_lost_update_and_rebuilds(monkeypatch):
     assert store.load()['generatedAt']=='2026-10-09T10:01:00+08:00'
 
 
-def test_800mib_pressure_reaps_two_independent_term_ignoring_sources(monkeypatch):
-    backend=ControlRedis()
-    high=threading.Event()
-    monkeypatch.setattr('app.runtime.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES if high.is_set() else 0})
-    context=mp.get_context('spawn')
-    ready=[context.Event(),context.Event()]
-    sources=[SourceExecutor('redis://offline',client=backend,worker=ignore_term_worker) for _ in range(2)]
-    calls=[SourceCall('fake','ths',{'ready':ready[0]},900,cooldown_keys=('cool',)),
-           SourceCall('stock_fund_flow_individual','ths',{'symbol':'即时','ready':ready[1]},900,cooldown_keys=('cool',))]
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        pending=[pool.submit(source.call,call) for source,call in zip(sources,calls)]
-        assert all(event.wait(5) for event in ready)
-        assert backend.max_global==2 and backend.max_groups=={'ths':2}
-        high.set()
-        for result in pending:
-            with pytest.raises(SourceResourceError):
-                result.result(timeout=4)
-    assert not any(child.is_alive() for child in mp.active_children())
-    assert backend.metrics()[-1]==[] and backend.get('cool') is None
-
-
 @pytest.mark.parametrize('cached',[False,True])
 def test_funds_read_calendar_without_quotes_entry_or_monthly_retry(flow_rows,market_rows,cached):
     from datetime import datetime
@@ -232,3 +210,23 @@ def test_manual_market_workflow_uses_both_locks_and_quote_job_can_coexist_with_f
     # 总闸关闭的行情任务无需资金入口，也不会创建XQ客户端。
     assert workflows.run_monitor(settings,backend)=='disabled'
     assert backend.get(QUOTES_ENTRY_KEY) is None and backend.get(FUNDS_ENTRY_KEY)=='other'
+
+
+def test_cancel_reaps_both_channels_and_releases_admission_without_cooling():
+    backend=ControlRedis()
+    context=mp.get_context('spawn')
+    ready=[context.Event(),context.Event()]
+    sources=[SourceExecutor('redis://offline',client=backend,worker=ignore_term_worker) for _ in range(2)]
+    calls=[SourceCall('fake','ths',{'ready':ready[0]},900,cooldown_keys=('cool',)),
+           SourceCall('stock_fund_flow_individual','ths',{'symbol':'即时','ready':ready[1]},900,cooldown_keys=('cool',))]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending=[pool.submit(source.call,call) for source,call in zip(sources,calls)]
+        assert all(event.wait(5) for event in ready)
+        assert backend.max_global==2 and backend.max_groups=={'ths':2}
+        for source in sources:
+            source.stop()
+        for result in pending:
+            with pytest.raises(SourceControlError):
+                result.result(timeout=4)
+    assert not any(child.is_alive() for child in mp.active_children())
+    assert backend.metrics()[-1]==[] and backend.get('cool') is None

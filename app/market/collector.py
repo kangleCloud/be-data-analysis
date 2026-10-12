@@ -222,8 +222,8 @@ class MarketCollector:
                     except SourceResourceError as exc:
                         resource_failed = True
                         failures += 1
-                        LOGGER.warning("模块 %s 资源失败 reason=%s memory=%s exitcode=%s",key,exc.reason,exc.state,exc.exitcode)
-                        modules[key] = _fallback(key,old_modules.get(key),timestamp,"采集资源不足或源进程退出，保留上次有效数据")
+                        LOGGER.warning("模块 %s 资源失败 reason=%s exitcode=%s",key,exc.reason,exc.exitcode)
+                        modules[key] = _fallback(key,old_modules.get(key),timestamp,"采集源进程退出，保留上次有效数据")
                     except SourceNotStartedError:
                         failures += 1
                         LOGGER.info("模块 %s 预算结束，未发起源请求", key)

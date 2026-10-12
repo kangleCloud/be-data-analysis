@@ -215,7 +215,7 @@ class EtfCollector:
                 del rows
             except SourceResourceError as exc:
                 resource_failed = True
-                LOGGER.warning("ETF资源失败 reason=%s memory=%s exitcode=%s",exc.reason,exc.state,exc.exitcode)
+                LOGGER.warning("ETF资源失败 reason=%s exitcode=%s",exc.reason,exc.exitcode)
                 quotes, failed = {}, len(symbols)
             except SourceNotStartedError:
                 cooling = True

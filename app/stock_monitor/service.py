@@ -332,7 +332,7 @@ class StockMonitorSampler:
                     except SourceResourceError as exc:
                         resource_failed = True
                         failures += 1
-                        LOGGER.warning("雪球资源失败 reason=%s memory=%s exitcode=%s",exc.reason,exc.state,exc.exitcode)
+                        LOGGER.warning("雪球资源失败 reason=%s exitcode=%s",exc.reason,exc.exitcode)
                         self._mark_failed(symbol,local)
                         return "resource"
                     except SourceThrottledError as exc:

@@ -175,16 +175,6 @@ def test_manual_redis_failure_stops_before_spawn():
         executor.call(SourceCall('fake','ths',mode='manual'))
 
 
-def test_manual_memory_pressure_stops_without_cooling(monkeypatch):
-    backend=ControlRedis()
-    def fail():
-        raise SourceResourceError('MEMORY_PRESSURE',state={'currentBytes':800*1024**2})
-    monkeypatch.setattr('app.runtime.source_execution.check_memory',fail)
-    with pytest.raises(SourceResourceError):
-        SourceExecutor('redis://offline',client=backend,mode='manual',worker=frame_worker).call(SourceCall('fake','ths',mode='manual'))
-    assert not any('cooldown' in key or 'risk:' in key or 'slot:' in key for key in backend.values)
-
-
 @pytest.mark.parametrize('stop_one', [False,True])
 def test_concurrent_manual_batches_have_independent_cancellation_and_reap(stop_one):
     backend=ControlRedis();ready=mp.get_context('spawn').Event()
@@ -436,20 +426,6 @@ def test_spawn_auto_and_manual_actual_http_starts_share_redis_rate_without_manua
                     parent.kill()
                 parent.join(timeout=2)
             queue.close()
-
-
-def test_manual_pressure_after_spawn_reaps_term_ignoring_child_without_auto_key_pollution(monkeypatch):
-    from app.runtime.resources import MEMORY_LIMIT_BYTES
-    backend=ControlRedis();ready=mp.get_context('spawn').Event();high=threading.Event()
-    monkeypatch.setattr('app.runtime.resources.memory_state',lambda:{'currentBytes':MEMORY_LIMIT_BYTES if high.is_set() else 0})
-    executor=SourceExecutor('redis://offline',client=backend,mode='manual',worker=ignore_term_worker)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pending=pool.submit(executor.call,SourceCall('fake','ths',{'ready':ready},budget_seconds=900,mode='manual'))
-        assert ready.wait(5);high.set()
-        with pytest.raises(SourceResourceError):
-            pending.result(timeout=4)
-    assert not any(child.is_alive() for child in mp.active_children())
-    assert not any('risk:' in key or ':ordinary' in key or ':slot:' in key for key in backend.values)
 
 
 def test_manual_redis_loss_after_spawn_reaps_child(monkeypatch):

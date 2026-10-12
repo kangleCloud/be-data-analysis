@@ -98,7 +98,7 @@ def create_monitor_router(
         except HTTPException:
             raise
         except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except Exception as exc:
             LOGGER.warning("交易所股票字典同步失败，异常 %s", type(exc).__name__)
             raise HTTPException(status_code=502, detail="交易所股票字典同步失败") from exc
@@ -169,7 +169,7 @@ def create_monitor_router(
         except (SourceThrottledError,SourceCoolingError) as exc:
             raise HTTPException(status_code=429,detail='源保护或请求间隔未满足') from exc
         except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集资源不足'}) from exc
+            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except XueqiuSourceError as exc:
             if exc.cooldown:
                 store.start_cooldown()
