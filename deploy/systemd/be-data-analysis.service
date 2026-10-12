@@ -7,17 +7,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=be-data-analysis
-Group=be-data-analysis
+User=root
+Group=root
 WorkingDirectory=/data/content/be-data-analysis
 Environment=APP_ENV=prod
-Environment=SERVICE_PORT=18801
-Environment=TZ=Asia/Shanghai
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=OPENBLAS_NUM_THREADS=1
-Environment=OMP_NUM_THREADS=1
-Environment=MKL_NUM_THREADS=1
 ExecStart=/data/content/be-data-analysis/.venv/bin/python -m app serve
 Restart=on-failure
 RestartSec=5

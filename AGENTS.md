@@ -41,4 +41,4 @@ Redis 密码等秘密只能通过环境变量注入，不得提交真实值或�
 
 ## 原生部署
 
-Linux systemd部署文件位于`deploy/systemd/`，说明为`docs/native-systemd-deployment.md`。默认`/data/content/be-data-analysis`，默认专用账号运行，支持RUN_USER选择root或其他账号，目标重新创建Python3.12虚拟环境，仅安装生产依赖；APP_ENV=prod沿用私有.env.prod，虚拟IP由部署填写，原生端口18801。stdout/stderr追加现有service.log，不新增Python文件handler。Docker入口保留，先停旧实例再启新实例；不在开发会话执行服务器命令。
+Linux systemd部署文件位于`deploy/systemd/`，说明为`docs/native-systemd-deployment.md`。默认`/data/content/be-data-analysis`，默认root运行，其他账号直接修改unit与日志轮转账号，使用目标已有Python3.12虚拟环境，仅安装生产依赖；systemd仅保留APP_ENV=prod和日志无缓冲变量，业务配置统一沿用私有.env.prod，虚拟IP由部署填写，原生端口18801。stdout/stderr追加现有service.log，不新增Python文件handler。Docker入口保留，先停旧实例再启新实例；不在开发会话执行服务器命令。

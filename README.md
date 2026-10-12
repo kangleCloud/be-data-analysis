@@ -4,7 +4,7 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 
 ## 部署方式
 
-- Linux原生systemd：参见[安装、虚拟IP配置、日志与回退](docs/native-systemd-deployment.md)，默认`/data/content/be-data-analysis`，原生端口18801，目标主机重新创建Python3.12虚拟环境，仅安装生产依赖。
+- Linux原生systemd：参见[安装、虚拟IP配置、日志与回退](docs/native-systemd-deployment.md)，默认`/data/content/be-data-analysis`，原生端口18801，使用目标主机已有Python3.12虚拟环境，仅安装生产依赖。
 - Docker：保留现有Dockerfile、compose.yaml和deploy.sh，下面容器章节仍可使用。两种方式二选一，先停旧实例再启动新实例，防止重复调度。
 
 ## 环境
