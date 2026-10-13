@@ -84,7 +84,7 @@ def run_etf(settings: Settings, client: Any, *, at: datetime | None = None, mode
 
 
 def run_quotes(settings: Settings, client: Any, *, cancel=None) -> str:
-    """市场行情独立入口：指数/行业/概念最多两项在途，完成即发布。"""
+    """市场行情独立入口：指数/行业/概念最多三项在途，完成即发布。"""
     with collection_entry(client, cancel, lane='quotes') as acquired:
         return _market(settings, client, datetime.now(SHANGHAI), 'quotes') if acquired else 'locked'
 

@@ -27,8 +27,8 @@ from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 
 LOGGER = logging.getLogger(__name__)
 PREFIX = "stock:source-control:v1:"
-GLOBAL_LIMIT = 3
-SOURCE_LIMIT = 2
+GLOBAL_LIMIT = 6
+SOURCE_LIMITS = {"ths": 3, "xq": 3, "sina": 2, "sse": 2, "szse": 2, "bse": 2}
 LEASE_SECONDS = 30
 RENEW_SECONDS = 10
 CLEANUP_SECONDS = 2
@@ -60,7 +60,7 @@ if ARGV[4] ~= '' and redis.call('get', KEYS[5]) ~= ARGV[4] then return {-1,0} en
 for i=8+tonumber(ARGV[7]),#KEYS do if redis.call('exists', KEYS[i]) == 1 then return {-2,redis.call('ttl', KEYS[i])} end end
 local interval = tonumber(ARGV[5])
 local owner = interval > 0 and redis.call('get', KEYS[6]) or false
-if owner and owner ~= ARGV[1] then return {-3,redis.call('pttl', KEYS[6])} end
+if owner and owner ~= ARGV[8] then return {-3,redis.call('pttl', KEYS[6])} end
 if interval > 0 then
   for i=8,7+tonumber(ARGV[7]) do
     local batch_owner=redis.call('get',KEYS[i])
@@ -77,7 +77,7 @@ if interval > 0 and not owner then
   local previous=redis.call('get',KEYS[7])
   if previous then elapsed=now-tonumber(previous) end
   redis.call('set',KEYS[7],now,'EX',86400)
-  redis.call('set', KEYS[6], ARGV[1], 'EX', interval)
+  redis.call('set', KEYS[6], ARGV[8], 'EX', interval)
   for i=8,7+tonumber(ARGV[7]) do
     if not redis.call('get',KEYS[i]) then redis.call('set',KEYS[i],ARGV[4],'EX',interval) end
   end
@@ -154,9 +154,16 @@ class SourceControl:
 
     def acquire(self, group: str, token: str) -> tuple[str, str] | None:
         keys = [f"{PREFIX}slot:global:{i}" for i in range(GLOBAL_LIMIT)] + [
-            f"{PREFIX}slot:{group}:{i}" for i in range(SOURCE_LIMIT)]
+            f"{PREFIX}slot:{group}:{i}" for i in range(SOURCE_LIMITS[group])]
         result = self.client.eval(ACQUIRE_SCRIPT, len(keys), *keys, token, LEASE_SECONDS, GLOBAL_LIMIT)
         return (keys[result[0]-1], keys[result[1]-1]) if result else None
+
+    def release_extra(self, group: str, token: str) -> None:
+        # 源进程被TERM/KILL时，其分页线程来不及finally；回收后才清除额外名额。
+        keys = [f"{PREFIX}slot:global:{i}" for i in range(GLOBAL_LIMIT)] + [
+            f"{PREFIX}slot:{group}:{i}" for i in range(SOURCE_LIMITS[group])]
+        self.client.eval("for i=1,#KEYS do if redis.call('get',KEYS[i]) == ARGV[1] then redis.call('del',KEYS[i]) end end return 1",
+                         len(keys), *keys, token+":page")
 
     def renew(self, keys: tuple[str, str], token: str) -> None:
         if not self.client.eval(RENEW_SCRIPT, 2, *keys, token, LEASE_SECONDS):
@@ -175,7 +182,7 @@ class SourceControl:
             raise SourceControlError("业务任务锁已失效")
 
     def request_turn(self, call: SourceCall, keys: tuple[str, str] | None, token: str,
-                     guard: tuple[str, str] | None, deadline: float) -> None:
+                     guard: tuple[str, str] | None, deadline: float, *, sampling_token: str | None = None, first_request: bool = True) -> None:
         interval = 0.2 if call.group == "sina" else 1
         rate_keys = [f"{PREFIX}rate:{call.group}",
                      f"{PREFIX}rate:ths:fund" if call.fund_profile else f"{PREFIX}rate:{call.group}"]
@@ -189,7 +196,7 @@ class SourceControl:
                 raise TimeoutError("源调用预算已耗尽")
             result = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
                                              int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
-                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" else 0, call.mode, len(call.batch_interval_keys))
+                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" and first_request else 0, call.mode, len(call.batch_interval_keys), sampling_token or token)
             status, value = result[:2]
             if status == -1:
                 raise SourceControlError("源配额或业务锁已失效")
@@ -234,33 +241,56 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
     import requests
     original = requests.Session.send
     paging = IndividualPaging(call)
-    def send(session: Any, request: Any, **kwargs: Any) -> Any:
+    first_started = threading.Event()
+    paired = None
+
+    def physical_send(session, request, kwargs, *, quota_keys=keys, quota_token=token):
         if urlparse(request.url).hostname not in call.domains:
             raise SourceControlError("源请求域名不在审计清单中")
-        page = paging.prepare(request)
-        control.request_turn(call, keys, token, guard, deadline)
-        remaining = max(0.001, deadline - time.monotonic())
-        connect, read = bounded_timeout(kwargs.get("timeout"), read_seconds)
-        kwargs["timeout"] = (min(connect, remaining), min(read, remaining))
-        if call.fund_profile:
-            kwargs["allow_redirects"] = False
+        control.request_turn(call, quota_keys, quota_token, guard, deadline,
+                             sampling_token=token, first_request=not first_started.is_set())
+        first_started.set()
+        remaining = max(0.001, deadline-time.monotonic())
+        options = dict(kwargs)
+        connect, read = bounded_timeout(options.get("timeout"), read_seconds)
+        options["timeout"] = (min(connect, remaining), min(read, remaining))
+        if call.fund_profile or paging.enabled:
+            options["allow_redirects"] = False
         try:
             if started_event is not None:
                 started_event.set()
-            response = original(session, request, **kwargs)
+            response = original(session, request, **options)
             response.raise_for_status()
-            paging.response(page,response)
             return response
         except SourceResourceError:
             raise
         except Exception as exc:
             control.cool(call, error_metadata(exc))
             raise
+
+    if paging.enabled:
+        from app.providers.ths_parallel import PairedIndividualPages
+        paired = PairedIndividualPages(paging, physical_send, control, call, keys, token, guard, deadline)
+
+    def send(session: Any, request: Any, **kwargs: Any) -> Any:
+        page = paging.prepare(request)
+        response = paired.send(page, session, request, kwargs) if paired is not None else physical_send(session, request, kwargs)
+        try:
+            paging.response(page, response)
+        except Exception as exc:
+            control.cool(call, error_metadata(exc))
+            raise
+        return response
+
     requests.Session.send = send
     try:
         yield paging
     finally:
-        requests.Session.send = original
+        try:
+            if paired is not None:
+                paired.close()
+        finally:
+            requests.Session.send = original
 
 
 def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str] | None, token: str,
@@ -522,6 +552,8 @@ class SourceExecutor:
                 process.close()
             if queue is not None:
                 queue.close()
+            if call.function == "stock_fund_flow_individual" and call.parameters.get("symbol") == "即时" and self.mode == "auto":
+                self.control.release_extra(call.group, token)
             if keys is not None:
                 self.control.release(keys, token)
             LOGGER.info("源 %s 总耗时 %.2f 秒 exitcode=%s",call.function,time.monotonic()-started,exitcode)
@@ -555,8 +587,10 @@ def source_batch(source: Any, guard: tuple[str, str] | None = None,
 
 
 def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any = None,
-              max_workers: int = 1) -> Iterator[tuple[str, Any, Exception | None, float]]:
-    """最多两项在途，完成即交付；仅调用父流程标准化和发布。"""
+              max_workers: int = 1, ready: Callable[[str], float] | None = None,
+              ready_deadline: float | None = None, on_skip: Callable[[str], None] | None = None,
+              ) -> Iterator[tuple[str, Any, Exception | None, float]]:
+    """最多三项在途；到期筛选和短等待在父流程进行，不占源配额。"""
     if max_workers == 1:
         for key, group, function in actions:
             executor = getattr(source, 'executor', None)
@@ -571,17 +605,22 @@ def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any
             else:
                 yield key, value, None, time.monotonic()
         return
-    if max_workers != 2:
-        raise ValueError("只支持串行或两项在途")
+    if max_workers not in {2, 3}:
+        raise ValueError("只支持一、二或三项在途")
     pending = {}
-    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='source-wait')
-    actions = iter(actions)
+    waiting = list(actions)
+    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='source-wait')
+    wait_logged = False
+    eligible = set()
+    first_scan = True
 
     def submit_next():
-        try:
-            key, group, function = next(actions)
-        except StopIteration:
-            return
+        for index, (key, group, function) in enumerate(waiting):
+            if ready is None or (key in eligible and ready(key) <= time.monotonic()):
+                waiting.pop(index)
+                break
+        else:
+            return False
         isolated = copy(source)
         parent = getattr(source, 'executor', None)
         executor = parent.fork() if parent is not None else None
@@ -597,19 +636,50 @@ def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any
             except Exception as exc:
                 return key, None, exc, time.monotonic()
             return key, value, None, time.monotonic()
-        # 每次提交使用独立Context，继承当前入口租约而非重新抢锁。
         future = pool.submit(copy_context().run, invoke)
         pending[future] = executor
+        return True
 
     try:
-        submit_next()
-        submit_next()
-        while pending:
-            ready, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in ready:
-                pending.pop(future)
-                yield future.result()
-                submit_next()
+        while waiting or pending:
+            check_entry()
+            parent = getattr(source, 'executor', None)
+            if parent is not None:
+                parent._check()
+            now = time.monotonic()
+            if ready is not None:
+                # 记录60秒内到期的项，即使三个并发位一直忙也不丢失其资格。
+                for key, _, _ in waiting:
+                    if first_scan or ready_deadline is None or now <= ready_deadline:
+                        due_at = ready(key)
+                        if ready_deadline is None or due_at <= ready_deadline or (first_scan and due_at <= now):
+                            eligible.add(key)
+                        else:
+                            eligible.discard(key)
+                if ready_deadline is not None and now > ready_deadline:
+                    skipped = [item for item in waiting if item[0] not in eligible]
+                    waiting = [item for item in waiting if item[0] in eligible]
+                    for key, _, _ in skipped:
+                        if on_skip is not None:
+                            on_skip(key)
+            first_scan = False
+            while len(pending) < max_workers and submit_next():
+                pass
+            if pending:
+                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    yield future.result()
+            elif waiting:
+                if ready_deadline is None or time.monotonic() >= ready_deadline:
+                    for key, _, _ in waiting:
+                        if on_skip is not None:
+                            on_skip(key)
+                    break
+                if not wait_logged:
+                    LOGGER.info("父流程等待股票到期 remainingBudget=%.2f",ready_deadline-time.monotonic())
+                    wait_logged = True
+                time.sleep(min(0.1, max(0, ready_deadline-time.monotonic())))
     finally:
         for future, executor in pending.items():
             if executor is not None:

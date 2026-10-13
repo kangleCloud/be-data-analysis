@@ -272,7 +272,7 @@ class MarketCollector:
 
     def _results(self, actions):
         # 全市场资金分页保持串行；完整刷新先交付行情，再执行同批资金汇总。
-        with closing(completed(actions, source=self._provider, max_workers=2)) as results:
+        with closing(completed(actions, source=self._provider, max_workers=3)) as results:
             yield from results
         if "marketFundFlow" in self.module_keys:
             def funds():

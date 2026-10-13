@@ -23,6 +23,19 @@ Java 将已启用列表写入 `stock:etf-monitor:v1:enabled`，值为按显示�
 - `items` 包含 `symbol/code/name/market`、`quote`、`priceSeries`、`fundSeries`。`quote.status` 为 `FRESH` 或 `STALE`；失败保留上次有效价格并标记 `STALE`，无历史数据时 `quote:null`。`quote.sourceTime:null`，公开视图的 `closeConfirmed:false`；不可根据 15:00 后的采集时间推断收盘确认。
 - `fundSeries:[]`、`fundFlowStatus:"NO_RELIABLE_SOURCE"` 表示没有可靠的 ETF 资金流数据。不能以份额或基金净值伪造资金流及交易价格。
 
+ETF `quote` 的六项价格指标复用同一次新浪全表采集，随现有快照及事务通知一起发布，不增加逐ETF请求：
+
+| 字段 | 新浪字段 | 单位 |
+| --- | --- | --- |
+| `previousClose` | 昨收 | 元 |
+| `open` | 今开 | 元 |
+| `high` | 最高 | 元 |
+| `low` | 最低 | 元 |
+| `buyPrice` | 买入 | 元 |
+| `sellPrice` | 卖出 | 元 |
+
+`buyPrice`、`sellPrice`缺失、无效或小于等于零时为`null`，不影响有效最新价的发布。Python存储与传输不四舍五入，UI统一显示三位小数；不新增涨停价、跌停价或估算均价。V1路径、Redis业务键、REST全量与SSE补丁、120秒采集、180秒断线及现有配额保持不变。
+
 ## 内部同步接口
 
 所有接口使用 `X-Internal-Token`。`POST /internal/etf-monitor/v1/dictionary` 返回新浪 ETF 字典。`POST /internal/etf-monitor/v1/profiles` 只接收 `{ "symbols":["SH510050"] }`，最多 10 个不重复代码；旧 `asOfDate` 字段返回 422。资料不受雪球总闸控制，不加入 120 秒行情采集。

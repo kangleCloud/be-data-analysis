@@ -5,7 +5,7 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 ## 部署方式
 
 - Linux原生systemd：参见[安装、虚拟IP配置、日志与回退](docs/native-systemd-deployment.md)，默认`/data/content/be-data-analysis`，原生端口18801，使用目标主机已有Python3.12虚拟环境，仅安装生产依赖。
-- Docker：保留现有Dockerfile、compose.yaml和deploy.sh，下面容器章节仍可使用。两种方式二选一，先停旧实例再启动新实例，防止重复调度。
+- Docker：使用Dockerfile、compose.yaml和`deploy/deploy.sh`。两种方式二选一，先停旧实例再启动新实例，防止重复调度。
 
 ## 环境
 
@@ -14,12 +14,24 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 - 本地开发与测试：`pip install -r requirements-dev.txt`；生产镜像只安装 `requirements.txt` 中的运行依赖
 - 配置参考 `.env.example`。本地默认读取被 Git 忽略的 `.env.dev`；`APP_ENV=prod` 选择 `.env.prod`。运行时环境变量覆盖文件配置，文件中的密码不作变量展开
 
+业务配置统一写入对应的 `.env` 文件，无需 `install.sh` 或手动 `source`。已进入 `.venv` 后，安装依赖并运行上述命令即可。
+
+| 配置项 | 用途 |
+| --- | --- |
+| `REDIS_URL`、`REDIS_PASSWORD`、`REDIS_PORT`、`REDIS_DB` | Redis 地址、密码、端口和库 |
+| `SOURCE_TIMEOUT_SECONDS`、`REDIS_LOCK_SECONDS` | 源请求读取超时和采集锁有效期 |
+| `STOCK_MONITOR_XQ_ENABLED`、`XUEQIU_TOKEN` | 雪球开关和访问令牌 |
+| `STOCK_MONITOR_INTERNAL_TOKEN` | 内部接口鉴权令牌 |
+| `SERVICE_HOST`、`SERVICE_PORT`、`SERVICE_LOG_LEVEL` | 服务监听地址、端口和日志级别 |
+
+部署层只负责 `APP_ENV=prod` 及 Python 日志无缓冲输出，不重复设置业务配置或数值库线程变量。构建配置不预设代理地址。
+
 ```bash
 python -m app collect
 python -m app serve
 ```
 
-`serve` 启动健康接口与内置调度：个股、ETF、市场行情、资金各自独立120秒周期，同任务不重叠、不积压或补跑。AUTO全局最多3个源进程、同来源2个；个股和市场行情各最多两项在途，ETF全表及资金分页按原业务复用。详见[采样调度与并发](docs/sampling-scheduling.md)。北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。CLI `collect` 使用 auto，可在采集窗口内主动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
+`serve` 启动健康接口与内置调度：个股、ETF、市场行情、资金各自独立120秒周期，同任务不重叠、不积压或补跑。AUTO全局最多6个源名额，THS/XQ各3个、SINA/交易所各2个；个股和市场行情各最多三项在途，ETF全表及资金分页按原业务复用。详见[采样调度与并发](docs/sampling-scheduling.md)。北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。CLI `collect` 使用 auto，可在采集窗口内主动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
 
 交易日历通过 AKShare 新浪接口独立刷新后缓存在 Redis DB 2；启动时补建，每月 1 日北京时间 00:10 常规刷新，失败自动重试每天最多一次。缓存未覆盖当天时不会凭工作日推断交易日，市场快照降级、个股跳过。`python -m app calendar-refresh` 可手动触发受限频保护的自动刷新。受保护的同步手动任务接口见 [交易日历与内部任务 V1](docs/trading-calendar-jobs-v1.md)。
 
@@ -38,7 +50,7 @@ curl -f http://127.0.0.1:18801/health
 tail -f /data/logs/be-data-analysis/service.log
 ```
 
-`compose.yaml` 将宿主机 `/data/logs/be-data-analysis/` 挂载到容器 `/app/logs/`。服务与定时采集子进程的标准输出、错误和 Uvicorn 日志都写入 `service.log`。容器以 UID/GID 10001 运行，因此宿主机日志目录须对该用户可写。应用端口映射为宿主机 18801 到容器 8000；`compose.yaml` 中的 `SERVICE_PORT` 固定容器监听端口为 8000。查看服务状态用 `docker compose ps`，重启用 `docker compose restart`。
+`compose.yaml` 将宿主机 `/data/logs/be-data-analysis/` 挂载到容器 `/app/logs/`。服务与定时采集子进程的标准输出、错误和 Uvicorn 日志都写入 `service.log`。容器以 UID/GID 10001 运行，因此宿主机日志目录须对该用户可写。应用端口映射为宿主机 18801 到容器 8000；容器部署时在 `.env.prod` 中配置 `SERVICE_HOST=0.0.0.0`、`SERVICE_PORT=8000`，原生部署则使用专用样例的虚拟IP和18801端口。查看服务状态用 `docker compose ps`，重启用 `docker compose restart`。
 
 生产镜像不安装 `pytest/httpx` 测试依赖，测试目录也不进入构建上下文。修改 `.env.prod` 后执行 `docker compose up -d` 重新创建容器以加载新配置；`restart` 不重新读取 env 文件。
 
@@ -46,9 +58,9 @@ tail -f /data/logs/be-data-analysis/service.log
 
 重叠运行由 Redis 锁阻止。市场普通网络、读取超时、解析或数据校验失败只暂停失败模块五分钟；明确403/429或有证据的风控拒绝才暂停共享源两小时；ETF 普通网络、超时、格式及标准化错误冷却五分钟。冷却跳过只记录 INFO 和剩余 TTL，不续期、不访问源站、不新增曲线点，已有有效数据保留为 STALE。
 
-源进程异常退出不触发源冷却，超时/取消仍TERM/KILL并回收。一个服务父进程启动个股、ETF、市场行情、资金四个独立120秒周期，各任务不重叠、不积压、不补跑。个股最多两只、指数/行业/概念最多两项在途；资金分页串行，ETF一次全表。
+源进程异常退出不触发源冷却，超时/取消仍TERM/KILL并回收。一个服务父进程启动个股、ETF、市场行情、资金四个独立120秒周期，各任务不重叠、不积压、不补跑。个股最多三只、指数/行业/概念最多三项在途；即时资金页数发现串行、相邻页最多两路，ETF一次全表。
 
-四个采集入口为`stock:source-control:v1:entry:{monitor,etf,quotes,funds}`，日历使用calendar入口、交易所字典使用reference入口；股票资料与报价共用monitor，ETF资料/字典/资产配置共用etf。原完整market刷新原子获取quotes/funds，忙时立即locked/409。AUTO源调用共用全局3路/同来源2路配额；租约30秒/每10秒续租，HTTP间隔、冷却、源超时不变。资金只读有效日历缓存，UNKNOWN时降级，由独立日历任务补建。
+四个采集入口为`stock:source-control:v1:entry:{monitor,etf,quotes,funds}`，日历使用calendar入口、交易所字典使用reference入口；股票资料与报价共用monitor，ETF资料/字典/资产配置共用etf。原完整market刷新原子获取quotes/funds，忙时立即locked/409。AUTO源调用共用全局6路/THS及XQ各3路/SINA及交易所各2路配额；租约30秒/每10秒续租，HTTP间隔、冷却、源超时不变。资金只读有效日历缓存，UNKNOWN时降级，由独立日历任务补建。
 
 每模块/每股完成立即发布。市场快照采用WATCH/MULTI/EXEC，只合并本次变化模块；首次尝试后最多3次冲突重试，每次重新读最新快照/版本。资金点、股票版本与通知仍在原监控锁及同一事务中，失败变化通知不造点。控制Redis或业务发布失败停止后续处理。详见[执行控制与源验证](docs/source-health-check.md)。
 
@@ -70,7 +82,7 @@ tail -f /data/logs/be-data-analysis/service.log
 
 内部 POST 先验证 `X-Internal-Token`，再验证 `X-Collection-Mode`：缺省为 `auto`，仅接受精确的 `auto`、`manual`，其他值返回400。四种 jobs 刷新、股票/ETF字典和资料以及ETF资产配置均支持，同步返回原响应，不新增jobId。Java只有八个scheduler本机回环POST明确发送manual；admin、定时与CLI保持auto。
 
-manual每请求独立执行器，个股/市场行情最多两项在途，其他批次仍串行，跳过采集任务/入口锁、全局及分组源配额、普通故障冷却、120秒/单股/资料1800秒/日历刷新间隔。manual成功与普通失败不读取、写入或续期AUTO普通冷却/间隔/采集锁。
+manual每请求独立执行器，个股/市场行情最多三项在途，其他批次仍串行，跳过采集任务/入口锁、全局及分组源配额、普通故障冷却、120秒/单股/资料1800秒/日历刷新间隔。manual成功与普通失败不读取、写入或续期AUTO普通冷却/间隔/采集锁。
 
 两模式共享每次物理HTTP启动间隔：THS≥1秒、THS资料≥2秒、新浪≥0.2秒、雪球/交易所≥1秒；保留401/403/429及确认风控、雪球总闸/Token、最多10只监控、源超时/批次截止/TERM/KILL回收、异常进程退出分类及Redis失败停止。普通冷却使用原适用键加`:ordinary`，确认风控使用`stock:source-control:v1:risk:{group}`，值包含原因。原因未知的旧冷却键两模式均等待自然过期，不按TTL猜测原因、不自动删除。
 

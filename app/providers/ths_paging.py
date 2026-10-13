@@ -19,13 +19,21 @@ class IndividualPaging:
 
     def prepare(self, request):
         url = urlsplit(request.url)
-        if not self.enabled or url.hostname != 'data.10jqka.com.cn':
+        if not self.enabled:
             return None
+        if (url.hostname != 'data.10jqka.com.cn' or request.method != 'GET'
+                or url.scheme not in {'http','https'} or url.query or url.fragment
+                or url.username or url.password or url.port not in {None,80,443}):
+            self.fail('UNEXPECTED_PAGE_PATH')
         if url.path == INITIAL:
+            if self.total is not None:
+                self.fail('REPEATED_PAGE_COUNT')
             return 0
         match = PAGE.fullmatch(url.path)
         if not match:
-            return None
+            self.fail('UNEXPECTED_PAGE_PATH')
+        if int(match[2]) != self.next_page or self.total is None or int(match[2]) > self.total:
+            self.fail('MISSING_OR_OUT_OF_ORDER_PAGE')
         request.url = urlunsplit(url._replace(path=url.path.replace('/field/zdf/','/field/code/')))
         return int(match[2])
 
@@ -58,7 +66,7 @@ class IndividualPaging:
                 if not cells:
                     continue
                 code = cells[1].get_text(strip=True) if len(cells) > 1 else ''
-                if not re.fullmatch(r'\d{1,6}',code):
+                if not re.fullmatch(r'[0-9]{1,6}',code):
                     self.fail('INVALID_PAGE_CODE')
                 codes.append(code.zfill(6))
         if not codes:

@@ -289,17 +289,26 @@ class StockMonitorSampler:
                 symbol = stock["symbol"]
                 if close_retry and self._close_confirmed(symbol, local.date()):
                     continue
-                if self.mode == "auto" and getattr(self.source, "executor", None) is None and not self.store.reserve_request(symbol):
-                    if close_retry:
-                        self._mark_failed(symbol, local)
-                    continue
                 def fetch(provider, code: str = symbol) -> dict[str, Any]:
                     if self.store.cooldown_active():
                         raise SourceCoolingError(self.store.client.ttl(XQ_COOLDOWN_KEY))
+                    if self.mode == "auto" and getattr(provider, "executor", None) is None and not self.store.reserve_request(code):
+                        raise SourceThrottledError(self.store.client.ttl(f"{LAST_REQUEST_PREFIX}{code}"))
                     return provider.quote(code)
                 candidates.append((symbol, "xq", fetch))
+            def due(symbol):
+                ttl = self.store.client.pttl(f"{LAST_REQUEST_PREFIX}{symbol}")
+                now = time.monotonic()
+                return now if ttl in {-2, 0} else float("inf") if ttl == -1 else now+ttl/1000
+            def skip(symbol):
+                LOGGER.info("股票到期等待结束 symbol=%s remainingMs=%d", symbol,
+                            self.store.client.pttl(f"{LAST_REQUEST_PREFIX}{symbol}"))
+                if close_retry:
+                    self._mark_failed(symbol, local)
             with source_batch(self.source, (SAMPLE_LOCK_KEY, token) if self.mode == "auto" else None, started+300), closing(
-                completed(candidates, source=self.source, max_workers=2)
+                completed(candidates, source=self.source, max_workers=3,
+                          ready=due if self.mode == "auto" else None,
+                          ready_deadline=min(started+60, started+300), on_skip=skip)
             ) as results:
                 for symbol, raw, error, finished_at in results:
                     if self.mode == "auto" and self.store.client.get(SAMPLE_LOCK_KEY) != token:

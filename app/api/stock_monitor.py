@@ -15,11 +15,11 @@ from pydantic import BaseModel
 
 from app.core.config import Settings
 from app.runtime.mode import collection_mode
-from app.runtime.source_execution import SourceExecutor, completed, source_batch, SourceBusyError, SourceThrottledError, SourceCoolingError
+from app.runtime.source_execution import SourceExecutor, completed, source_batch, SourceBusyError, SourceThrottledError, SourceCoolingError, SourceControlError
 from app.runtime.gates import collection_entry
 from app.runtime.resources import SourceResourceError
 from app.stock_monitor.service import SAMPLE_LOCK_KEY
-from app.providers.exchange_stocks import ExchangeStockProvider
+from app.providers.exchange_stocks import ExchangeStockProvider, log_dictionary_failure
 from app.providers.xueqiu import XueqiuProvider, XueqiuSourceError
 from app.stock_monitor.service import MonitorStore, normalize_profile, valid_symbol
 
@@ -84,26 +84,38 @@ def create_monitor_router(
     ) -> dict[str, Any]:
         authorize(x_internal_token)
         mode = collection_mode(x_collection_mode)
-        source = exchange_factory() if exchange_factory else ExchangeStockProvider(
-            settings.source_timeout_seconds,
-            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
-            mode=mode,
-        )
-        store = new_store()
+        started = time.monotonic()
+        store = None
         try:
+            store = new_store()
+            source = exchange_factory() if exchange_factory else ExchangeStockProvider(
+                settings.source_timeout_seconds,
+                executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds,
+                                        client=store.client, lane="reference", mode=mode),
+                mode=mode,
+            )
             with collection_entry(store.client, lane="reference", mode=mode) as entered:
                 if not entered:
-                    raise HTTPException(status_code=409,detail='采集入口忙碌')
-                return {"schemaVersion":1,"stocks":source.all_a_stocks()}
+                    raise SourceBusyError('采集入口忙碌')
+                stocks = source.all_a_stocks()
+                LOGGER.info("交易所字典完成 phase=batch rows=%d elapsed=%.2f",len(stocks),time.monotonic()-started)
+                return {"schemaVersion":1,"stocks":stocks}
         except HTTPException:
             raise
-        except SourceResourceError as exc:
-            raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
         except Exception as exc:
-            LOGGER.warning("交易所股票字典同步失败，异常 %s", type(exc).__name__)
+            log_dictionary_failure(LOGGER, exc, phase="batch", elapsed=time.monotonic()-started)
+            if isinstance(exc, SourceBusyError):
+                raise HTTPException(status_code=409,detail='采集入口忙碌') from exc
+            if isinstance(exc, (SourceCoolingError, SourceThrottledError)):
+                raise HTTPException(status_code=429,detail='交易所数据源冷却或请求间隔未满足') from exc
+            if isinstance(exc, SourceResourceError):
+                raise HTTPException(status_code=503,detail={'reason':'RESOURCE','message':'采集源进程异常退出'}) from exc
+            if isinstance(exc, (SourceControlError, redis.RedisError)):
+                raise HTTPException(status_code=503,detail='交易所字典采集控制不可用') from exc
             raise HTTPException(status_code=502, detail="交易所股票字典同步失败") from exc
         finally:
-            store.client.close()
+            if store is not None:
+                store.client.close()
 
     @router.post("/profiles", summary="刷新已监控股票雪球资料")
     def profiles(

@@ -17,7 +17,13 @@
 # print(fund_individual_detail_hold_xq_df)
 
 # 基金持仓
+# import akshare as ak
+#
+# fund_portfolio_hold_em_df = ak.fund_portfolio_hold_em(symbol="588000", date="2026")
+# print(fund_portfolio_hold_em_df)
+
+# 同花顺-个股资金流
 import akshare as ak
 
-fund_portfolio_hold_em_df = ak.fund_portfolio_hold_em(symbol="588000", date="2026")
-print(fund_portfolio_hold_em_df)
+stock_fund_flow_individual_df = ak.stock_fund_flow_individual(symbol="即时")
+print(stock_fund_flow_individual_df)

@@ -25,6 +25,12 @@ def _text(raw: Any) -> str | None:
     } else None
 
 
+def _bid_ask_price(raw: Any) -> float | None:
+    """买卖报价仅接受有限正数，缺失或零报价不补造。"""
+    value = _number(raw)
+    return value if value is not None and value > 0 else None
+
+
 def _date(raw: Any) -> str | None:
     if raw is None:
         return None
@@ -87,6 +93,8 @@ def quote_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "changePercent": _number(row.get("涨跌幅")),
             "previousClose": _number(row.get("昨收")), "open": _number(row.get("今开")),
             "high": _number(row.get("最高")), "low": _number(row.get("最低")),
+            "buyPrice": _bid_ask_price(row.get("买入")),
+            "sellPrice": _bid_ask_price(row.get("卖出")),
             "volume": _number(row.get("成交量")), "amount": _number(row.get("成交额")),
             "sourceTime": None, "closeConfirmed": False,
         }
