@@ -24,7 +24,10 @@ def ths_signature():
         js.eval(module._get_file_content_ths('ths.js'))
         return js.call('v')
     finally:
-        js.close()
+        # AKShare在Linux使用旧版py-mini-racer，其上下文由对象回收，不提供close。
+        close = getattr(js, 'close', None)
+        if callable(close):
+            close()
 
 
 class PairedIndividualPages:
