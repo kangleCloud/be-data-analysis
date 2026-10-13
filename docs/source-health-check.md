@@ -112,9 +112,9 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 
 ## 四任务执行控制与及时发布（AUTO）
 
-- 一个服务父进程、个股/ETF/市场行情/资金四条固定自动循环，各有独立执行器和取消状态；个股最多三只、指数/行业/概念最多三项在途，各自完成即发布。资金只取`stock_fund_flow_individual(symbol="即时")`，ETF一次新浪全表。各任务启动间隔≥120秒；跨任务并行，慢资金完成回收后按当前窗口接续，不阻塞行情、不重叠、不补历史点。普通模块失败只降级自身；Redis控制失败或源进程异常退出停止调用。
+- 一个服务父进程、个股/ETF/市场行情/资金四条固定自动循环，各有独立执行器和取消状态；个股最多三只、指数/行业/概念最多三项在途，各自完成即发布。完整市场优先提交资金及三项行情共四个候选，各自独立执行器并按完成顺序发布；资金只取`stock_fund_flow_individual(symbol="即时")`，ETF一次新浪全表。各任务启动间隔≥120秒；跨任务并行，慢资金完成回收后按当前窗口接续，不阻塞行情、不重叠、不补历史点。普通模块失败只降级自身；Redis控制失败或源进程异常退出停止调用。
 - 固定入口`stock:source-control:v1:entry:{monitor,etf,quotes,funds}`，日历为`:entry:calendar`，交易所字典为`:entry:reference`。CLI、默认/auto内部API和默认Provider均受控，源执行器沿业务入口取锁，不按函数硬编码到quotes。股票资料与报价共用monitor及原采样锁；ETF资料/字典/资产配置共用etf；同步完整market原子取得两个，否则立即locked/409且不留半把锁。令牌TTL30秒，每10秒续租；旧令牌不能删除新持有者。GET/SSE不取采集入口。
-- 全局`slot:global:{0..5}`最多6，THS/XQ组`slot:{ths|xq}:{0..2}`最多3，SINA/交易所组`slot:{sina|sse|szse|bse}:{0,1}`最多2，XQ含蛋卷。源进程回收后按令牌释放；子进程仅请求源/控制键，并转records释放DataFrame；服务父进程不导入AKShare/pandas。Session.send补丁仅在spawn源进程；会话/分页/重定向仍按原HTTP间隔、域名、源超时及冷却规则，仅固定即时资金相邻页最多两路，其他分页串行；失败不交付部分汇总。
+- 全局`slot:global:{0..5}`最多6，THS/XQ组`slot:{ths|xq}:{0..2}`最多3，SINA/交易所组`slot:{sina|sse|szse|bse}:{0,1}`最多2，XQ含蛋卷。源进程回收后按令牌释放；子进程仅请求源/控制键，并转records释放DataFrame；服务父进程不导入AKShare/pandas。Session.send补丁仅在spawn源进程；会话/分页/重定向仍按原HTTP间隔、域名、源超时及冷却规则，仅固定即时资金两页滑动窗口与两条通道各自独占持久Session，其他分页串行；失败不交付部分汇总。
 - 日历由独立calendar入口启动补建/月度循环维护。**资金只读当年合法、覆盖该日的缓存**；缺失/覆盖不足为UNKNOWN，只降级资金模块、不发日历HTTP、不跨占quotes入口、不消费日历AUTO_RETRY_KEY。缓存已覆盖但月刷新到期时，资金仍按有效日期判断，由日历/月度入口刷新。工作日不等同交易日，UNKNOWN/休市不请求业务源。
 - 每个行情模块只发布自身patch，不初始化或降级资金；资金只发布marketFundFlow，不修改指数/行业/概念。WATCH读取最新快照，再MULTI/EXEC合并本次模块；最多3次冲突重试（首次＋3次，共4次），每次重读base/version。冲突耗尽明确失败，保留其他已发布数据；模块各自时间保持真实，快照generatedAt不倒退。版本/市场通知同事务，连续previousSnapshotId链支持原REST全量＋SSE增量/缺口重同步。
 - 同一全市场资金批次生成汇总、宽度及启用≤10股票资金点，不逐股加请求。资金点只随成功发布一次；原monitor_event_lock序列化资金/报价的股票stateId事务。无新点但真实资金结果/日期/诊断变化仍通知当前启用股票；重试时间单独变化不重复发通知，不造点、不将报价/曲线落MySQL。
@@ -122,7 +122,7 @@ HTTP 连接上限5秒、读取默认15秒，由 `SOURCE_TIMEOUT_SECONDS` 控制�
 - 新浪ETF全表一次取回生成启用交易报价＋`dictionary-source`轻量全量字典，TTL86400，不永久保留原表、不缓存启用子集。AUTO字典优先合法上海当日缓存，否则一次源调用；MANUAL字典强制一次新浪全表源调用；写缓存失败属Redis故障而非源格式/冷却。ETF交易价不换净值；fundFlowStatus=NO_RELIABLE_SOURCE。资产配置状态仍由Java按MySQL报告/总闸生成，Python行情不推测报告状态。
 - 四个任务保留独立超时/取消及TERM/KILL/reap。源异常退出沿用RESOURCE分类而不触发源冷却，Redis失败独立终止。日志记录init/request/serialization耗时、退出码/信号及取消原因；SIGKILL不能直接认定OOM。
 - 资产配置固定detail.reason=RESOURCE/NO_DATA/DISABLED/SOURCE，忙409、冷却/间隔429、参数422、资源/关闭503、源/无数据502。NO_DATA仅真实空/指定期无有效类别；格式变化/未知错误SOURCE。不扫其他期、不重试。公开路径/schemaVersion/业务键及严格源时间>15:00收盘、15:02/04/06/08/10补收盘、雪球总闸不变。
-- 分包：api路由；runtime跨域工作流/配额/源执行/资源/四任务调度；providers源HTTP/THS分页/catalog；calendar、market、stock_monitor、etf_monitor各归领域。completed支持一、二或三项在途，其他资料/字典批次保持串行，不新增通用调度框架，没有legacy别名或新jobId。Python没有HTML渲染点，JSON/SSE保持结构化原文，不做所有字符串Filter/全局escape；实际展示和HTTP/HTTPS外链由渲染端防护，业务库不存转义文本。
+- 分包：api路由；runtime跨域工作流/配额/源执行/资源/四任务调度；providers源HTTP/THS分页/catalog；calendar、market、stock_monitor、etf_monitor各归领域。completed支持一至四项候选在途，完整市场优先提交资金及三项行情，其他资料/字典批次保持串行，不新增通用调度框架，没有legacy别名或新jobId。Python没有HTML渲染点，JSON/SSE保持结构化原文，不做所有字符串Filter/全局escape；实际展示和HTTP/HTTPS外链由渲染端防护，业务库不存转义文本。
 
 120秒门禁以首个实际HTTP启动计时，配额等待、初始化及短间隔等待均计入原预算。剩余间隔<=5秒当前调用等待，更长跳过；ETF不提前占轮次间隔。实现及临时离线验证见[采样调度与并发](sampling-scheduling.md)。
 

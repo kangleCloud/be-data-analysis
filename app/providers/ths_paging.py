@@ -2,6 +2,7 @@
 
 import logging
 import re
+import threading
 from urllib.parse import urlsplit, urlunsplit
 
 from app.market.normalize import SourceDataError
@@ -16,6 +17,15 @@ class IndividualPaging:
         self.enabled = call.function == 'stock_fund_flow_individual' and call.parameters.get('symbol') == '即时'
         self.total, self.next_page, self.last_code = None, 1, None
         self.codes, self.row_count = set(), 0
+        self.metrics_lock = threading.Lock()
+        self.metrics = {"requests": 0, "network": 0.0, "rateWait": 0.0,
+                        "intervalWait": 0.0, "audit": 0.0, "wrapper": 0.0}
+
+    def measure(self, **values):
+        if self.enabled:
+            with self.metrics_lock:
+                for key, value in values.items():
+                    self.metrics[key] += value
 
     def prepare(self, request):
         url = urlsplit(request.url)

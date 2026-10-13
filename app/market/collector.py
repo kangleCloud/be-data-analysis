@@ -182,6 +182,7 @@ class MarketCollector:
             throttled = 0
             resource_failed = False
             actions = [
+                ("marketFundFlow", "ths", lambda provider: provider.market_fund_flow()),
                 ("coreIndices", "sina", lambda provider: provider.index_spot()),
                 ("industrySectors", "ths", lambda provider: provider.sector_fund_flow("industry")),
                 ("conceptSectors", "ths", lambda provider: provider.sector_fund_flow("concept")),
@@ -205,6 +206,7 @@ class MarketCollector:
                     try:
                         if error:
                             raise error
+                        normalizing = clock.monotonic()
                         source_finished = (local + timedelta(seconds=finished_at-started)).isoformat(timespec="seconds")
                         if key in {"industrySectors", "conceptSectors"}:
                             data = normalize_sectors(frame, "industry" if key == "industrySectors" else "concept")
@@ -215,6 +217,7 @@ class MarketCollector:
                                 fund_points = {symbol: by_code[symbol[2:]] for symbol in selected if symbol[2:] in by_code}
                         else:
                             data = normalize_core_indices(frame, source_finished)
+                        LOGGER.info("模块 %s 标准化耗时 %.3f 秒", key, clock.monotonic()-normalizing)
                         modules[key] = {"status": "FRESH", "tradeDate": day, "tradeDateBasis": "CALENDAR",
                                         "lastSuccessAt": source_finished, "lastAttemptAt": timestamp,
                                         "message": None, "data": data}
@@ -271,17 +274,10 @@ class MarketCollector:
             LOGGER.info("采集总耗时 %.2f 秒", clock.monotonic() - started)
 
     def _results(self, actions):
-        # 全市场资金分页保持串行；完整刷新先交付行情，再执行同批资金汇总。
-        with closing(completed(actions, source=self._provider, max_workers=3)) as results:
+        # 完整刷新优先提交慢资金；真实源配额仍约束四个候选调用。
+        with closing(completed(actions, source=self._provider,
+                               max_workers=4 if self.lane == "market" else 3)) as results:
             yield from results
-        if "marketFundFlow" in self.module_keys:
-            def funds():
-                scopes = ("stock:market:v1:cooldown:ths", "stock:market:v1:cooldown:module:marketFundFlow")
-                ttl = remaining(self._store._client, scopes, "ths", self.mode)
-                if ttl is not None:
-                    raise SourceCoolingError(ttl)
-                return self._provider.market_fund_flow()
-            yield from completed([("marketFundFlow", "ths", funds)], source=self._provider)
 
     def _publish(
         self, token: str | None, timestamp: str, modules: dict[str, Any],
@@ -289,7 +285,10 @@ class MarketCollector:
     ) -> None:
         if self.mode == "auto" and not self._store.renew(token):
             raise RuntimeError("市场采集锁已失效，拒绝发布快照")
+        started = clock.monotonic()
         self._store.save({
             "schemaVersion": 1, "provider": "akshare",
             "generatedAt": timestamp, "modules": modules,
         }, trade_date=trade_date, fund_points=fund_points)
+        LOGGER.info("市场发布耗时 %.3f 秒 modules=%s", clock.monotonic()-started,
+                    ",".join(modules))

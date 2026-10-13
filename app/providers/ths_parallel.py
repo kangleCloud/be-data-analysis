@@ -1,4 +1,4 @@
-"""固定AKShare即时资金函数的相邻页传输适配；解析仍由原函数完成。"""
+"""固定AKShare即时资金的两页窗口；连接复用，解析仍由原函数完成。"""
 
 import importlib
 import importlib.metadata
@@ -6,17 +6,19 @@ import logging
 import re
 import threading
 import time
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-from app.runtime.source_execution import SourceControlError, RENEW_SECONDS
+from app.runtime.source_execution import SourceControl, SourceCall, SourceControlError, RENEW_SECONDS
+from app.providers.ths_paging import IndividualPaging
 
 LOGGER = logging.getLogger(__name__)
 
 
-def ths_signature():
+def ths_signature() -> str:
     """复用原AKShare的ths.js及MiniRacer流程，逐页生成hexin-v。"""
     module = importlib.import_module('akshare.stock_feature.stock_fund_flow')
     js = module.py_mini_racer.MiniRacer()
@@ -30,109 +32,156 @@ def ths_signature():
             close()
 
 
-class PairedIndividualPages:
-    def __init__(self, paging, send, control, call, keys, token, guard, deadline,
-                 *, signature_factory=ths_signature):
-        if call.group != 'ths':
-            raise SourceControlError('即时资金分页来源组必须为ths')
-        if importlib.metadata.version('akshare') != '1.18.97':
-            raise SourceControlError('资金分页适配仅支持AKShare 1.18.97')
+class SlidingIndividualPages:
+    """两条固定线程各独占一个Session；请求中和未消费响应合计最多两页。"""
+
+    def __init__(self, paging: IndividualPaging, send: Any, control: SourceControl,
+                 call: SourceCall, keys: tuple[str, str] | None, token: str,
+                 guard: tuple[str, str] | None, deadline: float,
+                 *, signature_factory=ths_signature) -> None:
+        if call.group != 'ths' or importlib.metadata.version('akshare') != '1.18.97':
+            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.18.97')
         self.paging, self.physical_send, self.control, self.call = paging, send, control, call
         self.keys, self.token, self.guard, self.deadline = keys, token, guard, deadline
         self.signature_factory = signature_factory
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ths-page')
+        self.pools = [ThreadPoolExecutor(max_workers=1, thread_name_prefix=f'ths-page-{lane}')
+                      for lane in range(2)]
+        self.sessions = [None, None]
         self.cancelled = threading.Event()
-        self.pending = None
-        self.pending_page = None
+        self.pending = {}
         self.last_response = None
+        self.extra_acquired = 0
+        self.quota_seconds = 0.0
+        self.peak_window = 0
+
+    @staticmethod
+    def _discard(response):
+        response.close()
+        response._content = b''
 
     def _retire_response(self):
         if self.last_response is not None:
-            # 下次原函数请求时，上页已由AKShare解析；清掉旧r仍引用的原始HTML。
-            self.last_response.close()
-            self.last_response._content = b''
+            # 原函数开始下一次请求时，上页已经解析，清除旧r仍引用的HTML。
+            self._discard(self.last_response)
             self.last_response = None
 
-    def _prefetch(self, request, options, keys, extra_token):
+    def _run(self, lane, request, options, keys, quota_token, sign):
         stop, failed = threading.Event(), threading.Event()
+        response = None
+
         def renew():
             while not stop.wait(RENEW_SECONDS):
                 try:
-                    self.control.check(keys, extra_token, self.guard)
+                    self.control.check(keys, quota_token, self.guard)
                     if keys is not None:
-                        self.control.renew(keys, extra_token)
+                        self.control.renew(keys, quota_token)
                 except Exception:
                     failed.set()
                     return
-        thread = threading.Thread(target=renew, daemon=True)
-        thread.start()
+
+        renewal = threading.Thread(target=renew, daemon=True) if lane == 1 else None
+        if renewal is not None:
+            renewal.start()
         try:
-            if self.cancelled.is_set() or time.monotonic() >= self.deadline:
-                raise SourceControlError('资金分页已取消或超过预算')
-            request.headers['hexin-v'] = self.signature_factory()
-            with requests.Session() as session:
-                response = self.physical_send(session, request, options, quota_keys=keys, quota_token=extra_token)
-            self.control.check(keys, extra_token, self.guard)
-            if self.cancelled.is_set() or failed.is_set() or time.monotonic() >= self.deadline:
-                response.close()
-                response._content = b''
+            self._check()
+            if sign:
+                request.headers['hexin-v'] = self.signature_factory()
+            if self.sessions[lane] is None:
+                self.sessions[lane] = requests.Session()
+            response = self.physical_send(self.sessions[lane], request, options,
+                                          quota_keys=keys, quota_token=quota_token, cancelled=self.cancelled)
+            self.control.check(keys, quota_token, self.guard)
+            self._check()
+            if failed.is_set():
                 raise SourceControlError('资金分页控制失效')
             return response
+        except BaseException:
+            if response is not None:
+                self._discard(response)
+            raise
         finally:
-            stop.set()
-            thread.join(timeout=1.2)
-            if keys is not None:
-                self.control.release(keys, extra_token)
+            if renewal is not None:
+                stop.set()
+                renewal.join(timeout=1.2)
+            if lane == 1 and keys is not None:
+                self.control.release(keys, quota_token)
 
-    def send(self, page, session, request, options):
-        self._retire_response()
+    def _check(self):
         if self.cancelled.is_set() or time.monotonic() >= self.deadline:
             raise SourceControlError('资金分页已取消或超过预算')
-        if self.pending is not None:
-            if page != self.pending_page:
+
+    def _submit(self, page, lane, request, options, *, sign):
+        keys, quota_token = self.keys, self.token
+        if lane == 1:
+            quota_token = self.token + ':page'
+            started = time.monotonic()
+            keys = self.control.acquire('ths', quota_token) if self.call.mode == 'auto' else None
+            self.quota_seconds += time.monotonic() - started
+            if self.call.mode == 'auto' and keys is None:
+                LOGGER.info('资金分页无额外配额，串行继续 page=%d', page)
+                return False
+            self.extra_acquired += int(keys is not None)
+        try:
+            prepared = request.copy()
+            if page:
+                url = urlsplit(prepared.url)
+                prepared.url = urlunsplit(url._replace(
+                    path=re.sub(r'/page/\d+/', f'/page/{page}/', url.path)))
+            future = self.pools[lane].submit(self._run, lane, prepared,
+                                            {**options, 'stream': False, 'allow_redirects': False},
+                                            keys, quota_token, sign)
+        except BaseException:
+            if lane == 1 and keys is not None:
+                self.control.release(keys, quota_token)
+            raise
+        self.pending[page] = (future, lane)
+        self.peak_window = max(self.peak_window, len(self.pending))
+        LOGGER.info('资金分页提交 page=%d channel=%d transport=%s window=%d',
+                    page, lane, 'parallel' if len(self.pending) == 2 else 'serial', len(self.pending))
+        return True
+
+    def send(self, page: int, session: requests.Session | None,
+             request: requests.PreparedRequest, options: dict[str, Any]) -> requests.Response:
+        self._retire_response()
+        self._check()
+        if page not in self.pending:
+            if self.pending:
                 self.paging.fail('MISSING_OR_OUT_OF_ORDER_PAGE')
-            future = self.pending
-            self.pending, self.pending_page = None, None
-            response = future.result()
-            LOGGER.info('资金分页按页交付 page=%d transport=paired',page)
-        else:
-            # 首页仅发现页数；每一对的前页走主调用，后页使用一个额外名额。
-            if page and page % 2 == 1 and page < self.paging.total:
-                extra_token = self.token+':page'
-                extra_keys = self.control.acquire('ths', extra_token) if self.call.mode == 'auto' else None
-                if self.call.mode == 'manual' or extra_keys is not None:
-                    prepared = request.copy()
-                    url = urlsplit(prepared.url)
-                    prepared.url = urlunsplit(url._replace(path=re.sub(r'/page/\d+/',f'/page/{page+1}/',url.path)))
-                    options = {**options, 'stream': False, 'allow_redirects': False}
-                    try:
-                        self.pending = self.pool.submit(self._prefetch, prepared, options, extra_keys, extra_token)
-                        self.pending_page = page+1
-                    except BaseException:
-                        if extra_keys is not None:
-                            self.control.release(extra_keys, extra_token)
-                        raise
-                    LOGGER.info('资金相邻页在途 pages=%d,%d signature=akshare-ths-js',page,page+1)
-                else:
-                    LOGGER.info('资金分页无额外配额，串行继续 page=%d',page)
-            response = self.physical_send(session, request, options)
+            self._submit(page, 0, request, options, sign=False)
+        # 消费前页后窗口空出一格；当前页即使尚未完成也可补下一页。
+        if page and page < self.paging.total and len(self.pending) < 2:
+            busy_lanes = {lane for _, lane in self.pending.values()}
+            lane = 1 if 0 in busy_lanes else 0
+            self._submit(page+1, lane, request, options, sign=True)
+        future, lane = self.pending[page]
+        response = future.result()
+        del self.pending[page]
         self.last_response = response
+        LOGGER.info('资金分页按页交付 page=%d channel=%d transport=%s buffered=%d',
+                    page, lane, 'parallel' if self.pending else 'serial', len(self.pending))
         return response
 
-    def close(self):
+    def _close_session(self, lane):
+        if self.sessions[lane] is not None:
+            self.sessions[lane].close()
+            self.sessions[lane] = None
+
+    def close(self) -> None:
         self.cancelled.set()
-        if self.pending is not None:
-            # 不取消已取得名额的工作项：让它执行finally后再退出。
-            self.pool.shutdown(wait=True)
-            if not self.pending.cancelled():
-                try:
-                    response = self.pending.result()
-                except Exception:
-                    pass
-                else:
-                    response.close()
-                    response._content = b''
-            self.pending = None
-        else:
-            self.pool.shutdown(wait=True)
+        # 不取消已获额外名额的工作项，保证其finally释放；Session在所属通道关闭。
+        closes = [pool.submit(self._close_session, lane) for lane, pool in enumerate(self.pools)]
+        for pool in self.pools:
+            pool.shutdown(wait=True)
+        for future, _ in self.pending.values():
+            try:
+                response = future.result()
+            except Exception:
+                pass
+            else:
+                self._discard(response)
+        self.pending.clear()
         self._retire_response()
+        for future in closes:
+            future.result()
+        LOGGER.info('资金分页窗口汇总 pages=%s extraAcquired=%d quotaWait=%.3f peakWindow=%d',
+                    self.paging.total, self.extra_acquired, self.quota_seconds, self.peak_window)

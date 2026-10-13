@@ -182,7 +182,8 @@ class SourceControl:
             raise SourceControlError("业务任务锁已失效")
 
     def request_turn(self, call: SourceCall, keys: tuple[str, str] | None, token: str,
-                     guard: tuple[str, str] | None, deadline: float, *, sampling_token: str | None = None, first_request: bool = True) -> None:
+                     guard: tuple[str, str] | None, deadline: float, *, sampling_token: str | None = None,
+                     first_request: bool = True, cancelled: threading.Event | None = None) -> tuple[float, float]:
         interval = 0.2 if call.group == "sina" else 1
         rate_keys = [f"{PREFIX}rate:{call.group}",
                      f"{PREFIX}rate:ths:fund" if call.fund_profile else f"{PREFIX}rate:{call.group}"]
@@ -191,31 +192,43 @@ class SourceControl:
                     f"{PREFIX}sample-time:{call.interval_key or call.function}",
                     *call.batch_interval_keys, *protected_keys(call.cooldown_keys, call.group, call.mode)]
         interval_wait_logged = False
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("源调用预算已耗尽")
-            result = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
-                                             int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
-                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" and first_request else 0, call.mode, len(call.batch_interval_keys), sampling_token or token)
-            status, value = result[:2]
-            if status == -1:
-                raise SourceControlError("源配额或业务锁已失效")
-            if status == -2:
-                raise SourceCoolingError(value)
-            if status == -3:
-                if value > 5000 or value <= 0:
-                    LOGGER.info("限频跳过 function=%s remainingMs=%d", call.function, value)
-                    raise SourceThrottledError(max(0, (value+999)//1000))
-                if not interval_wait_logged:
-                    LOGGER.info("限频等待 function=%s remainingMs=%d", call.function, value)
-                    interval_wait_logged = True
-                time.sleep(min(0.1, value/1000, max(0, deadline-time.monotonic())))
-                continue
-            if status == 1:
-                if len(result) > 2 and result[2] >= 0:
-                    LOGGER.info("有效HTTP采样间隔 function=%s seconds=%.3f", call.function, result[2]/1000)
-                return
-            time.sleep(min(0.1, value / 1000, max(0, deadline-time.monotonic())))
+        rate_wait = interval_wait = 0.0
+        try:
+            while True:
+                if cancelled is not None and cancelled.is_set():
+                    raise SourceControlError("资金分页已取消")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("源调用预算已耗尽")
+                result = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
+                                                 int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
+                                                 guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" and first_request else 0, call.mode, len(call.batch_interval_keys), sampling_token or token)
+                status, value = result[:2]
+                if status == -1:
+                    raise SourceControlError("源配额或业务锁已失效")
+                if status == -2:
+                    raise SourceCoolingError(value)
+                if status == -3:
+                    if value > 5000 or value <= 0:
+                        LOGGER.info("限频跳过 function=%s remainingMs=%d", call.function, value)
+                        raise SourceThrottledError(max(0, (value+999)//1000))
+                    if not interval_wait_logged:
+                        LOGGER.info("限频等待 function=%s remainingMs=%d", call.function, value)
+                        interval_wait_logged = True
+                    slept = time.monotonic()
+                    time.sleep(min(0.1, value/1000, max(0, deadline-time.monotonic())))
+                    interval_wait += time.monotonic()-slept
+                    continue
+                if status == 1:
+                    if len(result) > 2 and result[2] >= 0:
+                        LOGGER.info("有效HTTP采样间隔 function=%s seconds=%.3f", call.function, result[2]/1000)
+                    return rate_wait, interval_wait
+                slept = time.monotonic()
+                time.sleep(min(0.1, value / 1000, max(0, deadline-time.monotonic())))
+                rate_wait += time.monotonic()-slept
+        finally:
+            if rate_wait or interval_wait:
+                LOGGER.info("HTTP等待耗时 function=%s rateWait=%.3f intervalWait=%.3f",
+                            call.function, rate_wait, interval_wait)
 
     def cool(self, call: SourceCall, metadata: dict[str, Any]) -> None:
         keys = call.cooldown_keys if call.cooldown_policy in {"market", "etf"} else ()
@@ -242,14 +255,18 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
     original = requests.Session.send
     paging = IndividualPaging(call)
     first_started = threading.Event()
-    paired = None
+    sliding = None
 
-    def physical_send(session, request, kwargs, *, quota_keys=keys, quota_token=token):
+    def physical_send(session, request, kwargs, *, quota_keys=keys, quota_token=token, cancelled=None):
         if urlparse(request.url).hostname not in call.domains:
             raise SourceControlError("源请求域名不在审计清单中")
-        control.request_turn(call, quota_keys, quota_token, guard, deadline,
-                             sampling_token=token, first_request=not first_started.is_set())
+        waits = control.request_turn(call, quota_keys, quota_token, guard, deadline,
+                             sampling_token=token, first_request=not first_started.is_set(), cancelled=cancelled)
+        if waits is not None:
+            paging.measure(rateWait=waits[0], intervalWait=waits[1])
         first_started.set()
+        if cancelled is not None and cancelled.is_set():
+            raise SourceControlError("资金分页已取消")
         remaining = max(0.001, deadline-time.monotonic())
         options = dict(kwargs)
         connect, read = bounded_timeout(options.get("timeout"), read_seconds)
@@ -259,7 +276,12 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
         try:
             if started_event is not None:
                 started_event.set()
-            response = original(session, request, **options)
+            network_started = time.monotonic()
+            paging.measure(requests=1)
+            try:
+                response = original(session, request, **options)
+            finally:
+                paging.measure(network=time.monotonic()-network_started)
             response.raise_for_status()
             return response
         except SourceResourceError:
@@ -269,26 +291,40 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
             raise
 
     if paging.enabled:
-        from app.providers.ths_parallel import PairedIndividualPages
-        paired = PairedIndividualPages(paging, physical_send, control, call, keys, token, guard, deadline)
+        from app.providers.ths_parallel import SlidingIndividualPages
+        sliding = SlidingIndividualPages(paging, physical_send, control, call, keys, token, guard, deadline)
 
     def send(session: Any, request: Any, **kwargs: Any) -> Any:
-        page = paging.prepare(request)
-        response = paired.send(page, session, request, kwargs) if paired is not None else physical_send(session, request, kwargs)
+        wrapper_started = time.monotonic()
         try:
-            paging.response(page, response)
-        except Exception as exc:
-            control.cool(call, error_metadata(exc))
-            raise
-        return response
+            audit_started = time.monotonic()
+            try:
+                page = paging.prepare(request)
+            finally:
+                paging.measure(audit=time.monotonic()-audit_started)
+            response = sliding.send(page, session, request, kwargs) if sliding is not None else physical_send(session, request, kwargs)
+            audit_started = time.monotonic()
+            try:
+                paging.response(page, response)
+            except Exception as exc:
+                control.cool(call, error_metadata(exc))
+                raise
+            finally:
+                paging.measure(audit=time.monotonic()-audit_started)
+            return response
+        finally:
+            paging.measure(wrapper=time.monotonic()-wrapper_started)
 
     requests.Session.send = send
     try:
         yield paging
     finally:
         try:
-            if paired is not None:
-                paired.close()
+            if sliding is not None:
+                sliding.close()
+                LOGGER.info("资金HTTP汇总 pages=%s requests=%d rateWait=%.3f intervalWait=%.3f networkSum=%.3f audit=%.3f；并行通道耗时为累加值，不等于批次墙钟耗时",
+                            paging.total, paging.metrics["requests"], paging.metrics["rateWait"],
+                            paging.metrics["intervalWait"], paging.metrics["network"], paging.metrics["audit"])
         finally:
             requests.Session.send = original
 
@@ -331,12 +367,18 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
                 clear()
             fetched = time.monotonic()
             frame = function(**call.parameters)
-            LOGGER.info("源请求耗时 %.2f 秒", time.monotonic()-fetched)
+            function_seconds = time.monotonic()-fetched
+            LOGGER.info("AKShare函数执行耗时 %.2f 秒", function_seconds)
+            if paging.enabled:
+                LOGGER.info("AKShare剩余函数耗时 %.3f 秒（原签名/解析/拼接未分别测量）",
+                            max(0.0, function_seconds-paging.metrics["wrapper"]))
             serialized = time.monotonic()
             rows = frame.to_dict("records")
+            audit_started = time.monotonic()
             paging.finish(rows)
+            paging.measure(audit=time.monotonic()-audit_started)
             del frame
-            LOGGER.info("源转换耗时 %.2f 秒 rows=%d",time.monotonic()-serialized,len(rows))
+            LOGGER.info("记录转换耗时 %.2f 秒 rows=%d",audit_started-serialized,len(rows))
         queue.put(("ok", rows))
     except SourceThrottledError as exc:
         queue.put(("throttled", exc.ttl))
@@ -473,6 +515,10 @@ class SourceExecutor:
         keys = None
         queue = process = None
         exitcode = None
+        successful = False
+        outcome = "失败"
+        quota_started = time.monotonic()
+        quota_seconds = None
         requested = self.context.Event()
         try:
             quota_wait_logged = False
@@ -491,6 +537,8 @@ class SourceExecutor:
                         LOGGER.info("配额等待 function=%s group=%s", call.function, call.group)
                         quota_wait_logged = True
                     time.sleep(min(0.1, max(0, request_deadline-time.monotonic())))
+            quota_seconds = time.monotonic()-quota_started
+            LOGGER.info("源配额等待耗时 function=%s seconds=%.3f", call.function, quota_seconds)
             queue = self.context.Queue()
             process = self.context.Process(target=self.worker, args=(queue, self.redis_url, call, keys, token,
                 guard, request_deadline, self.read_seconds, os.getpid(), requested), daemon=True)
@@ -535,19 +583,29 @@ class SourceExecutor:
                 if result["category"] == "TIMEOUT" and not requested.is_set():
                     raise SourceNotStartedError("源预算结束，尚未发起请求")
                 raise SourceCallError(result)
+            successful = True
+            outcome = "成功后清理"
             return result
         except BaseException as exc:
             log = LOGGER.info if isinstance(exc, (SourceThrottledError, SourceNotStartedError, SourceCoolingError)) else LOGGER.warning
-            log("源取消 function=%s reason=%s elapsed=%.2f exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,process.exitcode if process else None)
+            if isinstance(exc, SourceControlError):
+                outcome = "取消"
+            elif isinstance(exc, (SourceThrottledError, SourceNotStartedError, SourceCoolingError)):
+                outcome = "未请求"
+            elif isinstance(exc, TimeoutError):
+                outcome = "超时"
+            else:
+                outcome = "失败"
+            log("源%s function=%s reason=%s elapsed=%.2f exitcode=%s",outcome,call.function,getattr(exc,"reason",None) or type(exc).__name__,time.monotonic()-started,process.exitcode if process else None)
             if process is not None:
-                self._reap(process, deadline)
+                self._reap(process, deadline, outcome=outcome)
                 exitcode = process.exitcode
                 process.close()
                 process = None
             raise
         finally:
             if process is not None:
-                self._reap(process, deadline)
+                self._reap(process, deadline, successful=successful, outcome=outcome)
                 exitcode = process.exitcode
                 process.close()
             if queue is not None:
@@ -556,13 +614,17 @@ class SourceExecutor:
                 self.control.release_extra(call.group, token)
             if keys is not None:
                 self.control.release(keys, token)
+            if quota_seconds is None:
+                LOGGER.info("源配额等待耗时 function=%s seconds=%.3f", call.function, time.monotonic()-quota_started)
             LOGGER.info("源 %s 总耗时 %.2f 秒 exitcode=%s",call.function,time.monotonic()-started,exitcode)
 
     @staticmethod
-    def _reap(process: Any, deadline: float) -> None:
+    def _reap(process: Any, deadline: float, *, successful: bool = False, outcome: str = "取消") -> None:
         if getattr(process, "pid", None) is None:
             return
         deadline = min(deadline, time.monotonic() + CLEANUP_SECONDS)
+        if successful and process.is_alive():
+            process.join(timeout=min(0.2, max(0, deadline-time.monotonic())))
         if process.is_alive():
             process.terminate()
             process.join(timeout=max(0, deadline-time.monotonic()-1))
@@ -572,7 +634,7 @@ class SourceExecutor:
         if process.is_alive():
             raise SourceControlError("源进程未完成回收，拒绝释放名额")
         process.join(timeout=0)
-        LOGGER.info("源回收 exitcode=%s signal=%s",process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None)
+        LOGGER.info("源回收 stage=%s exitcode=%s signal=%s",outcome,process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None)
 
 
 @contextmanager
@@ -590,7 +652,7 @@ def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any
               max_workers: int = 1, ready: Callable[[str], float] | None = None,
               ready_deadline: float | None = None, on_skip: Callable[[str], None] | None = None,
               ) -> Iterator[tuple[str, Any, Exception | None, float]]:
-    """最多三项在途；到期筛选和短等待在父流程进行，不占源配额。"""
+    """完整市场最多四项候选在途；父流程到期等待不占源配额。"""
     if max_workers == 1:
         for key, group, function in actions:
             executor = getattr(source, 'executor', None)
@@ -605,8 +667,8 @@ def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any
             else:
                 yield key, value, None, time.monotonic()
         return
-    if max_workers not in {2, 3}:
-        raise ValueError("只支持一、二或三项在途")
+    if max_workers not in {2, 3, 4}:
+        raise ValueError("只支持一至四项候选在途")
     pending = {}
     waiting = list(actions)
     pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='source-wait')
