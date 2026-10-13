@@ -56,7 +56,7 @@ class XueqiuProvider:
         self._timeout = bounded_timeout(None, timeout_seconds)
         self._api = api
         self.mode = mode
-        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, mode=mode))
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, lane="monitor", mode=mode))
 
     def _frame(self, function: str, symbol: str) -> dict[str, Any]:
         if self._api is not None:

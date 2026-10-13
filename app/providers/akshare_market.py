@@ -5,7 +5,7 @@ import time
 from typing import Any, Protocol
 
 from app.providers.http import error_metadata
-from app.runtime.source_execution import SourceCall, SourceExecutor, SourceCoolingError
+from app.runtime.source_execution import SourceCall, SourceExecutor, SourceCoolingError, SourceThrottledError, SourceNotStartedError
 
 LOGGER = logging.getLogger(__name__)
 THS_SECTOR_TIMEOUT_SECONDS = 120
@@ -22,7 +22,7 @@ class MarketSource(Protocol):
 class AkShareMarketProvider:
     def __init__(self, timeout_seconds: int, *, executor: Any = None, api: Any = None, mode: str = "auto") -> None:
         self.mode = mode
-        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, mode=mode))
+        self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, lane="quotes", mode=mode))
         self._akshare = api
         self._timeout_seconds = timeout_seconds
 
@@ -34,11 +34,19 @@ class AkShareMarketProvider:
                 result = getattr(self._akshare, function)(**parameters)
             else:
                 source = "ths" if group == "ths" else "sina-index"
+                lane = "funds" if module == "marketFundFlow" else "quotes"
+                batch_keys = (f"stock:source-control:v1:interval:{lane}",)
+                if self.executor.lane == "market":
+                    batch_keys += ("stock:market:v1:min-interval",)
                 result = self.executor.call(SourceCall(function, group, parameters, budget,
                     ("data.10jqka.com.cn",) if group == "ths" else ("vip.stock.finance.sina.com.cn",),
-                    (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{module}"), "market", mode=self.mode))
+                    (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{module}"), "market", interval_key=f"stock:source-control:v1:interval:market:{module}",
+                    batch_interval_keys=batch_keys, entry_lane=lane, mode=self.mode))
             LOGGER.info("接口 %s 成功，耗时 %.2f 秒", function, time.monotonic()-started)
             return result
+        except (SourceThrottledError, SourceNotStartedError) as exc:
+            LOGGER.info("接口 %s 未请求，原因 %s", function, type(exc).__name__)
+            raise
         except SourceCoolingError as exc:
             LOGGER.info("接口 %s 冷却跳过，剩余 TTL %d 秒", function, exc.ttl)
             raise

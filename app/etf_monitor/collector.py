@@ -18,7 +18,7 @@ from app.core.logging import log_failure, redis_failure_kind
 from app.etf_monitor.normalize import etf_symbol, quote_rows
 from app.providers.akshare_etf import EtfSourceError
 from app.providers.http import error_metadata
-from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, source_batch
+from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, source_batch
 from app.calendar.service import CalendarService
 
 LOGGER = logging.getLogger(__name__)
@@ -185,8 +185,6 @@ class EtfCollector:
             LOGGER.info("ETF 采集总耗时 %.2f 秒", time.monotonic() - started)
 
     def _collect_locked(self, local: datetime, started: float, token: str | None) -> str:
-        if self.mode == "auto" and not self.store.reserve_slot():
-            return "throttled"
         trading = self.calendar.day_status(local.date(), local)
         if self.mode == "auto" and trading is not True:
             return "skipped"
@@ -208,6 +206,8 @@ class EtfCollector:
             failed = len(symbols)
         else:
             try:
+                if self.mode == "auto" and getattr(self.source, "executor", None) is None and not self.store.reserve_slot():
+                    return "throttled"
                 rows = self.source.quotes()
                 source_finished = time.monotonic()
                 save_dictionary(self.store.client,rows,local+timedelta(seconds=source_finished-started))
@@ -217,6 +217,9 @@ class EtfCollector:
                 resource_failed = True
                 LOGGER.warning("ETF资源失败 reason=%s exitcode=%s",exc.reason,exc.exitcode)
                 quotes, failed = {}, len(symbols)
+            except SourceThrottledError as exc:
+                LOGGER.info("ETF 限频跳过，剩余 TTL %d 秒", exc.ttl)
+                return "throttled"
             except SourceNotStartedError:
                 cooling = True
                 LOGGER.info("ETF 行情预算结束，未发起源请求")

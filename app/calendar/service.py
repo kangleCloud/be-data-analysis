@@ -36,7 +36,7 @@ class AkShareCalendarSource:
     def __init__(self, timeout_seconds: int = 15, *, executor: Any = None, mode: str = "auto") -> None:
         self.timeout_seconds = timeout_seconds
         self.mode = mode
-        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds, mode=mode)
+        self.executor = executor if executor is not None else SourceExecutor.configured(timeout_seconds, lane="calendar", mode=mode)
 
     def dates(self) -> list[str]:
         frame = self.executor.call(SourceCall("tool_trade_date_hist_sina", "sina", {},

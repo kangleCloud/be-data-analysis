@@ -51,7 +51,7 @@ def create_etf_router(
     def provider(mode: str) -> Any:
         return provider_factory() if provider_factory else AkShareEtfProvider(
             settings.source_timeout_seconds,
-            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
+            executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, lane="etf", mode=mode),
             mode=mode,
         )
 
@@ -82,7 +82,7 @@ def create_etf_router(
             cached = load_dictionary(client,now) if mode == "auto" else None
             if cached:
                 return dictionary_response(cached)
-            with collection_entry(client, mode=mode) as entered:
+            with collection_entry(client, lane="etf", mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
                 rows = provider(mode).quotes()
@@ -122,7 +122,7 @@ def create_etf_router(
                 settings.redis_url.get_secret_value(), decode_responses=True,
                 socket_timeout=5, socket_connect_timeout=5,
             )
-            with collection_entry(client, mode=mode) as entered:
+            with collection_entry(client, lane="etf", mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
                 return collect_profiles(provider(mode),client,symbols,mode=mode)
@@ -157,7 +157,7 @@ def create_etf_router(
         client = None
         try:
             client = redis_client()
-            with collection_entry(client, mode=mode) as entered:
+            with collection_entry(client, lane="etf", mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
                 rows = provider(mode).asset_allocation(symbol[2:],request.reportPeriod)

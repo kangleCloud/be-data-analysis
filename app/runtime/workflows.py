@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from functools import wraps
-from app.runtime.gates import collection_entry, check_entry
+from app.runtime.gates import collection_entry
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,21 +20,24 @@ from app.calendar.service import AkShareCalendarSource, CalendarService
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def exclusive(function):
-    @wraps(function)
-    def run(settings,client,**kwargs):
-        with collection_entry(client, mode=kwargs.get('mode', 'auto')) as acquired:
-            if not acquired:
-                return 'locked'
-            return function(settings,client,**kwargs)
-    return run
+def exclusive(lane):
+    def decorate(function):
+        @wraps(function)
+        def run(settings, client, **kwargs):
+            cancel = kwargs.pop('cancel', None)
+            with collection_entry(client, cancel, lane=lane, mode=kwargs.get('mode', 'auto')) as acquired:
+                if not acquired:
+                    return 'locked'
+                return function(settings, client, **kwargs)
+        return run
+    return decorate
 
 
 def calendar_service(settings: Settings, client: Any, *, mode: str = "auto") -> CalendarService:
-    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client, mode=mode), mode=mode), mode=mode)
+    return CalendarService(client, AkShareCalendarSource(settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client, lane="calendar", mode=mode), mode=mode), mode=mode)
 
 
-@exclusive
+@exclusive('calendar')
 def run_calendar(settings: Settings, client: Any, *, on_demand: bool = False, mode: str = "auto",
                  at: datetime | None = None) -> str:
     return calendar_service(settings, client, mode=mode).refresh(
@@ -57,7 +60,7 @@ def run_market(settings: Settings, client: Any, *, at: datetime | None = None, m
         return _market(settings,client,at,'market',mode) if acquired else 'locked'
 
 
-@exclusive
+@exclusive('monitor')
 def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None, mode: str = "auto") -> str:
     if not settings.stock_monitor_xq_enabled:
         return "disabled"
@@ -66,34 +69,24 @@ def run_monitor(settings: Settings, client: Any, *, at: datetime | None = None, 
         return "missing_token"
     return StockMonitorSampler(
         MonitorStore(client),
-        XueqiuProvider(token, settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,mode=mode), mode=mode),
+        XueqiuProvider(token, settings.source_timeout_seconds, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,lane="monitor",mode=mode), mode=mode),
         calendar_service(settings, client, mode=mode),
         xq_enabled=True, mode=mode,
     ).sample(at or datetime.now(SHANGHAI))
 
 
-@exclusive
+@exclusive('etf')
 def run_etf(settings: Settings, client: Any, *, at: datetime | None = None, mode: str = "auto") -> str:
     return EtfCollector(
-        AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,mode=mode), mode=mode),
+        AkShareEtfProvider(settings.source_timeout_seconds, market_quotes=True, executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, client=client,lane="etf",mode=mode), mode=mode),
         EtfStore(client), calendar_service(settings, client, mode=mode), mode=mode,
     ).collect(at or datetime.now(SHANGHAI))
 
 
-def run_quotes(settings: Settings,client: Any,*,cancel=None) -> dict[str,str]:
-    """行情通道：股票报价→ETF→指数→行业→概念，完成模块立即发布。"""
-    with collection_entry(client,cancel,lane='quotes') as acquired:
-        if not acquired:
-            return {'outcome':'locked'}
-        outcomes = {}
-        for key,function in [('monitor',run_monitor),('etf',run_etf)]:
-            check_entry()
-            outcomes[key] = function(settings,client,at=datetime.now(SHANGHAI))
-            if outcomes[key] == 'resource':
-                return outcomes
-        check_entry()
-        outcomes['market'] = _market(settings,client,datetime.now(SHANGHAI),'quotes')
-        return outcomes
+def run_quotes(settings: Settings, client: Any, *, cancel=None) -> str:
+    """市场行情独立入口：指数/行业/概念最多两项在途，完成即发布。"""
+    with collection_entry(client, cancel, lane='quotes') as acquired:
+        return _market(settings, client, datetime.now(SHANGHAI), 'quotes') if acquired else 'locked'
 
 
 def run_funds(settings: Settings,client: Any,*,cancel=None) -> str:

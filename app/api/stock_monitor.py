@@ -91,7 +91,7 @@ def create_monitor_router(
         )
         store = new_store()
         try:
-            with collection_entry(store.client, mode=mode) as entered:
+            with collection_entry(store.client, lane="reference", mode=mode) as entered:
                 if not entered:
                     raise HTTPException(status_code=409,detail='采集入口忙碌')
                 return {"schemaVersion":1,"stocks":source.all_a_stocks()}
@@ -133,7 +133,7 @@ def create_monitor_router(
             try:
                 source = xq_factory() if xq_factory else XueqiuProvider(
                     token, settings.source_timeout_seconds,
-                    executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, mode=mode),
+                    executor=SourceExecutor(settings.redis_url.get_secret_value(), settings.source_timeout_seconds, lane="monitor", mode=mode),
                     mode=mode,
                 )
                 def fetch(symbol: str) -> dict[str, Any]:
@@ -147,7 +147,7 @@ def create_monitor_router(
                     return profile
                 actions = [(symbol, "xq", lambda code=symbol: fetch(code)) for symbol in symbols]
                 profiles_by_symbol = {}
-                with collection_entry(store.client, mode=mode) as entered:
+                with collection_entry(store.client, lane="monitor", mode=mode) as entered:
                     if not entered:
                         raise HTTPException(status_code=409,detail="采集入口忙碌")
                     with source_batch(source, (SAMPLE_LOCK_KEY, lock) if mode == "auto" else None, time.monotonic()+600), closing(

@@ -293,13 +293,13 @@ class StockMonitorSampler:
                     if close_retry:
                         self._mark_failed(symbol, local)
                     continue
-                def fetch(code: str = symbol) -> dict[str, Any]:
+                def fetch(provider, code: str = symbol) -> dict[str, Any]:
                     if self.store.cooldown_active():
                         raise SourceCoolingError(self.store.client.ttl(XQ_COOLDOWN_KEY))
-                    return self.source.quote(code)
+                    return provider.quote(code)
                 candidates.append((symbol, "xq", fetch))
             with source_batch(self.source, (SAMPLE_LOCK_KEY, token) if self.mode == "auto" else None, started+300), closing(
-                completed(candidates, source=self.source)
+                completed(candidates, source=self.source, max_workers=2)
             ) as results:
                 for symbol, raw, error, finished_at in results:
                     if self.mode == "auto" and self.store.client.get(SAMPLE_LOCK_KEY) != token:
@@ -366,6 +366,9 @@ class StockMonitorSampler:
                     # 业务写入失败直接退出，关闭结果迭代器后回收在途源进程。
                     if self.mode == "auto" and self.store.client.get(SAMPLE_LOCK_KEY) != token:
                         raise SourceControlError("业务任务锁已失效")
+                    if previous_time is not None:
+                        LOGGER.info("有效报价采样间隔 symbol=%s sourceSeconds=%.3f", symbol,
+                                    (source_time-previous_time).total_seconds())
                     self.store.write_quote(quote, append_point=in_window and trading is True and source_time.date() == local.date())
             return "resource" if resource_failed else "partial" if failures else "published"
         finally:
@@ -377,6 +380,7 @@ class StockMonitorSampler:
         at: datetime, reason: str,
     ) -> None:
         """延迟报价只更新最近有效报价状态，不写入当日曲线。"""
+        LOGGER.info("报价未追加 symbol=%s reason=%s", symbol, reason)
         incoming_time = datetime.fromisoformat(incoming["sourceTime"])
         previous_time = _source_time(previous.get("sourceTime")) if previous else None
         use_previous = (

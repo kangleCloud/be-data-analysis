@@ -109,7 +109,7 @@ def create_jobs_router(
                 status_code, outcome, message = 409, "locked", MESSAGES["locked"]
             else:
                 try:
-                    with collection_entry(client, lane="market" if kind == "market" else "quotes", mode=mode) as entered:
+                    with collection_entry(client, lane={"market": "market", "monitor": "monitor", "etf": "etf", "calendar": "calendar"}[kind], mode=mode) as entered:
                         if not entered:
                             outcome = 'locked'
                             status_code = 409

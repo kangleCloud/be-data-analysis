@@ -17,7 +17,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import log_failure
 from app.api.etf_monitor import create_etf_router
 from app.api.jobs import create_jobs_router
-from app.runtime.scheduler import run_scheduler, run_funds_scheduler
+from app.runtime.scheduler import run_scheduler, TASKS
 from app.calendar.scheduler import run_calendar_scheduler
 from app.api.stock_monitor import create_monitor_router
 
@@ -35,19 +35,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
-        task = asyncio.create_task(run_scheduler(configured)) if scheduler_enabled else None
-        funds_task = asyncio.create_task(run_funds_scheduler(configured)) if scheduler_enabled else None
-        calendar_task = asyncio.create_task(run_calendar_scheduler(configured)) if scheduler_enabled else None
+        tasks = ([asyncio.create_task(run_scheduler(configured, lane=lane)) for lane in TASKS]
+                 + [asyncio.create_task(run_calendar_scheduler(configured))]) if scheduler_enabled else []
         try:
             yield
         finally:
-            for running in (task,funds_task,calendar_task):
-                if running is not None:
-                    running.cancel()
-            for running in (task,funds_task,calendar_task):
-                if running is not None:
-                    with suppress(asyncio.CancelledError):
-                        await running
+            for running in tasks:
+                running.cancel()
+            for running in tasks:
+                with suppress(asyncio.CancelledError):
+                    await running
 
     application = FastAPI(title="be-data-analysis", version="1.0.0", lifespan=lifespan)
 

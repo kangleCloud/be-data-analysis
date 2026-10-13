@@ -16,18 +16,18 @@ HTTP_RULES = {
     "shorterLimits": "缺失或 None 补齐上限；已有 scalar/tuple 更短限制保留",
     "retry": "服务不增加即时重试，不并行分页；一次函数调用可能含多个 HTTP 请求",
     "execution": "每次 AKShare 调用独立 spawn；子进程转精简记录，单服务父进程标准化和业务发布",
-    "quota": "AUTO：行情/资金两个固定非排队入口；完整market原子取得两个；全局2路、同来源2路；THS/SINA/XQ及蛋卷/SSE/SZSE/BSE",
-    "order": "行情：股票报价→ETF→指数→行业→概念；资金：即时个股全市场榜。跨通道并行，同通道串行/启动至少120秒，完成模块立即发布",
+    "quota": "AUTO：个股/ETF/市场行情/资金四个固定非排队入口；完整market原子取得市场两个；全局3路、同来源2路；THS/SINA/XQ及蛋卷/SSE/SZSE/BSE",
+    "order": "四任务各自120秒周期；个股最多两只、市场指数/行业/概念最多两项在途；ETF一次全表，资金分页串行。各自不重叠/不积压，完成即发布",
     "lease": "AUTO：令牌租约30秒、每10秒续租；子进程回收后按令牌释放",
     "requestStartGaps": "每次实际HTTP：新浪0.2秒、THS/雪球/交易所1秒、THS基金资料额外2秒",
     "collectionMode": "内部POST先认证X-Internal-Token，再解析X-Collection-Mode；缺省auto，只有auto/manual合法，其它400；CLI/定时/admin沿auto",
-    "manual": "manual每请求独立执行器与SourceCall；串行复用同一Provider/标准化/缓存，跳过采集入口/任务锁、普通冷却、任务/代码间隔及源配额；不读取/写入AUTO普通冷却与间隔键",
+    "manual": "manual每请求独立执行器与SourceCall；个股/市场行情最多两项在途，其他批次仍串行；复用同一Provider/标准化/缓存，跳过采集入口/任务锁、普通冷却、任务/代码间隔及源配额；不读取/写入AUTO普通冷却与间隔键",
     "sharedProtection": "两模式共享实际HTTP启动间隔、401/403/429及明确风控risk键；旧冷却原因未知则自然过期，不能推测或清除；源总闸/Token、截止时间、Redis故障、异常进程退出与事务写入保护仍生效",
     "outsideWindow": "manual可休市/窗口外刷新；股票保留真实sourceTime/tradeDate且不得倒退，严格源时间>15:00确认收盘；无可靠源日期的市场/指数/ETF只更新快照与实际collectedAt，不产生日期或曲线点",
     "deadline": "配额等待、模块初始化、HTTP和最多2秒回收均计入原函数/批次预算",
 }
 THS_MARKET_POLICY = [
-    "各通道启动至少120秒；快轮沿原定点节奏，耗时>=120秒的慢轮完成回收后在交易窗口立即接续，不补旧轮",
+    "各任务周期120秒；业务120秒门禁按实际首个HTTP启动设置，剩余<=5秒在原预算内等待，较长跳过；各任务启动至少120秒；快轮沿原定点节奏，耗时>=120秒的慢轮完成回收后在交易窗口立即接续，不补旧轮",
     "同花顺分页请求至少间隔 1 秒",
     "401/403/429或明确风控拒绝：THS共享源冷却7200秒；普通网络/读取超时/解析/校验失败仅当前模块300秒",
     "SourceDataError：仅失败模块冷却 300 秒；冷却不访问源、不续期、不新增曲线点",
@@ -40,7 +40,7 @@ XQ_AUTH = (
 ETF_BUDGET = {
     "processSeconds": "SOURCE_TIMEOUT_SECONDS + 17（默认 32 秒）",
     "cleanupReserveSeconds": 2,
-    "profileCap": "资料单次总预算不超过批次剩余预算，超时先终止再回收，行情入口内串行",
+    "profileCap": "资料单次总预算不超过批次剩余预算，超时先终止再回收，ETF入口内串行",
 }
 
 # 每项对应一种函数参数组合；同一函数的不同业务用途放在 uses 中，不重复计数。
@@ -52,7 +52,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         "endpoints": [{"method": "GET", "scheme": "https", "domain": "finance.sina.com.cn",
                        "path": "/realstock/company/klc_td_sh.txt"}],
         "authorization": PUBLIC_AUTH,
-        "frequency": ["每月 1 日上海时间 00:10；行情入口启动检查/覆盖不足补建；资金通道只读缓存",
+        "frequency": ["每月 1 日上海时间 00:10；独立日历入口启动检查/覆盖不足补建；资金任务只读缓存",
                       "AUTO失败每日限频；AUTO内部按需日历刷新600秒，受独立锁保护；manual绕过两者"],
         "timeout": {"queueWaitSeconds": "SOURCE_TIMEOUT_SECONDS + 10（默认 25 秒）",
                     "normalJoinSeconds": 2, "cleanup": "超时终止并回收子进程"},
@@ -219,7 +219,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
                       {"method": "GET", "scheme": "https", "domain": "stock.xueqiu.com",
                        "path": "/v5/stock/quote.json", "query": {"symbol": "{symbol}", "extend": "detail"}}],
         "authorization": XQ_AUTH,
-        "frequency": ["盘中每120秒，同股请求TTL=120秒，跨股票串行，每次实际HTTP启动间隔>=1秒",
+        "frequency": ["盘中每120秒，同股实际首个HTTP启动TTL=120秒，最多两只股票在途，每次实际HTTP启动间隔>=1秒",
                       "15:02/04/06/08/10 补收盘确认；已确认跳过；拒绝/限流现有冷却7200秒"],
         "timeout": {"functionBudgetSeconds": 300, "batchBudgetSeconds": 300, "note": "建会话和取数据均取得HTTP速率许可"},
         "availability": ["非空 item/value；有效源时间，现价/涨幅/成交额至少一项有效",

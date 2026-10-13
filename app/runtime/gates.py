@@ -1,4 +1,4 @@
-"""行情、资金两个固定入口；租约原子获取，忙时拒绝且不排队。"""
+"""四类采集及日历/资料固定入口；租约原子获取，忙时拒绝且不排队。"""
 
 import threading
 from contextlib import contextmanager
@@ -7,8 +7,9 @@ from uuid import uuid4
 
 QUOTES_ENTRY_KEY = 'stock:source-control:v1:entry:quotes'
 FUNDS_ENTRY_KEY = 'stock:source-control:v1:entry:funds'
-ENTRY_KEYS = {'quotes': (QUOTES_ENTRY_KEY,), 'funds': (FUNDS_ENTRY_KEY,),
-              'market': (QUOTES_ENTRY_KEY, FUNDS_ENTRY_KEY)}
+ENTRY_KEYS = {name: (f'stock:source-control:v1:entry:{name}',)
+              for name in ('quotes', 'funds', 'monitor', 'etf', 'calendar', 'reference')}
+ENTRY_KEYS['market'] = (QUOTES_ENTRY_KEY, FUNDS_ENTRY_KEY)
 _ENTRY = ContextVar('collection_entries', default=())
 RENEW_SECONDS = 10
 ACQUIRE = """
@@ -44,7 +45,7 @@ def entry_guard(lane):
 
 
 @contextmanager
-def collection_entry(client, cancel=None, *, lane='quotes', mode='auto'):
+def collection_entry(client, cancel=None, *, lane='reference', mode='auto'):
     if mode == 'manual':
         if cancel is not None and cancel.is_set():
             from app.runtime.source_execution import SourceControlError

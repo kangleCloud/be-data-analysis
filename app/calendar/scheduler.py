@@ -36,7 +36,7 @@ def _bootstrap(settings: Settings, cancel=None) -> None:
     )
     try:
         now = datetime.now(SHANGHAI)
-        with collection_entry(client,cancel) as entered:
+        with collection_entry(client,cancel,lane='calendar') as entered:
             if not entered:
                 return
             status = calendar_service(settings, client).day_status(now.date(), now)
@@ -67,7 +67,7 @@ def _refresh(settings,cancel=None):
     client = redis.Redis.from_url(settings.redis_url.get_secret_value(),decode_responses=True,
                                  socket_timeout=1,socket_connect_timeout=1)
     try:
-        with collection_entry(client,cancel) as entered:
+        with collection_entry(client,cancel,lane='calendar') as entered:
             if entered:
                 LOGGER.info('交易日历月初刷新: %s',run_calendar(settings,client))
     finally:

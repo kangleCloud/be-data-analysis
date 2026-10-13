@@ -8,7 +8,9 @@ from app.market.collector import _in_collection_window
 from app.stock_monitor.scheduler import next_sample_slot
 from app.core.config import get_settings
 from app.core.logging import log_failure
-from app.runtime.workflows import run_quotes, run_funds
+from app.runtime.workflows import run_quotes, run_funds, run_monitor, run_etf
+
+TASKS = {"monitor": run_monitor, "etf": run_etf, "quotes": run_quotes, "funds": run_funds}
 import threading
 import redis
 from datetime import datetime, time, timedelta
@@ -48,14 +50,14 @@ def _round(settings,cancel,lane="quotes"):
     client = redis.Redis.from_url(settings.redis_url.get_secret_value(),decode_responses=True,
                                   socket_timeout=1,socket_connect_timeout=1)
     try:
-        return run_quotes(settings,client,cancel=cancel) if lane == "quotes" else run_funds(settings,client,cancel=cancel)
+        return TASKS[lane](settings, client, cancel=cancel)
     finally:
         client.close()
 
 
 async def run_scheduler(settings=None, *, lane="quotes") -> None:
-    """单服务父进程复用业务函数，轮内串行、跨轮至少120秒、长轮短任务优先。"""
-    if lane not in {"quotes","funds"}:
+    """固定任务各自120秒周期，同任务不重叠、不积压或补跑。"""
+    if lane not in TASKS:
         raise ValueError("未知固定通道")
     settings = settings or get_settings()
     last_started = last_monotonic = None
@@ -72,6 +74,7 @@ async def run_scheduler(settings=None, *, lane="quotes") -> None:
             delay = max(0,(slot-now).total_seconds())
             if last_monotonic is not None:
                 delay = max(delay,MIN_START_SECONDS-(clock.monotonic()-last_monotonic))
+            LOGGER.info("调度等待 task=%s seconds=%.2f", lane, delay)
             await asyncio.sleep(delay)
             actual = datetime.now(SHANGHAI)
             if (actual-slot).total_seconds() > MAX_START_LAG_SECONDS:
@@ -81,7 +84,7 @@ async def run_scheduler(settings=None, *, lane="quotes") -> None:
             work = asyncio.create_task(asyncio.to_thread(_round,settings,cancel,lane))
             try:
                 outcome = await asyncio.shield(work)
-                LOGGER.info('通道 %s 轮次完成: %s',lane,outcome)
+                LOGGER.info('调度完成 task=%s outcome=%s elapsed=%.2f',lane,outcome,clock.monotonic()-last_monotonic)
             except asyncio.CancelledError:
                 cancel.set()
                 try:
@@ -94,7 +97,3 @@ async def run_scheduler(settings=None, *, lane="quotes") -> None:
             continue_now = clock.monotonic()-last_monotonic >= MIN_START_SECONDS
     finally:
         cancel.set()
-
-
-async def run_funds_scheduler(settings):
-    await run_scheduler(settings,lane='funds')

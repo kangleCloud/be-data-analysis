@@ -6,6 +6,9 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import copy_context
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from copy import copy
 from dataclasses import dataclass, field
 from queue import Empty
 from typing import Any, Callable, Iterator
@@ -16,7 +19,7 @@ import redis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
-from app.runtime.gates import collection_entry, check_entry
+from app.runtime.gates import collection_entry, check_entry, entry_guard
 from app.runtime.cooldown import protected_keys, record, risk_rejection
 from app.runtime.resources import SourceResourceError
 from app.providers.ths_paging import IndividualPaging
@@ -24,7 +27,7 @@ from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 
 LOGGER = logging.getLogger(__name__)
 PREFIX = "stock:source-control:v1:"
-GLOBAL_LIMIT = 2
+GLOBAL_LIMIT = 3
 SOURCE_LIMIT = 2
 LEASE_SECONDS = 30
 RENEW_SECONDS = 10
@@ -54,19 +57,34 @@ return redis.call('expire', KEYS[1], ARGV[2])
 RATE_SCRIPT = """
 if ARGV[6] ~= 'manual' and (redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('get', KEYS[2]) ~= ARGV[1]) then return {-1,0} end
 if ARGV[4] ~= '' and redis.call('get', KEYS[5]) ~= ARGV[4] then return {-1,0} end
-for i=7,#KEYS do if redis.call('exists', KEYS[i]) == 1 then return {-2,redis.call('ttl', KEYS[i])} end end
+for i=8+tonumber(ARGV[7]),#KEYS do if redis.call('exists', KEYS[i]) == 1 then return {-2,redis.call('ttl', KEYS[i])} end end
 local interval = tonumber(ARGV[5])
 local owner = interval > 0 and redis.call('get', KEYS[6]) or false
-if owner and owner ~= ARGV[1] then return {-3,redis.call('ttl', KEYS[6])} end
+if owner and owner ~= ARGV[1] then return {-3,redis.call('pttl', KEYS[6])} end
+if interval > 0 then
+  for i=8,7+tonumber(ARGV[7]) do
+    local batch_owner=redis.call('get',KEYS[i])
+    if batch_owner and batch_owner ~= ARGV[4] then return {-3,redis.call('pttl',KEYS[i])} end
+  end
+end
 local t=redis.call('TIME'); local now=t[1]*1000+math.floor(t[2]/1000)
 local a=tonumber(redis.call('get', KEYS[3]) or '0')
 local b=tonumber(redis.call('get', KEYS[4]) or '0')
 local remaining=math.max(a,b)-now
 if remaining > 0 then return {0,remaining} end
-if interval > 0 and not owner then redis.call('set', KEYS[6], ARGV[1], 'EX', interval) end
+local elapsed=-1
+if interval > 0 and not owner then
+  local previous=redis.call('get',KEYS[7])
+  if previous then elapsed=now-tonumber(previous) end
+  redis.call('set',KEYS[7],now,'EX',86400)
+  redis.call('set', KEYS[6], ARGV[1], 'EX', interval)
+  for i=8,7+tonumber(ARGV[7]) do
+    if not redis.call('get',KEYS[i]) then redis.call('set',KEYS[i],ARGV[4],'EX',interval) end
+  end
+end
 redis.call('set', KEYS[3], now+tonumber(ARGV[2]), 'PX', 30000)
 redis.call('set', KEYS[4], now+tonumber(ARGV[3]), 'PX', 30000)
-return {1,0}
+return {1,0,elapsed}
 """
 
 
@@ -126,9 +144,8 @@ class SourceCall:
     interval_seconds: int = 120
     mode: str = "auto"
 
-    @property
-    def lane(self):
-        return "funds" if self.function == "stock_fund_flow_individual" and self.parameters.get("symbol") == "即时" else "quotes"
+    batch_interval_keys: tuple[str, ...] = ()
+    entry_lane: str | None = None
 
 
 class SourceControl:
@@ -163,20 +180,33 @@ class SourceControl:
         rate_keys = [f"{PREFIX}rate:{call.group}",
                      f"{PREFIX}rate:ths:fund" if call.fund_profile else f"{PREFIX}rate:{call.group}"]
         all_keys = [*(keys or (f"{PREFIX}no-slot", f"{PREFIX}no-slot")), *rate_keys, guard[0] if guard else f"{PREFIX}no-guard",
-                    call.interval_key or f"{PREFIX}no-interval", *protected_keys(call.cooldown_keys, call.group, call.mode)]
+                    call.interval_key or f"{PREFIX}no-interval",
+                    f"{PREFIX}sample-time:{call.interval_key or call.function}",
+                    *call.batch_interval_keys, *protected_keys(call.cooldown_keys, call.group, call.mode)]
+        interval_wait_logged = False
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("源调用预算已耗尽")
-            status, value = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
+            result = self.client.eval(RATE_SCRIPT, len(all_keys), *all_keys, token,
                                              int(interval * 1000), 2000 if call.fund_profile else int(interval*1000),
-                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" else 0, call.mode)
+                                             guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" else 0, call.mode, len(call.batch_interval_keys))
+            status, value = result[:2]
             if status == -1:
                 raise SourceControlError("源配额或业务锁已失效")
             if status == -2:
                 raise SourceCoolingError(value)
             if status == -3:
-                raise SourceThrottledError(value)
+                if value > 5000 or value <= 0:
+                    LOGGER.info("限频跳过 function=%s remainingMs=%d", call.function, value)
+                    raise SourceThrottledError(max(0, (value+999)//1000))
+                if not interval_wait_logged:
+                    LOGGER.info("限频等待 function=%s remainingMs=%d", call.function, value)
+                    interval_wait_logged = True
+                time.sleep(min(0.1, value/1000, max(0, deadline-time.monotonic())))
+                continue
             if status == 1:
+                if len(result) > 2 and result[2] >= 0:
+                    LOGGER.info("有效HTTP采样间隔 function=%s seconds=%.3f", call.function, result[2]/1000)
                 return
             time.sleep(min(0.1, value / 1000, max(0, deadline-time.monotonic())))
 
@@ -312,7 +342,7 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
 class SourceExecutor:
     """父进程等待/续租/回收独立 spawn 源进程，不写任何业务快照。"""
     def __init__(self, redis_url: str, read_seconds: float = 15, *, client: Any = None,
-                 context: Any = None, lane: str = "quotes", mode: str = "auto", worker: Callable[..., None] = _source_worker) -> None:
+                 context: Any = None, lane: str = "reference", mode: str = "auto", worker: Callable[..., None] = _source_worker) -> None:
         if mode not in {"auto", "manual"}:
             raise ValueError("采集模式必须为 auto 或 manual")
         self.redis_url, self.read_seconds = redis_url, read_seconds
@@ -321,15 +351,16 @@ class SourceExecutor:
         self.context = context or mp.get_context("spawn")
         self.worker = worker
         self.cancelled = threading.Event()
+        self.parent_cancel: threading.Event | None = None
         self.guard: tuple[str, str] | None = None
         self.deadline: float | None = None
 
     @classmethod
-    def configured(cls, read_seconds: float | None = None, *, mode: str = "auto") -> "SourceExecutor":
+    def configured(cls, read_seconds: float | None = None, *, lane: str = "reference", mode: str = "auto") -> "SourceExecutor":
         from app.core.config import get_settings
         settings = get_settings()
         return cls(settings.redis_url.get_secret_value(),
-                   settings.source_timeout_seconds if read_seconds is None else read_seconds, mode=mode)
+                   settings.source_timeout_seconds if read_seconds is None else read_seconds, lane=lane, mode=mode)
 
     @contextmanager
     def batch(self, guard: tuple[str, str] | None = None,
@@ -373,18 +404,26 @@ class SourceExecutor:
                 thread.join(timeout=1.2)
             self.guard, self.deadline = None, None
 
+    def fork(self) -> "SourceExecutor":
+        """在途调用独立取消状态，仅读取父批次的锁和截止时间。"""
+        executor = SourceExecutor(self.redis_url, self.read_seconds, client=self.control.client,
+                                  context=self.context, lane=self.lane, mode=self.mode, worker=self.worker)
+        executor.guard, executor.deadline = self.guard, self.deadline
+        executor.parent_cancel = self.cancelled
+        return executor
+
     def stop(self) -> None:
         self.cancelled.set()
 
     def _check(self) -> None:
         check_entry()
-        if self.cancelled.is_set():
+        if self.cancelled.is_set() or (self.parent_cancel is not None and self.parent_cancel.is_set()):
             raise SourceControlError("源批次已取消")
         if self.guard and self.control.client.get(self.guard[0]) != self.guard[1]:
             raise SourceControlError("业务任务锁已失效")
 
     def call(self, call: SourceCall) -> Any:
-        with collection_entry(self.control.client, lane=call.lane, mode=self.mode) as acquired:
+        with collection_entry(self.control.client, lane=call.entry_lane or self.lane, mode=self.mode) as acquired:
             if not acquired:
                 raise SourceBusyError('其他采集任务正在运行')
             return self._call_locked(call)
@@ -394,6 +433,7 @@ class SourceExecutor:
             raise ValueError("Provider 与源执行器采集模式不一致")
         if call.group not in GROUPS:
             raise ValueError("未知来源组")
+        guard = (self.guard or entry_guard(call.entry_lane or self.lane)) if self.mode == "auto" else None
         started = time.monotonic()
         deadline = started + call.budget_seconds
         if self.deadline is not None:
@@ -405,6 +445,7 @@ class SourceExecutor:
         exitcode = None
         requested = self.context.Event()
         try:
+            quota_wait_logged = False
             while keys is None:
                 self._check()
                 if time.monotonic() >= request_deadline:
@@ -416,15 +457,18 @@ class SourceExecutor:
                     break
                 keys = self.control.acquire(call.group, token)
                 if keys is None:
+                    if not quota_wait_logged:
+                        LOGGER.info("配额等待 function=%s group=%s", call.function, call.group)
+                        quota_wait_logged = True
                     time.sleep(min(0.1, max(0, request_deadline-time.monotonic())))
             queue = self.context.Queue()
             process = self.context.Process(target=self.worker, args=(queue, self.redis_url, call, keys, token,
-                self.guard, request_deadline, self.read_seconds, os.getpid(), requested), daemon=True)
+                guard, request_deadline, self.read_seconds, os.getpid(), requested), daemon=True)
             process.start()
             renewed = time.monotonic()
             while True:
                 self._check()
-                self.control.check(keys, token, self.guard)
+                self.control.check(keys, token, guard)
                 now = time.monotonic()
                 if now >= request_deadline:
                     if not requested.is_set():
@@ -450,7 +494,7 @@ class SourceExecutor:
                             raise SourceControlError("源控制失效 exitcode="+str(process.exitcode))
                         raise SourceResourceError(exitcode=process.exitcode)
             self._check()
-            self.control.check(keys, token, self.guard)
+            self.control.check(keys, token, guard)
             if status == "throttled":
                 raise SourceThrottledError(result)
             if status == "cooldown":
@@ -463,7 +507,8 @@ class SourceExecutor:
                 raise SourceCallError(result)
             return result
         except BaseException as exc:
-            LOGGER.warning("源取消 function=%s reason=%s elapsed=%.2f exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,process.exitcode if process else None)
+            log = LOGGER.info if isinstance(exc, (SourceThrottledError, SourceNotStartedError, SourceCoolingError)) else LOGGER.warning
+            log("源取消 function=%s reason=%s elapsed=%.2f exitcode=%s",call.function,getattr(exc,"reason",type(exc).__name__),time.monotonic()-started,process.exitcode if process else None)
             if process is not None:
                 self._reap(process, deadline)
                 exitcode = process.exitcode
@@ -509,18 +554,65 @@ def source_batch(source: Any, guard: tuple[str, str] | None = None,
             yield
 
 
-def completed(actions: list[tuple[str, str, Callable[[], Any]]], *, source: Any = None,
-              ) -> Iterator[tuple[str, Any, Exception | None, float]]:
-    """单父进程串行准入，完成立即交付，不为源调用再创建等待线程。"""
-    for key, group, function in actions:
-        executor = getattr(source, 'executor', None)
+def completed(actions: list[tuple[str, str, Callable[..., Any]]], *, source: Any = None,
+              max_workers: int = 1) -> Iterator[tuple[str, Any, Exception | None, float]]:
+    """最多两项在途，完成即交付；仅调用父流程标准化和发布。"""
+    if max_workers == 1:
+        for key, group, function in actions:
+            executor = getattr(source, 'executor', None)
+            try:
+                if executor is not None:
+                    executor._check()
+                value = function()
+            except (SourceControlError, redis.RedisError):
+                raise
+            except Exception as exc:
+                yield key, None, exc, time.monotonic()
+            else:
+                yield key, value, None, time.monotonic()
+        return
+    if max_workers != 2:
+        raise ValueError("只支持串行或两项在途")
+    pending = {}
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='source-wait')
+    actions = iter(actions)
+
+    def submit_next():
         try:
+            key, group, function = next(actions)
+        except StopIteration:
+            return
+        isolated = copy(source)
+        parent = getattr(source, 'executor', None)
+        executor = parent.fork() if parent is not None else None
+        if executor is not None:
+            isolated.executor = executor
+        def invoke():
+            try:
+                if executor is not None:
+                    executor._check()
+                value = function(isolated)
+            except (SourceControlError, redis.RedisError):
+                raise
+            except Exception as exc:
+                return key, None, exc, time.monotonic()
+            return key, value, None, time.monotonic()
+        # 每次提交使用独立Context，继承当前入口租约而非重新抢锁。
+        future = pool.submit(copy_context().run, invoke)
+        pending[future] = executor
+
+    try:
+        submit_next()
+        submit_next()
+        while pending:
+            ready, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in ready:
+                pending.pop(future)
+                yield future.result()
+                submit_next()
+    finally:
+        for future, executor in pending.items():
             if executor is not None:
-                executor._check()
-            value = function()
-        except (SourceControlError, redis.RedisError):
-            raise
-        except Exception as exc:
-            yield key, None, exc, time.monotonic()
-        else:
-            yield key, value, None, time.monotonic()
+                executor.stop()
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)

@@ -14,7 +14,7 @@ from app.runtime.cooldown import remaining, record
 from app.core.logging import log_failure, redis_failure_kind
 from app.providers.akshare_market import MarketSource
 from app.providers.http import error_metadata
-from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, completed, source_batch
+from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, completed, source_batch
 from app.runtime.gates import collection_entry
 from app.market.snapshot import SnapshotStore, undated_module
 from app.calendar.service import CalendarService
@@ -153,7 +153,7 @@ class MarketCollector:
         try:
             if self.mode == "auto":
                 self._store.start_renewal(token)
-            if self.mode == "auto" and not self._store.reserve_slot(local):
+            if self.mode == "auto" and getattr(self._provider, "executor", None) is None and not self._store.reserve_slot(local):
                 return "throttled"
             timestamp = local.isoformat(timespec="seconds")
             previous = self._store.load() or {}
@@ -179,25 +179,25 @@ class MarketCollector:
             modules = {key: old_modules.get(key) if _reusable_prior(key, old_modules.get(key))
                        else _error_module(timestamp, "暂无可用数据") for key in self.module_keys}
             failures = 0
+            throttled = 0
             resource_failed = False
             actions = [
-                ("coreIndices", "sina", self._provider.index_spot),
-                ("industrySectors", "ths", lambda: self._provider.sector_fund_flow("industry")),
-                ("conceptSectors", "ths", lambda: self._provider.sector_fund_flow("concept")),
-                ("marketFundFlow", "ths", self._provider.market_fund_flow),
+                ("coreIndices", "sina", lambda provider: provider.index_spot()),
+                ("industrySectors", "ths", lambda provider: provider.sector_fund_flow("industry")),
+                ("conceptSectors", "ths", lambda provider: provider.sector_fund_flow("concept")),
             ]
             actions = [action for action in actions if action[0] in self.module_keys]
-            def fetch(key: str, group: str, function: Any) -> Any:
+            def fetch(key: str, group: str, function: Any, provider: Any) -> Any:
                 source = "ths" if group == "ths" else "sina-index"
                 scopes = (f"stock:market:v1:cooldown:{source}", f"stock:market:v1:cooldown:module:{key}")
                 ttl = remaining(self._store._client, scopes, group, self.mode)
                 if ttl is not None:
                     raise SourceCoolingError(ttl)
-                return function()
-            guarded = [(key, group, lambda k=key,g=group,f=function: fetch(k,g,f))
+                return function(provider)
+            guarded = [(key, group, lambda provider,k=key,g=group,f=function: fetch(k,g,f,provider))
                        for key,group,function in actions]
             with source_batch(self._provider, (self._store.lock_key, token) if self.mode == "auto" else None, started+1380), closing(
-                completed(guarded, source=self._provider)
+                self._results(guarded)
             ) as results:
                 for key, frame, error, finished_at in results:
                     source = "sina-index" if key == "coreIndices" else "ths"
@@ -224,6 +224,11 @@ class MarketCollector:
                         failures += 1
                         LOGGER.warning("模块 %s 资源失败 reason=%s exitcode=%s",key,exc.reason,exc.exitcode)
                         modules[key] = _fallback(key,old_modules.get(key),timestamp,"采集源进程退出，保留上次有效数据")
+                    except SourceThrottledError as exc:
+                        failures += 1
+                        throttled += 1
+                        LOGGER.info("模块 %s 限频跳过，剩余 TTL %d 秒", key, exc.ttl)
+                        continue
                     except SourceNotStartedError:
                         failures += 1
                         LOGGER.info("模块 %s 预算结束，未发起源请求", key)
@@ -256,12 +261,27 @@ class MarketCollector:
                     fund_points = None
                     if resource_failed:
                         return "resource"
+            if throttled == len(self.module_keys):
+                return "throttled"
             return "resource" if resource_failed else "partial" if failures else "published"
         finally:
             if self.mode == "auto":
                 self._store.stop_renewal()
                 self._store.release(token)
             LOGGER.info("采集总耗时 %.2f 秒", clock.monotonic() - started)
+
+    def _results(self, actions):
+        # 全市场资金分页保持串行；完整刷新先交付行情，再执行同批资金汇总。
+        with closing(completed(actions, source=self._provider, max_workers=2)) as results:
+            yield from results
+        if "marketFundFlow" in self.module_keys:
+            def funds():
+                scopes = ("stock:market:v1:cooldown:ths", "stock:market:v1:cooldown:module:marketFundFlow")
+                ttl = remaining(self._store._client, scopes, "ths", self.mode)
+                if ttl is not None:
+                    raise SourceCoolingError(ttl)
+                return self._provider.market_fund_flow()
+            yield from completed([("marketFundFlow", "ths", funds)], source=self._provider)
 
     def _publish(
         self, token: str | None, timestamp: str, modules: dict[str, Any],
