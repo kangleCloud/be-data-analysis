@@ -1,5 +1,7 @@
 # Linux systemd 原生部署
 
+本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
 应用目录为`/data/content/be-data-analysis`，使用目标主机已有Python 3.12虚拟环境，原生端口18801。主机需提供systemd和logrotate，不限制Ubuntu版本。服务默认以root运行；其他账号直接修改unit的`User`、`Group`和轮转配置的`su`，三者保持一致，并确保账号可以读取源码、生产配置和虚拟环境、写入日志目录。
 
 ## 配置

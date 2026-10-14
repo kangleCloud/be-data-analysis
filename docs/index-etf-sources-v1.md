@@ -1,5 +1,7 @@
 # 核心指数与 ETF 数据源 V1
 
+本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
 ## 源接口与边界
 
 | 用途 | AKShare 入口 | 源域名 | 结果与限制 |
@@ -9,7 +11,7 @@
 | ETF 基本资料 | `fund_info_ths(symbol=六位代码)` | `fund.10jqka.com.cn` | 基金全称、类型、投资类型、基金经理、成立日期、业绩比较基准、管理人和托管人；缺字段可空 |
 | 雪球 ETF 资产配置 | `fund_individual_detail_hold_xq` | `danjuanfunds.com` | 仅资产类型仓位比例，不是成份股；总闸默认关闭 |
 
-固定 AKShare 1.18.97。本地源码审计确认 `fund_info_ths` 使用 `requests.get` 请求 `https://fund.10jqka.com.cn/{symbol}/interduce.html`，返回“字段／值”两列表。Python 调用 AKShare，未修改安装包或另写网页解析器。Provider 只放行已审计域名，资料请求禁止跟随重定向，设置 HTTP 超时并在隔离子进程执行。ETF 基本资料只使用同花顺入口，不调用交易所份额、雪球 basic 或东方财富接口。源码审计与模拟验证不代表所有 ETF 在源站均有可用资料。
+固定 AKShare 1.19.1。本地源码审计确认 `fund_info_ths` 使用 `requests.get` 请求 `https://fund.10jqka.com.cn/{symbol}/interduce.html`，返回“字段／值”两列表。Python 调用 AKShare，未修改安装包或另写网页解析器。Provider 只放行已审计域名，资料请求禁止跟随重定向，设置 HTTP 超时并在隔离子进程执行。ETF 基本资料只使用同花顺入口，不调用交易所份额、雪球 basic 或东方财富接口。源码审计与模拟验证不代表所有 ETF 在源站均有可用资料。
 
 核心指数固定为上证指数 `sh000001`、深证成指 `sz399001`、沪深300 `sh000300`、创业板指 `sz399006`、科创50 `sh000688`。五条缺任意一条时整个 `coreIndices` 模块降级，不混合不完整的新批次与旧批次。指数数据包含 `sourceTime:null`；`tradeDateBasis:CALENDAR` 表示交易日期来自日历，`collectedAt` 只表示 Python 获取时间。
 

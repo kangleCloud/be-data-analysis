@@ -9,17 +9,26 @@ from app.runtime.source_execution import SourceCall, SourceCallError, SourceExec
 
 
 class XueqiuSourceError(RuntimeError):
-    def __init__(self, message: str, *, cooldown: bool = False) -> None:
+    def __init__(self, message: str, *, cooldown: bool = False,
+                 reason: str | None = None, bad_rows: int = 0) -> None:
         super().__init__(message)
         self.cooldown = cooldown
+        if reason is not None:
+            self.exception_type = self.root_type = type(self).__name__
+            self.http_status = None
+            self.category = "FORMAT"
+            self.reason, self.fields, self.code, self.bad_rows = reason, ("item", "value"), None, bad_rows
 
 
 def _items(frame: Any) -> dict[str, Any]:
     rows = frame.to_dict("records") if hasattr(frame,"to_dict") else frame
-    if not isinstance(rows,list) or not rows:
-        raise XueqiuSourceError("雪球数据为空")
+    if rows is None or isinstance(rows, list) and not rows:
+        raise XueqiuSourceError("雪球数据为空", reason="EMPTY_DATA")
+    if not isinstance(rows, list):
+        raise XueqiuSourceError("雪球数据结构不正确", reason="INVALID_SHAPE", bad_rows=1)
     if any(not isinstance(row,dict) or not {"item","value"}.issubset(row) for row in rows):
-        raise XueqiuSourceError("雪球数据结构不正确")
+        raise XueqiuSourceError("雪球数据结构不正确", reason="INVALID_SHAPE",
+                              bad_rows=sum(not isinstance(row,dict) or not {"item","value"}.issubset(row) for row in rows))
     return {row["item"]:row["value"] for row in rows}
 
 
@@ -49,7 +58,7 @@ class XueqiuProvider:
     def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None, mode: str = "auto") -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
-        # AKShare 1.18.97 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
+        # AKShare 1.19.1 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
         self._token = token
@@ -68,6 +77,9 @@ class XueqiuProvider:
                 interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
                 if function == "stock_individual_spot_xq" else None, mode=self.mode))
             return _items(frame)
+        except XueqiuSourceError as exc:
+            exc.source_pid = getattr(self.executor, "source_pid", None)
+            raise
         except SourceCallError as exc:
             raise XueqiuSourceError("雪球接口请求失败", cooldown=exc.http_status in {401,403,429}
                                    or exc.exception_type == "RateLimitError" or exc.category == "AUTH_REJECTED") from exc

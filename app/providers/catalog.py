@@ -1,4 +1,4 @@
-"""AKShare 1.18.97 数据源说明；仅供阅读，不参与采集路由或读取配置。
+"""AKShare 1.19.1 数据源说明；仅供阅读，不参与采集路由或读取配置。
 
 清单中的参数为调用模板，认证值仅占位。业务可用判定是校验规则，
 不是实时健康结果；函数数、参数组合数和 HTTP 请求数含义不同。
@@ -109,7 +109,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
         "semantics": ["个股纯数值资金为元；显式元/万/亿转换为元",
                       "市场及个股 netAmount 均为同批流入减流出；涨跌计数来自同批去重股票",
                       "只改即时个股准确域名与zdf分页路径为code；保留原AKShare解析，排序不支持则失败；行业/概念及非即时参数不改",
-                      "仅AKShare 1.18.97精确即时路径：页数发现串行、两页滑动窗口包含请求中和未消费页；两条固定通道各自独占持久Session，原请求头/代理/超时选项保持；预取使用原ths.js/MiniRacer签名，Linux无close沿对象回收；按序原解析，每页一次；额外AUTO全局/THS名额立即申请，拿不到串行，续租与强制回收所有权清理，长批次不重置首HTTP120秒门禁",
+                      "仅AKShare 1.19.1精确即时路径：页数发现串行、两页滑动窗口包含请求中和未消费页；两条固定通道各自独占持久Session，原请求头/代理/超时选项保持；预取使用原ths.js/MiniRacer签名，Linux无close沿对象回收；按序原解析，每页一次；额外AUTO全局/THS名额立即申请，拿不到串行，续租与强制回收所有权清理，长批次不重置首HTTP120秒门禁",
                       "额外页AUTO占一个全局/THS名额，租约续租；父进程强制回收后按采集身份清理额外租约；MANUAL不触碰AUTO配额",
                       "同一长分页批次只在首个HTTP设置120秒门禁，不因键到期重置；仅保留当前两页原响应，全页完整才发布，使用实际批次完成时间",
                       "日历日期与实际采集时间；不为个股资金新增逐股源调用"],
@@ -296,7 +296,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
 def render_sources(*, as_json: bool = False) -> str:
     """只序列化静态说明；不导入配置、Provider、Redis 或网络库。"""
     payload = {
-        "schemaVersion": 1, "akshareVersion": "1.18.97",
+        "schemaVersion": 1, "akshareVersion": "1.19.1",
         "verificationStatus": "NOT_CHECKED",
         "notice": "仅为接口说明，本命令不发起真实请求，不证明任何源当前健康",
         "uniqueFunctionCount": len({source["function"] for source in SOURCES}),

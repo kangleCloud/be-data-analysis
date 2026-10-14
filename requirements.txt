@@ -1,4 +1,4 @@
-akshare==1.18.97
+akshare==1.19.1
 redis>=5,<7
 requests
 fastapi

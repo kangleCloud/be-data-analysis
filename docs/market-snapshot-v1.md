@@ -1,5 +1,7 @@
 # 市场快照 V1 契约
 
+本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
 `be-data-analysis` 向 Redis DB 2 的 `stock:market:v1:snapshot` 写入普通 UTF-8 JSON 字符串，不设 TTL。每次发布分配唯一 `snapshotId`。同一 Redis 事务写入快照并向 `stock:market:v1:updates` 发布 `{schemaVersion:1,snapshotId,previousSnapshotId,changedModules}`；有已启用个股资金点时，它们也在该事务中写入。`changedModules` 只列出相对上次快照内容变化的模块，含状态变化。旧缓存没有 `snapshotId` 时 `previousSnapshotId=null`，从新快照开始建立版本链。读取方可按版本获取快照并生成增量事件，遇缺口重新读取全量快照。
 
 ```json
@@ -11,12 +13,13 @@
   "modules": {
     "industrySectors": {},
     "conceptSectors": {},
-    "marketFundFlow": {}
+    "marketFundFlow": {},
+    "coreIndices": {}
   }
 }
 ```
 
-各模块均包含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。本轮成功为 `FRESH`；失败但有符合当前契约的旧数据为 `STALE`；无旧数据为 `ERROR/data=null`。三个模块独立降级。三组同花顺源均没有可靠的源日期和源时间，因此 `tradeDateBasis=CALENDAR`；`tradeDate` 仅是交易日历参考日期。`lastSuccessAt`、市场曲线的 `collectedAt` 与 `generatedAt` 是本服务采集时间，不代表源站时间。
+各模块均包含 `status`、`tradeDate`、`tradeDateBasis`、`lastSuccessAt`、`lastAttemptAt`、`message`、`data`。本轮成功为 `FRESH`；失败但有符合当前契约的旧数据为 `STALE`；无旧数据为 `ERROR/data=null`。四个模块独立降级。三组同花顺源及新浪指数均没有可靠的逐条源日期和源时间，因此 `tradeDateBasis=CALENDAR`；`tradeDate` 仅是交易日历参考日期。`lastSuccessAt`、市场曲线的 `collectedAt` 与 `generatedAt` 是本服务采集时间，不代表源站时间。
 
 ## 行业与概念
 
@@ -44,7 +47,13 @@
 }
 ```
 
-`items` 保存完整的有效板块行，页面从中计算排行：正涨幅降序前 5、负涨幅升序前 5、正净额降序前 10、负净额升序前 10。缺失字段返回 `null`，不伪造代码或零值。所有金额单位为元；百分数 `2.31` 表示 `2.31%`。`netFlowRate=netAmount/(inflow+outflow)*100`，分母缺失或非正数时为 `null`；它不是主力净占比。
+`items` 保存完整的有效板块行，读取方计算排行：正涨幅降序前 10、负涨幅升序前 10、正净额降序前 10、负净额升序前 10。Python不裁剪为Top10。缺失字段返回 `null`，不伪造代码或零值。所有金额单位为元；百分数 `2.31` 表示 `2.31%`。`netFlowRate=netAmount/(inflow+outflow)*100`，分母缺失或非正数时为 `null`；它不是主力净占比。
+
+## 五只核心指数
+
+`coreIndices.data`为`{source:"SINA_INDEX",items:[...]}`，来自`stock_zh_index_spot_sina()`，固定顺序为上证指数`sh000001`、深证成指`sz399001`、沪深300`sh000300`、创业板指`sz399006`、科创50`sh000688`。缺任意一只或点位无效时整个模块降级。
+
+每项包含`code/name/price/change/changePercent/previousClose/open/high/low/volume/amount/sourceTime/collectedAt/series`。`price`为指数点位，涨跌幅为百分数，`sourceTime=null`；曲线点为`{collectedAt,price}`，不将采集时间解释为源交易时间或收盘确认。窗口外无可靠源日期的手动刷新不生成日内曲线。完整字段与边界见[核心指数与ETF](index-etf-sources-v1.md)。
 
 ## 大盘资金
 
@@ -79,7 +88,9 @@
 
 ## 采集与风控
 
-`python -m app serve` 在北京时间交易日上午 09:30–11:30、下午 13:00–15:10 按两条固定通道至少间隔120秒执行自动采集，每次源调用独立spawn子进程。上一轮未结束时跳过已错过的时段，不排队补采。CLI `python -m app collect` 使用auto， 也不能绕过交易窗口、交易日历、分布式锁、120 秒最小间隔和源冷却。同花顺分页请求至少间隔一秒，单次请求有超时；auto普通网络/超时/解析/数值校验仅当前模块冷却300秒，键为适用原模块键加`:ordinary`；401/403/429及明确风控两模式共享`stock:source-control:v1:risk:{group}`的7200秒保护，未知原因旧冷却等待自然到期。采集锁在长分页期间由持有者续租，发布前再次核验锁归属。
+`python -m app serve` 启动个股、ETF、市场行情、全市场资金四个独立120秒周期任务。市场行情包含指数/行业/概念三项，资金只调用即时个股榜；完整市场刷新原子获取quotes/funds两个入口，优先提交资金及三项行情共四个候选，按完成顺序由父流程标准化、WATCH合并及事务发布。每次源调用独立spawn子进程。同任务不重叠、不积压或补采。AUTO全局6、THS/XQ各3、SINA及各交易所各2个名额。
+
+AKShare当前固定1.19.1；即时资金使用两页滑动窗口及两条线程独占的持久Session，额外名额拿不到即串行，完整审计后一次发布同批汇总与个股点。CLI `python -m app collect` 使用auto，不能绕过交易窗口、日历、锁、120秒间隔和冷却。同花顺每次实际HTTP启动至少间隔一秒。auto普通网络/超时/解析/数值校验仅当前模块冷却300秒，键为适用原模块键加`:ordinary`；401/403/429及明确风控两模式共享`stock:source-control:v1:risk:{group}`的7200秒保护，未知原因旧冷却等待自然到期。采集锁在长分页期间续租，发布前核验归属。窗口和取消规则见[采样调度](sampling-scheduling.md)。
 
 交易日历由 `stock:calendar:v1:trading-days` 缓存提供。当天超出缓存日期范围时状态为 `UNKNOWN`，本轮不请求同花顺，旧成功模块降级为 `STALE`；没有旧数据则为 `ERROR`。上述时段、日历与锁约束适用于auto。内部POST显式`X-Collection-Mode: manual`复用同一采集逻辑，跳过普通冷却/间隔/采集锁/源配额，可窗口外刷新；无可靠源日期时tradeDate=null，只更新快照与实际采集时间、不新增日内点；HTTP共享限速、认证/风控、资源与事务保护保留。详情见[交易日历与内部任务 V1](trading-calendar-jobs-v1.md)。
 

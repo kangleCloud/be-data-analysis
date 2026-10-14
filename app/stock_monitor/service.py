@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from app.runtime.resources import SourceResourceError
 from app.runtime.cooldown import remaining, record
 from app.providers.xueqiu import XueqiuSourceError
+from app.providers.http import error_metadata
 from app.runtime.source_execution import SourceControlError, SourceCoolingError, SourceNotStartedError, SourceThrottledError, completed, source_batch
 import redis
 from app.stock_monitor.events import monitor_event_lock
@@ -366,8 +367,10 @@ class StockMonitorSampler:
                         reason = exc.reason if isinstance(exc, QuoteValidationError) else (
                             "source_error" if isinstance(exc, XueqiuSourceError) else "unexpected_error")
                         field = exc.field if isinstance(exc, QuoteValidationError) else "none"
-                        LOGGER.warning("雪球报价 %s 失败，原因 %s，字段 %s，异常 %s，采集日期 %s",
-                                       symbol, reason, field, type(exc).__name__, local.date().isoformat())
+                        metadata = error_metadata(exc)
+                        LOGGER.warning("雪球报价失败 symbol=%s sourcePid=%s reason=%s field=%s date=%s diagnostic=%s",
+                                       symbol, metadata.get("source_pid"), reason, field,
+                                       local.date().isoformat(), metadata)
                         self._mark_failed(symbol, local)
                         if isinstance(exc, XueqiuSourceError) and exc.cooldown:
                             self.store.start_cooldown()

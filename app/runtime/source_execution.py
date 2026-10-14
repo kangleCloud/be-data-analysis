@@ -3,6 +3,7 @@
 import logging
 import multiprocessing as mp
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -123,6 +124,7 @@ class SourceCallError(RuntimeError):
         self.fields = metadata.get("fields", ())
         self.code = metadata.get("code")
         self.bad_rows = metadata.get("bad_rows", 0)
+        self.source_pid = metadata.get("source_pid")
         super().__init__(f"type={self.exception_type} root={self.root_type} "
                          f"http={self.http_status} category={self.category}")
 
@@ -146,6 +148,14 @@ class SourceCall:
 
     batch_interval_keys: tuple[str, ...] = ()
     entry_lane: str | None = None
+
+
+def _public_symbol(call: SourceCall) -> str | None:
+    """只提取公开股票代码，不能输出包含Token的完整参数。"""
+    value = call.parameters.get("symbol")
+    if isinstance(value, str) and re.fullmatch(r"(?:SH|SZ|BJ)?[0-9]{6}", value.upper()):
+        return value.upper()
+    return None
 
 
 class SourceControl:
@@ -212,7 +222,7 @@ class SourceControl:
                         LOGGER.info("限频跳过 function=%s remainingMs=%d", call.function, value)
                         raise SourceThrottledError(max(0, (value+999)//1000))
                     if not interval_wait_logged:
-                        LOGGER.info("限频等待 function=%s remainingMs=%d", call.function, value)
+                        LOGGER.info("限频等待 function=%s symbol=%s sourcePid=%s remainingMs=%d", call.function, _public_symbol(call), os.getpid(), value)
                         interval_wait_logged = True
                     slept = time.monotonic()
                     time.sleep(min(0.1, value/1000, max(0, deadline-time.monotonic())))
@@ -227,8 +237,8 @@ class SourceControl:
                 rate_wait += time.monotonic()-slept
         finally:
             if rate_wait or interval_wait:
-                LOGGER.info("HTTP等待耗时 function=%s rateWait=%.3f intervalWait=%.3f",
-                            call.function, rate_wait, interval_wait)
+                LOGGER.info("HTTP等待耗时 function=%s symbol=%s sourcePid=%s rateWait=%.3f intervalWait=%.3f",
+                            call.function, _public_symbol(call), os.getpid(), rate_wait, interval_wait)
 
     def cool(self, call: SourceCall, metadata: dict[str, Any]) -> None:
         keys = call.cooldown_keys if call.cooldown_policy in {"market", "etf"} else ()
@@ -258,37 +268,68 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
     sliding = None
 
     def physical_send(session, request, kwargs, *, quota_keys=keys, quota_token=token, cancelled=None):
-        if urlparse(request.url).hostname not in call.domains:
-            raise SourceControlError("源请求域名不在审计清单中")
-        waits = control.request_turn(call, quota_keys, quota_token, guard, deadline,
-                             sampling_token=token, first_request=not first_started.is_set(), cancelled=cancelled)
-        if waits is not None:
-            paging.measure(rateWait=waits[0], intervalWait=waits[1])
-        first_started.set()
-        if cancelled is not None and cancelled.is_set():
-            raise SourceControlError("资金分页已取消")
-        remaining = max(0.001, deadline-time.monotonic())
-        options = dict(kwargs)
-        connect, read = bounded_timeout(options.get("timeout"), read_seconds)
-        options["timeout"] = (min(connect, remaining), min(read, remaining))
-        if call.fund_profile or paging.enabled:
-            options["allow_redirects"] = False
+        parsed = urlparse(request.url)
+        response = None
+        failure_metadata = None
+        network_seconds = None
         try:
-            if started_event is not None:
-                started_event.set()
-            network_started = time.monotonic()
-            paging.measure(requests=1)
+            if parsed.hostname not in call.domains:
+                raise SourceControlError("源请求域名不在审计清单中")
+            waits = control.request_turn(call, quota_keys, quota_token, guard, deadline,
+                                 sampling_token=token, first_request=not first_started.is_set(), cancelled=cancelled)
+            if waits is not None:
+                paging.measure(rateWait=waits[0], intervalWait=waits[1])
+            first_started.set()
+            if cancelled is not None and cancelled.is_set():
+                raise SourceControlError("资金分页已取消")
+            remaining = max(0.001, deadline-time.monotonic())
+            options = dict(kwargs)
+            connect, read = bounded_timeout(options.get("timeout"), read_seconds)
+            options["timeout"] = (min(connect, remaining), min(read, remaining))
+            if call.fund_profile or paging.enabled:
+                options["allow_redirects"] = False
             try:
-                response = original(session, request, **options)
-            finally:
-                paging.measure(network=time.monotonic()-network_started)
-            response.raise_for_status()
-            return response
-        except SourceResourceError:
+                if started_event is not None:
+                    started_event.set()
+                network_started = time.monotonic()
+                paging.measure(requests=1)
+                try:
+                    response = original(session, request, **options)
+                finally:
+                    network_seconds = time.monotonic()-network_started
+                    paging.measure(network=network_seconds)
+                response.raise_for_status()
+                return response
+            except SourceResourceError as exc:
+                failure_metadata = error_metadata(exc)
+                raise
+            except Exception as exc:
+                failure_metadata = error_metadata(exc)
+                if response is None:
+                    response = getattr(exc, "response", None)
+                control.cool(call, failure_metadata)
+                raise
+        except BaseException as exc:
+            if failure_metadata is None:
+                failure_metadata = error_metadata(exc)
             raise
-        except Exception as exc:
-            control.cool(call, error_metadata(exc))
-            raise
+        finally:
+            if call.group == "xq":
+                # 仅固定阶段和MIME类型，不记录查询URL、响应正文或请求头。
+                phase = ("HOME" if parsed.hostname == "xueqiu.com" else
+                         "QUOTE" if parsed.path == "/v5/stock/quote.json" else
+                         "PROFILE" if call.function == "stock_individual_basic_info_xq" else
+                         "ASSET_ALLOCATION" if parsed.hostname == "danjuanfunds.com" else "OTHER_XQ")
+                status = getattr(response, "status_code", None)
+                mime = getattr(response, "headers", {}).get("Content-Type", "")
+                mime = mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else ""
+                if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", mime):
+                    mime = None
+                LOGGER.info("雪球HTTP function=%s symbol=%s sourcePid=%s phase=%s status=%s contentType=%s network=%s diagnostic=%s",
+                            call.function, _public_symbol(call), os.getpid(), phase,
+                            status if isinstance(status, int) else None, mime or None,
+                            round(network_seconds, 3) if network_seconds is not None else None,
+                            failure_metadata)
 
     if paging.enabled:
         from app.providers.ths_parallel import SlidingIndividualPages
@@ -357,7 +398,8 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
         from app.core.logging import configure_logging
         configure_logging("info", "source:"+call.function)
         import akshare
-        LOGGER.info("源初始化耗时 %.2f 秒", time.monotonic()-initialized)
+        LOGGER.info("源初始化耗时 %.2f 秒 function=%s symbol=%s sourcePid=%s",
+                    time.monotonic()-initialized, call.function, _public_symbol(call), os.getpid())
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
         with controlled_http(control, call, keys, token, guard, deadline, read_seconds, started_event) as paging, quiet_progress():
@@ -368,7 +410,8 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
             fetched = time.monotonic()
             frame = function(**call.parameters)
             function_seconds = time.monotonic()-fetched
-            LOGGER.info("AKShare函数执行耗时 %.2f 秒", function_seconds)
+            LOGGER.info("AKShare函数执行耗时 %.2f 秒 function=%s symbol=%s sourcePid=%s",
+                        function_seconds, call.function, _public_symbol(call), os.getpid())
             if paging.enabled:
                 LOGGER.info("AKShare剩余函数耗时 %.3f 秒（原签名/解析/拼接未分别测量）",
                             max(0.0, function_seconds-paging.metrics["wrapper"]))
@@ -398,6 +441,9 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
             metadata["category"] = "AUTH_REJECTED"
         if type(exc).__name__ == "NetworkError":
             metadata["category"] = "NETWORK"
+        metadata["source_pid"] = os.getpid()
+        LOGGER.warning("源执行失败 function=%s symbol=%s sourcePid=%s diagnostic=%s",
+                       call.function, _public_symbol(call), os.getpid(), metadata)
         try:
             if started_event.is_set() or metadata["category"] != "TIMEOUT":
                 control.cool(call, metadata)
@@ -426,6 +472,7 @@ class SourceExecutor:
         self.parent_cancel: threading.Event | None = None
         self.guard: tuple[str, str] | None = None
         self.deadline: float | None = None
+        self.source_pid: int | None = None
 
     @classmethod
     def configured(cls, read_seconds: float | None = None, *, lane: str = "reference", mode: str = "auto") -> "SourceExecutor":
@@ -520,6 +567,7 @@ class SourceExecutor:
         quota_started = time.monotonic()
         quota_seconds = None
         requested = self.context.Event()
+        self.source_pid = None
         try:
             quota_wait_logged = False
             while keys is None:
@@ -543,6 +591,7 @@ class SourceExecutor:
             process = self.context.Process(target=self.worker, args=(queue, self.redis_url, call, keys, token,
                 guard, request_deadline, self.read_seconds, os.getpid(), requested), daemon=True)
             process.start()
+            self.source_pid = process.pid
             renewed = time.monotonic()
             while True:
                 self._check()
@@ -582,7 +631,7 @@ class SourceExecutor:
             if status != "ok":
                 if result["category"] == "TIMEOUT" and not requested.is_set():
                     raise SourceNotStartedError("源预算结束，尚未发起请求")
-                raise SourceCallError(result)
+                raise SourceCallError({**result, "source_pid": self.source_pid})
             successful = True
             outcome = "成功后清理"
             return result
@@ -596,16 +645,20 @@ class SourceExecutor:
                 outcome = "超时"
             else:
                 outcome = "失败"
-            log("源%s function=%s reason=%s elapsed=%.2f exitcode=%s",outcome,call.function,getattr(exc,"reason",None) or type(exc).__name__,time.monotonic()-started,process.exitcode if process else None)
+            log("源%s function=%s symbol=%s sourcePid=%s reason=%s elapsed=%.2f exitcode=%s diagnostic=%s",
+                outcome, call.function, _public_symbol(call), self.source_pid,
+                getattr(exc,"reason",None) or type(exc).__name__, time.monotonic()-started,
+                process.exitcode if process else None, error_metadata(exc))
             if process is not None:
-                self._reap(process, deadline, outcome=outcome)
+                self._reap(process, deadline, outcome=outcome, function=call.function, symbol=_public_symbol(call))
                 exitcode = process.exitcode
                 process.close()
                 process = None
             raise
         finally:
             if process is not None:
-                self._reap(process, deadline, successful=successful, outcome=outcome)
+                self._reap(process, deadline, successful=successful, outcome=outcome,
+                           function=call.function, symbol=_public_symbol(call))
                 exitcode = process.exitcode
                 process.close()
             if queue is not None:
@@ -616,10 +669,12 @@ class SourceExecutor:
                 self.control.release(keys, token)
             if quota_seconds is None:
                 LOGGER.info("源配额等待耗时 function=%s seconds=%.3f", call.function, time.monotonic()-quota_started)
-            LOGGER.info("源 %s 总耗时 %.2f 秒 exitcode=%s",call.function,time.monotonic()-started,exitcode)
+            LOGGER.info("源 %s 总耗时 %.2f 秒 exitcode=%s symbol=%s sourcePid=%s",
+                        call.function, time.monotonic()-started, exitcode, _public_symbol(call), self.source_pid)
 
     @staticmethod
-    def _reap(process: Any, deadline: float, *, successful: bool = False, outcome: str = "取消") -> None:
+    def _reap(process: Any, deadline: float, *, successful: bool = False, outcome: str = "取消",
+              function: str | None = None, symbol: str | None = None) -> None:
         if getattr(process, "pid", None) is None:
             return
         deadline = min(deadline, time.monotonic() + CLEANUP_SECONDS)
@@ -634,7 +689,9 @@ class SourceExecutor:
         if process.is_alive():
             raise SourceControlError("源进程未完成回收，拒绝释放名额")
         process.join(timeout=0)
-        LOGGER.info("源回收 stage=%s exitcode=%s signal=%s",outcome,process.exitcode,-process.exitcode if process.exitcode is not None and process.exitcode < 0 else None)
+        LOGGER.info("源回收 stage=%s exitcode=%s signal=%s function=%s symbol=%s sourcePid=%s",
+                    outcome, process.exitcode, -process.exitcode if process.exitcode is not None and process.exitcode < 0 else None,
+                    function, symbol, process.pid)
 
 
 @contextmanager

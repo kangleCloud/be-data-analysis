@@ -1,6 +1,16 @@
 # be-data-analysis
 
-AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股即时资金流，汇总后写入 Redis DB 2，供 `be-vita` 读取。前端不直接调用本程序。
+本说明纳入[v1.0.0工作树文档归档](../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
+AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股即时资金流，汇总后写入 Redis DB 2，供 `be-data-stock` 读取。前端不直接调用本程序。
+
+## v1.0.0 归档状态
+
+本轮只核对并修订文档。工作树已实现AKShare1.19.1、四个独立120秒周期、完整市场四候选资金优先、两页滑动窗口及同批资金发布；实现说明不代表生产已部署。
+
+2026-10-14已交付155项临时离线模拟通过记录，覆盖13函数/14调用组合、当前原函数解析与映射、分页/连接/配额/回收、事务/历史保护、雪球诊断和demo安全启动；本轮归档未重新运行这些业务测试。真实源健康、生产性能和生产部署未实测。相关SQL为“用户确认已执行，非本轮独立数据库核验”，不再列为未执行待办。
+
+详细契约、业务、运维和验证证据由[根归档](../docs/releases/v1.0.0.md)维护。本仓库现行说明入口：[市场快照](docs/market-snapshot-v1.md)、[个股监控](docs/stock-monitor-v1.md)、[交易日历与任务](docs/trading-calendar-jobs-v1.md)、[指数与ETF](docs/index-etf-sources-v1.md)、[调度与并发](docs/sampling-scheduling.md)、[原生部署](docs/native-systemd-deployment.md)、[源依赖与诊断](docs/source-health-check.md)。
 
 ## 部署方式
 
@@ -10,7 +20,8 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 ## 环境
 
 - Python 3.12
-- Redis，需与 `be-vita` 连接同一个实例和 DB 2
+- AKShare 固定 `1.19.1`；资金精确分页只支持此审计版本，其他版本拒绝适配
+- Redis，需与 `be-data-stock` 连接同一个实例和 DB 2
 - 本地开发与测试：`pip install -r requirements-dev.txt`；生产镜像只安装 `requirements.txt` 中的运行依赖
 - 配置参考 `.env.example`。本地默认读取被 Git 忽略的 `.env.dev`；`APP_ENV=prod` 选择 `.env.prod`。运行时环境变量覆盖文件配置，文件中的密码不作变量展开
 
@@ -107,7 +118,6 @@ curl -X POST http://127.0.0.1:8000/internal/jobs/v1/market/refresh \
 
 ```bash
 python -m compileall app
-python -m pytest
 ```
 
-测试使用固定 DataFrame 和假 Redis，不依赖行情源或真实 Redis。AKShare 公开接口可能变化，部署前应运行一次受控联调，检查实际字段、最新交易日期及源站频率限制。
+仓库不提供已删除的tests目录或默认pytest入口。2026-10-14的155项验证使用/tmp中的模拟HTTP、固定DataFrame和fake Redis；本轮未重跑，历史命令见[源验证记录](docs/source-health-check.md)。真实源健康、生产性能和生产部署仍未实测。

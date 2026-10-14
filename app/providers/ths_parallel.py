@@ -39,8 +39,8 @@ class SlidingIndividualPages:
                  call: SourceCall, keys: tuple[str, str] | None, token: str,
                  guard: tuple[str, str] | None, deadline: float,
                  *, signature_factory=ths_signature) -> None:
-        if call.group != 'ths' or importlib.metadata.version('akshare') != '1.18.97':
-            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.18.97')
+        if call.group != 'ths' or importlib.metadata.version('akshare') != '1.19.1':
+            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.19.1')
         self.paging, self.physical_send, self.control, self.call = paging, send, control, call
         self.keys, self.token, self.guard, self.deadline = keys, token, guard, deadline
         self.signature_factory = signature_factory

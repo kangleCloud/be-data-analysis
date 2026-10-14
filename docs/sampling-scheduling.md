@@ -1,5 +1,7 @@
 # 监控采样调度与并发
 
+本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
 ## 固定任务
 
 | 任务 | AUTO入口 | 周期/在途 |
@@ -27,7 +29,7 @@ AUTO每股每轮最多一次，先提交已到期项。父流程用Redis PTTL估
 
 ## 固定即时资金两页适配
 
-只针对AKShare 1.18.97的`stock_fund_flow_individual(symbol="即时")`及`data.10jqka.com.cn/funds/ggzjl/field/{code,zdf}/order/desc/page/{page}/ajax/1/free/1/`精确路径。发现总页数的请求串行；同一函数内采用最多两页滑动窗口，请求中和完成但未消费页共同计数；消费前页后即补下一页，不并行重复调用整个函数，不修改安装包。分页URL改为稳定code倒序，按页码交付，原AKShare负责HTML表格解析与DataFrame合并。行业/概念和其他参数不使用此适配。
+只针对AKShare 1.19.1的`stock_fund_flow_individual(symbol="即时")`及`data.10jqka.com.cn/funds/ggzjl/field/{code,zdf}/order/desc/page/{page}/ajax/1/free/1/`精确路径。发现总页数的请求串行；同一函数内采用最多两页滑动窗口，请求中和完成但未消费页共同计数；消费前页后即补下一页，不并行重复调用整个函数，不修改安装包。分页URL改为稳定code倒序，按页码交付，原AKShare负责HTML表格解析与DataFrame合并。行业/概念和其他参数不使用此适配。
 
 两条固定执行通道各自独占一个批次级持久Session，复用连接，并在所属线程关闭；原请求头、代理、证书及超时选项保持。原调用当前页使用AKShare生成的`hexin-v`，预取页通过原模块`ths.js`与MiniRacer流程独立生成签名；Linux旧MiniRacer没有close时沿对象回收，保留已修复的平台差异处理。每页只有一次实际请求；仅保留当前两页原响应，已解析旧响应在下次请求时清空。AUTO额外页尝试原子获取一个全局/THS名额，无空闲时直接串行继续，不排队等待额外名额。额外租约每10秒续租，HTTP完成释放；源进程被强制取消/超时回收后，父进程按`源token:page`所有权清理其残留名额，不能误删其他持有者。
 

@@ -14,14 +14,7 @@ def bounded_timeout(original: Any, read_seconds: float) -> tuple[float, float]:
 
 
 def error_metadata(exc: BaseException) -> dict[str, Any]:
-    if getattr(exc,'category',None) == 'RESOURCE':
-        return {'exception_type':type(exc).__name__,'root_type':type(exc).__name__,
-                'http_status':None,'category':'RESOURCE'}
-    if all(hasattr(exc, field) for field in ("exception_type", "root_type", "http_status", "category")):
-        result = {field: getattr(exc, field) for field in ("exception_type", "root_type", "http_status", "category")}
-        if getattr(exc,'reason',None):
-            result.update(reason=exc.reason,fields=exc.fields,code=exc.code,bad_rows=exc.bad_rows)
-        return result
+    """透传异常链中已有安全诊断，不读取或解析异常原文。"""
     chain = []
     seen = set()
     current = exc
@@ -34,6 +27,18 @@ def error_metadata(exc: BaseException) -> dict[str, Any]:
         if nested is None:
             break
         current = nested
+    for item in chain:
+        if all(hasattr(item, field) for field in ("exception_type", "root_type", "http_status", "category")):
+            result = {field: getattr(item, field) for field in ("exception_type", "root_type", "http_status", "category")}
+            if getattr(item, 'reason', None):
+                result.update(reason=item.reason, fields=item.fields, code=item.code, bad_rows=item.bad_rows)
+            source_pid = getattr(item, 'source_pid', None)
+            if isinstance(source_pid, int) and not isinstance(source_pid, bool) and source_pid > 0:
+                result['source_pid'] = source_pid
+            return result
+        if getattr(item, 'category', None) == 'RESOURCE':
+            return {'exception_type': type(item).__name__, 'root_type': type(item).__name__,
+                    'http_status': None, 'category': 'RESOURCE'}
     status = next((getattr(getattr(item, "response", None), "status_code", None)
                    for item in chain if getattr(item, "response", None) is not None), None)
     if not isinstance(status, int):
@@ -44,17 +49,22 @@ def error_metadata(exc: BaseException) -> dict[str, Any]:
         category = "HTTP_ERROR"
     elif any(isinstance(item, (requests.Timeout, TimeoutError)) for item in chain):
         category = "TIMEOUT"
+    elif any(isinstance(item, requests.exceptions.JSONDecodeError) for item in chain):
+        # requests的JSONDecodeError也继承OSError，不能据此误标为网络失败。
+        category = "FORMAT"
     elif any(isinstance(item, (requests.ConnectionError, ConnectionError, OSError))
              for item in chain):
         category = "NETWORK"
-    elif isinstance(exc, (ValueError, TypeError, KeyError, AttributeError, IndexError)):
+    elif any(isinstance(item, (ValueError, TypeError, KeyError, AttributeError, IndexError)) for item in chain):
         category = "FORMAT"
     else:
         category = "UNEXPECTED"
     result = {"exception_type": type(exc).__name__, "root_type": type(chain[-1]).__name__,
             "http_status": status, "category": category}
-    if hasattr(exc,'diagnostic') and getattr(exc,'reason',None):
-        result.update(reason=exc.reason,fields=exc.fields,code=exc.code,bad_rows=exc.bad_rows)
+    diagnostic = next((item for item in chain if hasattr(item, 'diagnostic') and getattr(item, 'reason', None)), None)
+    if diagnostic is not None:
+        result.update(reason=diagnostic.reason, fields=diagnostic.fields,
+                      code=diagnostic.code, bad_rows=diagnostic.bad_rows)
     return result
 
 

@@ -1,5 +1,7 @@
 # 交易日历缓存与内部手动任务 V1
 
+本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+
 ## 共享交易日历
 
 Redis DB 2 的 `stock:calendar:v1:trading-days` 是唯一的交易日历缓存，单键 JSON 写入且无 TTL：
@@ -40,7 +42,7 @@ X-Collection-Mode: manual
 
 业务编排与标准化在服务父进程执行，每次AKShare源调用由独立spawn子进程执行和回收，避免在线程池内运行AKShare超时逻辑。服务等待同花顺和新浪指数源及日历开销，上限 1380 秒；日历源预算为SOURCE_TIMEOUT_SECONDS+12（默认27秒，含回收）、个股行情与ETF行情批次分别300、120秒。调用方的请求超时应高于对应上限，市场请求建议至少等待 1440 秒。
 
-四种jobs任务与CLI/自动调度复用同一业务流程。先认证X-Internal-Token再校验X-Collection-Mode；缺省auto，仅精确auto/manual有效，其他400。auto保留交易窗口、日历、入口/任务锁、源配额、间隔和冷却。manual跳过普通失败冷却、采集锁/入口/源配额和任务/单股/资料/日历间隔，可休市或窗口外执行，每次请求仍串行；HTTP共享限速、401/403/429及明确风控、未知旧保护、雪球总闸/Token、≤10、截止与资源保护以及Redis短写锁/事务仍生效。无可靠源日期的市场/指数/ETF窗口外只更新快照与实际采集时间，tradeDate=null，不新增日内点；股票保留真实源日期与时间且不能倒退，严格>15:00收盘，不补历史点。详细契约见[source-health-check.md](source-health-check.md)。
+四种jobs任务与CLI/自动调度复用同一业务流程。先认证X-Internal-Token再校验X-Collection-Mode；缺省auto，仅精确auto/manual有效，其他400。auto保留交易窗口、日历、入口/任务锁、源配额、间隔和冷却。manual跳过普通失败冷却、采集锁/入口/源配额和任务/单股/资料/日历间隔，可休市或窗口外执行；个股/市场行情子集最多三项、完整市场资金优先四候选、即时资金两页窗口，资料/字典批次串行；HTTP共享限速、401/403/429及明确风控、未知旧保护、雪球总闸/Token、≤10、截止与资源保护以及Redis短写锁/事务仍生效。无可靠源日期的市场/指数/ETF窗口外只更新快照与实际采集时间，tradeDate=null，不新增日内点；股票保留真实源日期与时间且不能倒退，严格>15:00收盘，不补历史点。详细契约见[source-health-check.md](source-health-check.md)。
 
 ## 本机 scheduler 与 Python 业务映射
 

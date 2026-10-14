@@ -1,3 +1,9 @@
+# 直接脚本入口不能让app/calendar遮蔽标准库calendar；模块入口沿用原搜索路径。
+if __name__ == "__main__" and not __package__:
+    import sys
+    from pathlib import Path
+    sys.path[0] = str(Path(__file__).resolve().parent.parent)
+
 # 新浪指数
 # import akshare as ak
 #
@@ -23,7 +29,13 @@
 # print(fund_portfolio_hold_em_df)
 
 # 同花顺-个股资金流
-import akshare as ak
+# import akshare as ak
+#
+# stock_fund_flow_individual_df = ak.stock_fund_flow_individual(symbol="即时")
+# print(stock_fund_flow_individual_df)
 
-stock_fund_flow_individual_df = ak.stock_fund_flow_individual(symbol="即时")
-print(stock_fund_flow_individual_df)
+# 同花顺个股资金服务端筛选演示：导入无网络，仅显式运行下面命令才请求一页基线。
+# python -m app.demo --code 601991 --no-proxy
+# 无已证实的代码筛选参数，不默认猜测code/stockcode；实验参数须由调用者显式提供：
+# python -m app.demo --code 601991 --experimental-query '{"由调用者指定的参数名":"601991"}'
+# 仅观测原始返回的全部股票代码，不下载后续分页，不用本地过滤伪装服务端筛选。
