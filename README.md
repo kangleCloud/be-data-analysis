@@ -75,6 +75,8 @@ tail -f /data/logs/be-data-analysis/service.log
 
 每模块/每股完成立即发布。市场快照采用WATCH/MULTI/EXEC，只合并本次变化模块；首次尝试后最多3次冲突重试，每次重新读最新快照/版本。资金点、股票版本与通知仍在原监控锁及同一事务中，失败变化通知不造点。控制Redis或业务发布失败停止后续处理。详见[执行控制与源验证](docs/source-health-check.md)。
 
+行情快照、曲线及个股/ETF行情`state-id`由Python独占写入；Java只维护启用清单并在原主题发布`{"resync":true}`，不改写行情版本。Python内部写入协调、增量版本链及同事务通知保持不变，手动与scheduler接口业务不变。职责、运行边界及本轮43项离线回归记录见[发布归属说明](docs/sampling-scheduling.md#行情版本与配置通知的归属)。
+
 代码按`app/api`、`runtime`、`providers`、`calendar`、`market`、`stock_monitor`、`etf_monitor`分包；`main/cli/__main__`与`core`保留。Python只输出结构化JSON，不生成HTML或全局改写字符串；展示文本的转义、合法HTTP/HTTPS外链限制由实际渲染端处理，不把转义内容写入业务存储。
 
 请求连接上限五秒，读取上限由 `SOURCE_TIMEOUT_SECONDS` 控制（默认十五秒），保留源接口原有更短限制。同花顺分页至少间隔一秒，ETF 资料请求至少间隔两秒。日志包含上海时间、PID、任务、接口和模块耗时，已知 Redis 故障仅记录脱敏分类，分页进度条关闭。
