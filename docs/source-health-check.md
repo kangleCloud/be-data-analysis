@@ -421,3 +421,11 @@ PYTHONPATH="$PWD" .venv/bin/python -m pytest --rootdir=/tmp/akshare-1191-validat
 覆盖：当前AKShare1.19.1全部14组合真实签名绑定与Provider参数、模拟HTTP下原函数表格/JSON/XLSX解析和业务映射、资金完整分页/滑动窗口/持久Session/无配额串行/限速/取消/回收及租约释放、同批资金点/版本连续/失败历史保护、雪球异常链与日志脱敏、ETF买卖价，以及demo两种入口的安全启动。日历编码和THS签名的JS上下文使用mock；真实数据源、生产Redis、生产部署和性能均未实测。用户确认相关SQL已执行，非本轮独立数据库核验。
 
 实现证据入口：`app/market/collector.py`和`normalize.py`的四模块与映射、`snapshot.py`的WATCH合并/事务/资金点；`app/runtime/scheduler.py`及`workflows.py`的四周期与完整刷新；`source_execution.py`的6/3/2配额和独立源进程；`app/providers/ths_parallel.py`和`ths_paging.py`的两页窗口与精确审计；`app/stock_monitor/service.py`的源时间、收盘及历史规则；`app/api/jobs.py`的同步路由；`deploy/systemd/`的原生部署模板。这些路径用于实现核对，不构成生产验收记录。
+
+## 2026-11-03 雪球重定向与域名拒绝诊断
+
+历史故障日志为HOME请求内部先出现OTHER_XQ/SourceControlError，再取消三股，手动任务返回500；这与requests自动跟随首页重定向、下一跳不在审计域名中的情况吻合。旧日志未记录跳转目标，不能据此确认目标域名或归因Token、403、超时、OOM。
+
+现对雪球每个物理请求先记录实际HTTP状态，再使用requests原resolve_redirects处理后续跳转；各跳继续经过现有域名清单、HTTP间隔和超时预算，保留Cookie/代理/证书及重定向上限，不增加重试。非白名单目标仍不发送请求；日志仅输出安全targetHost、DOMAIN_BLOCKED阶段及固定DOMAIN_NOT_ALLOWED原因，不输出Location全文、query、Cookie或Token。允许列表未扩大。
+
+雪球域名拒绝改为单次源失败，沿SourceCallError及source_error降级，保留历史；不再误作Redis/入口控制失效去取消其他股票。真正的配额/入口失效仍维持取消整批。若再次发生，核对同symbol/sourcePid的HOME状态（如302）、targetHost及DOMAIN_NOT_ALLOWED，即可确认是否为同一原因，再审计目标是否应该支持，不能直接放开任意域名。此修复的离线模拟不代表服务器连接已恢复。

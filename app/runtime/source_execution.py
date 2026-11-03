@@ -274,6 +274,16 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
         network_seconds = None
         try:
             if parsed.hostname not in call.domains:
+                if call.group == "xq":
+                    # 域名拒绝是当前源调用失败，不是Redis/入口失效，不能取消其他股票。
+                    host = parsed.hostname or ""
+                    host = host if len(host) <= 253 and re.fullmatch(r"[a-zA-Z0-9.-]+", host) else "INVALID_HOST"
+                    LOGGER.warning("雪球域名拒绝 function=%s symbol=%s sourcePid=%s targetHost=%s reason=DOMAIN_NOT_ALLOWED",
+                                   call.function, _public_symbol(call), os.getpid(), host)
+                    raise SourceCallError({"exception_type": "SourceCallError", "root_type": "SourceCallError",
+                                           "http_status": None, "category": "FORMAT",
+                                           "reason": "DOMAIN_NOT_ALLOWED", "fields": ("host",),
+                                           "code": None, "bad_rows": 0})
                 raise SourceControlError("源请求域名不在审计清单中")
             waits = control.request_turn(call, quota_keys, quota_token, guard, deadline,
                                  sampling_token=token, first_request=not first_started.is_set(), cancelled=cancelled)
@@ -286,7 +296,7 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
             options = dict(kwargs)
             connect, read = bounded_timeout(options.get("timeout"), read_seconds)
             options["timeout"] = (min(connect, remaining), min(read, remaining))
-            if call.fund_profile or paging.enabled:
+            if call.fund_profile or paging.enabled or call.group == "xq":
                 options["allow_redirects"] = False
             try:
                 if started_event is not None:
@@ -316,7 +326,8 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
         finally:
             if call.group == "xq":
                 # 仅固定阶段和MIME类型，不记录查询URL、响应正文或请求头。
-                phase = ("HOME" if parsed.hostname == "xueqiu.com" else
+                phase = ("DOMAIN_BLOCKED" if failure_metadata and failure_metadata.get("reason") == "DOMAIN_NOT_ALLOWED" else
+                         "HOME" if parsed.hostname == "xueqiu.com" else
                          "QUOTE" if parsed.path == "/v5/stock/quote.json" else
                          "PROFILE" if call.function == "stock_individual_basic_info_xq" else
                          "ASSET_ALLOCATION" if parsed.hostname == "danjuanfunds.com" else "OTHER_XQ")
@@ -352,6 +363,15 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
                 raise
             finally:
                 paging.measure(audit=time.monotonic()-audit_started)
+            if call.group == "xq" and kwargs.get("allow_redirects", True):
+                # 每一跳先单独记录真实状态，再经同一审计/限速入口发送下一跳。
+                # 使用requests原重定向逻辑保留Cookie、代理、证书和重定向上限语义。
+                redirect_options = {key: value for key, value in kwargs.items() if key != "allow_redirects"}
+                history = list(session.resolve_redirects(response, request, **redirect_options))
+                if history:
+                    history.insert(0, response)
+                    response = history.pop()
+                    response.history = history
             return response
         finally:
             paging.measure(wrapper=time.monotonic()-wrapper_started)
