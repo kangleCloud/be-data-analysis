@@ -73,7 +73,7 @@ class XueqiuProvider:
         try:
             frame = self.executor.call(SourceCall(function, "xq", {
                 "symbol": symbol, "token": self._token, "timeout": self._timeout,
-            }, 300, ("xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
+            }, 300, ("xueqiu.com", "www.xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
                 interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
                 if function == "stock_individual_spot_xq" else None, mode=self.mode))
             return _items(frame)

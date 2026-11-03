@@ -92,6 +92,17 @@ return {1,0,elapsed}
 class SourceControlError(RuntimeError):
     """配额、业务锁或 Redis 控制失效；停止整轮而不是继续源请求。"""
 
+    def __init__(self, message: str, *, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        if metadata is not None:
+            self.exception_type = metadata["exception_type"]
+            self.root_type = metadata["root_type"]
+            self.http_status = metadata["http_status"]
+            self.category = metadata["category"]
+            self.reason = metadata.get("reason")
+            self.fields, self.code, self.bad_rows = (), None, 0
+            self.source_pid = metadata.get("source_pid")
+
 
 class SourceBusyError(SourceControlError):
     """其他采集入口占用资源，立即拒绝。"""
@@ -327,7 +338,7 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
             if call.group == "xq":
                 # 仅固定阶段和MIME类型，不记录查询URL、响应正文或请求头。
                 phase = ("DOMAIN_BLOCKED" if failure_metadata and failure_metadata.get("reason") == "DOMAIN_NOT_ALLOWED" else
-                         "HOME" if parsed.hostname == "xueqiu.com" else
+                         "HOME" if parsed.hostname in {"xueqiu.com", "www.xueqiu.com"} else
                          "QUOTE" if parsed.path == "/v5/stock/quote.json" else
                          "PROFILE" if call.function == "stock_individual_basic_info_xq" else
                          "ASSET_ALLOCATION" if parsed.hostname == "danjuanfunds.com" else "OTHER_XQ")
@@ -447,10 +458,13 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
         queue.put(("throttled", exc.ttl))
     except SourceCoolingError as exc:
         queue.put(("cooldown", exc.ttl))
-    except SourceControlError:
-        queue.put(("control", None))
-    except redis.RedisError:
-        queue.put(("control", None))
+    except (SourceControlError, redis.RedisError) as exc:
+        metadata = error_metadata(exc)
+        metadata.update(reason="REDIS_CONTROL_ERROR" if isinstance(exc, redis.RedisError) else "SOURCE_CONTROL_INVALID",
+                        source_pid=os.getpid())
+        LOGGER.warning("源控制失败 function=%s symbol=%s sourcePid=%s diagnostic=%s",
+                       call.function, _public_symbol(call), os.getpid(), metadata)
+        queue.put(("control", metadata))
     except Exception as exc:
         metadata = error_metadata(exc)
         # AKShare 的 APIError/NetworkError 可能没有 requests.response。
@@ -467,8 +481,12 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
         try:
             if started_event.is_set() or metadata["category"] != "TIMEOUT":
                 control.cool(call, metadata)
-        except redis.RedisError:
-            queue.put(("control", None))
+        except redis.RedisError as control_error:
+            control_metadata = error_metadata(control_error)
+            control_metadata.update(reason="REDIS_COOLDOWN_ERROR", source_pid=os.getpid())
+            LOGGER.warning("源控制失败 function=%s symbol=%s sourcePid=%s diagnostic=%s",
+                           call.function, _public_symbol(call), os.getpid(), control_metadata)
+            queue.put(("control", control_metadata))
         else:
             queue.put(("error", metadata))
     finally:
@@ -647,7 +665,7 @@ class SourceExecutor:
             if status == "cooldown":
                 raise SourceCoolingError(result)
             if status == "control":
-                raise SourceControlError("源请求控制失效")
+                raise SourceControlError("源请求控制失效", metadata=result)
             if status != "ok":
                 if result["category"] == "TIMEOUT" and not requested.is_set():
                     raise SourceNotStartedError("源预算结束，尚未发起请求")

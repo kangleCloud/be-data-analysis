@@ -35,7 +35,7 @@ THS_MARKET_POLICY = [
 PUBLIC_AUTH = "公开网页接口，无服务 Token；仍可能被源站限流或拒绝"
 XQ_AUTH = (
     "STOCK_MONITOR_XQ_ENABLED=true 且已配置 XUEQIU_TOKEN 才允许；默认关闭。"
-    "只传已授权 Token，不记录 Cookie/Token；一次调用先建立 xueqiu.com 会话"
+    "只传已授权 Token，不记录 Cookie/Token；一次调用先建立 xueqiu.com 会话；允许其已观测的www.xueqiu.com首页跳转"
 )
 ETF_BUDGET = {
     "processSeconds": "SOURCE_TIMEOUT_SECONDS + 17（默认 32 秒）",
@@ -201,6 +201,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
                        "timeout": "(5, SOURCE_TIMEOUT_SECONDS)"},
         "provider": "app.providers.xueqiu.XueqiuProvider.profile",
         "endpoints": [{"method": "GET", "scheme": "https", "domain": "xueqiu.com", "path": "/"},
+                      {"method": "GET", "scheme": "https", "domain": "www.xueqiu.com", "path": "/", "note": "首页301跳转，复用同一审计/HTTP限速"},
                       {"method": "GET", "scheme": "https", "domain": "stock.xueqiu.com",
                        "path": "/v5/stock/f10/cn/company.json", "query": {"symbol": "{symbol}"}}],
         "authorization": XQ_AUTH,
@@ -219,6 +220,7 @@ SOURCES: tuple[dict[str, Any], ...] = (
                        "timeout": "(5, SOURCE_TIMEOUT_SECONDS)"},
         "provider": "app.providers.xueqiu.XueqiuProvider.quote",
         "endpoints": [{"method": "GET", "scheme": "https", "domain": "xueqiu.com", "path": "/"},
+                      {"method": "GET", "scheme": "https", "domain": "www.xueqiu.com", "path": "/", "note": "首页301跳转，复用同一审计/HTTP限速"},
                       {"method": "GET", "scheme": "https", "domain": "stock.xueqiu.com",
                        "path": "/v5/stock/quote.json", "query": {"symbol": "{symbol}", "extend": "detail"}}],
         "authorization": XQ_AUTH,

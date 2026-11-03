@@ -429,3 +429,7 @@ PYTHONPATH="$PWD" .venv/bin/python -m pytest --rootdir=/tmp/akshare-1191-validat
 现对雪球每个物理请求先记录实际HTTP状态，再使用requests原resolve_redirects处理后续跳转；各跳继续经过现有域名清单、HTTP间隔和超时预算，保留Cookie/代理/证书及重定向上限，不增加重试。非白名单目标仍不发送请求；日志仅输出安全targetHost、DOMAIN_BLOCKED阶段及固定DOMAIN_NOT_ALLOWED原因，不输出Location全文、query、Cookie或Token。允许列表未扩大。
 
 雪球域名拒绝改为单次源失败，沿SourceCallError及source_error降级，保留历史；不再误作Redis/入口控制失效去取消其他股票。真正的配额/入口失效仍维持取消整批。若再次发生，核对同symbol/sourcePid的HOME状态（如302）、targetHost及DOMAIN_NOT_ALLOWED，即可确认是否为同一原因，再审计目标是否应该支持，不能直接放开任意域名。此修复的离线模拟不代表服务器连接已恢复。
+
+20:27后续日志已确认首页HTTP301跳转到`www.xueqiu.com`并被拒绝。现仅为雪球报价/资料补入这一确切域名，仍经同一域名审计和HTTP限速，其他任意域名继续拒绝；www首页阶段也记为HOME。该日志中另一股随后在网络请求前TIMEOUT并触发控制取消，是独立问题，不能由域名故障推断其原因。
+
+子进程控制失败不再只回传control/None：现保留安全异常类型/分类/sourcePid，并固定标识REDIS_CONTROL_ERROR、SOURCE_CONTROL_INVALID或REDIS_COOLDOWN_ERROR；父进程仍按SourceControlError取消批次，但不再丢失底层诊断。未改Redis超时、源预算或保护策略，不能在缺少新日志时声称控制超时已恢复。
