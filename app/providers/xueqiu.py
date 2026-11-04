@@ -4,7 +4,6 @@ import os
 import time
 from typing import Any
 
-from app.providers.http import bounded_timeout
 from app.runtime.source_execution import SourceCall, SourceCallError, SourceExecutor
 
 
@@ -32,11 +31,10 @@ def _items(frame: Any) -> dict[str, Any]:
     return {row["item"]:row["value"] for row in rows}
 
 
-def _call(function: Any, *, symbol: str, token: str,
-          timeout: tuple[float, float]) -> dict[str, Any]:
+def _call(function: Any, *, symbol: str, token: str) -> dict[str, Any]:
     from akshare.exceptions import APIError, NetworkError, RateLimitError
     try:
-        return _items(function(symbol=symbol, token=token, timeout=timeout))
+        return _items(function(symbol=symbol, token=token))
     except XueqiuSourceError:
         raise
     except APIError as exc:
@@ -58,21 +56,20 @@ class XueqiuProvider:
     def __init__(self, token: str, timeout_seconds: int = 15, *, api: Any = None, executor: Any = None, mode: str = "auto") -> None:
         if not token:
             raise ValueError("雪球令牌未配置")
-        # AKShare 1.19.1 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
+        # AKShare 1.20.25 用 datetime.fromtimestamp 生成无时区的“时间”字符串。
         os.environ["TZ"] = "Asia/Shanghai"
         time.tzset()
         self._token = token
-        self._timeout = bounded_timeout(None, timeout_seconds)
         self._api = api
         self.mode = mode
         self.executor = executor if executor is not None else (None if api is not None else SourceExecutor.configured(timeout_seconds, lane="monitor", mode=mode))
 
     def _frame(self, function: str, symbol: str) -> dict[str, Any]:
         if self._api is not None:
-            return _call(getattr(self._api, function), symbol=symbol, token=self._token, timeout=self._timeout)
+            return _call(getattr(self._api, function), symbol=symbol, token=self._token)
         try:
             frame = self.executor.call(SourceCall(function, "xq", {
-                "symbol": symbol, "token": self._token, "timeout": self._timeout,
+                "symbol": symbol, "token": self._token,
             }, 300, ("xueqiu.com", "www.xueqiu.com", "stock.xueqiu.com"), ("stock:monitor:v1:xq:cooldown",), "stock",
                 interval_key=f"stock:monitor:v1:sample:lastRequest:{symbol}"
                 if function == "stock_individual_spot_xq" else None, mode=self.mode))

@@ -90,7 +90,7 @@
 
 `python -m app serve` 启动个股、ETF、市场行情、全市场资金四个独立120秒周期任务。市场行情包含指数/行业/概念三项，资金只调用即时个股榜；完整市场刷新原子获取quotes/funds两个入口，优先提交资金及三项行情共四个候选，按完成顺序由父流程标准化、WATCH合并及事务发布。每次源调用独立spawn子进程。同任务不重叠、不积压或补采。AUTO全局6、THS/XQ各3、SINA及各交易所各2个名额。
 
-AKShare当前固定1.19.1；即时资金使用两页滑动窗口及两条线程独占的持久Session，额外名额拿不到即串行，完整审计后一次发布同批汇总与个股点。CLI `python -m app collect` 使用auto，不能绕过交易窗口、日历、锁、120秒间隔和冷却。同花顺每次实际HTTP启动至少间隔一秒。auto普通网络/超时/解析/数值校验仅当前模块冷却300秒，键为适用原模块键加`:ordinary`；401/403/429及明确风控两模式共享`stock:source-control:v1:risk:{group}`的7200秒保护，未知原因旧冷却等待自然到期。采集锁在长分页期间续租，发布前核验归属。窗口和取消规则见[采样调度](sampling-scheduling.md)。
+AKShare当前固定1.20.25；即时资金使用两页滑动窗口及两条线程独占的持久Session，额外名额拿不到即串行，完整审计后一次发布同批汇总与个股点。CLI `python -m app collect` 使用auto，不能绕过交易窗口、日历、锁、120秒间隔和冷却。同花顺每次实际HTTP启动至少间隔一秒。auto普通网络/超时/解析/数值校验仅当前模块冷却300秒，键为适用原模块键加`:ordinary`；401/403/429及明确风控两模式共享`stock:source-control:v1:risk:{group}`的7200秒保护，未知原因旧冷却等待自然到期。采集锁在长分页期间续租，发布前核验归属。窗口和取消规则见[采样调度](sampling-scheduling.md)。
 
 交易日历由 `stock:calendar:v1:trading-days` 缓存提供。当天超出缓存日期范围时状态为 `UNKNOWN`，本轮不请求同花顺，旧成功模块降级为 `STALE`；没有旧数据则为 `ERROR`。上述时段、日历与锁约束适用于auto。内部POST显式`X-Collection-Mode: manual`复用同一采集逻辑，跳过普通冷却/间隔/采集锁/源配额，可窗口外刷新；无可靠源日期时tradeDate=null，只更新快照与实际采集时间、不新增日内点；HTTP共享限速、认证/风控、资源与事务保护保留。详情见[交易日历与内部任务 V1](trading-calendar-jobs-v1.md)。
 

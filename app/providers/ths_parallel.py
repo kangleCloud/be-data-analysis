@@ -20,16 +20,14 @@ LOGGER = logging.getLogger(__name__)
 
 def ths_signature() -> str:
     """复用原AKShare的ths.js及MiniRacer流程，逐页生成hexin-v。"""
-    module = importlib.import_module('akshare.stock_feature.stock_fund_flow')
+    module = importlib.import_module('akshare.stock.flow.stock_fund_flow')
     js = module.py_mini_racer.MiniRacer()
     try:
         js.eval(module._get_file_content_ths('ths.js'))
         return js.call('v')
     finally:
-        # AKShare在Linux使用旧版py-mini-racer，其上下文由对象回收，不提供close。
-        close = getattr(js, 'close', None)
-        if callable(close):
-            close()
+        # 固定版mini-racer显式释放签名上下文，避免分页累积V8资源。
+        js.close()
 
 
 class SlidingIndividualPages:
@@ -39,8 +37,8 @@ class SlidingIndividualPages:
                  call: SourceCall, keys: tuple[str, str] | None, token: str,
                  guard: tuple[str, str] | None, deadline: float,
                  *, signature_factory=ths_signature) -> None:
-        if call.group != 'ths' or importlib.metadata.version('akshare') != '1.19.1':
-            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.19.1')
+        if call.group != 'ths' or importlib.metadata.version('akshare') != '1.20.25':
+            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.20.25')
         self.paging, self.physical_send, self.control, self.call = paging, send, control, call
         self.keys, self.token, self.guard, self.deadline = keys, token, guard, deadline
         self.signature_factory = signature_factory

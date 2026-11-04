@@ -23,6 +23,8 @@ Java的admin、scheduler、openapi三处生产地址均使用`http://<PYTHON_VIR
 
 ## 安装生产依赖
 
+当前固定 AKShare 1.20.25，Python 3.12；其 `mini-racer>=0.13.0` 依赖要求 Linux glibc ≥ 2.27。安装前用 `ldd --version` 核对，旧版 CentOS 7 不满足要求；不限制具体发行版。新版另依赖 `curl_cffi>=0.13.0`，由生产 requirements 自动安装。Docker 继续使用 `python:3.12-slim`，升级时重新构建镜像，不复用旧虚拟环境。安装完成后执行 `python -m pip check`。
+
 在目标主机手工执行，进入提前准备好的`.venv`后安装依赖；不复制开发机虚拟环境，不安装测试依赖：
 
 ```bash

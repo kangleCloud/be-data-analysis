@@ -36,7 +36,7 @@ class AkShareEtfProvider:
             cooldown, policy = (), "none"
         else:
             function, group = "fund_individual_detail_hold_xq", "xq"
-            parameters = {"symbol": arguments["symbol"], "date": arguments["date"], "timeout": self.timeout_seconds}
+            parameters = {"symbol": arguments["symbol"], "date": arguments["date"]}
             cooldown, policy = (), "none"
         try:
             frame = self.executor.call(SourceCall(function, group, parameters, budget,

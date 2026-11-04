@@ -473,7 +473,8 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
             metadata["category"] = "HTTP_REJECTED" if exc.status_code in {401,403,429} else "HTTP_ERROR"
         if type(exc).__name__ == "APIError" and any(word in str(exc).lower() for word in ("token", "login")):
             metadata["category"] = "AUTH_REJECTED"
-        if type(exc).__name__ == "NetworkError":
+        # 新版AKShare也会将HTTP拒绝/JSON解码异常包装为NetworkError，保留异常链的具体分类。
+        if type(exc).__name__ == "NetworkError" and metadata["category"] == "UNEXPECTED":
             metadata["category"] = "NETWORK"
         metadata["source_pid"] = os.getpid()
         LOGGER.warning("源执行失败 function=%s symbol=%s sourcePid=%s diagnostic=%s",

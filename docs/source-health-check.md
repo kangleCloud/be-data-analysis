@@ -4,7 +4,7 @@
 
 ## 先区分接口说明、源验证和完整刷新
 
-本说明按项目固定 **AKShare 1.19.1** 的安装源码与当前 Provider 核对，包含 **13 个唯一函数、14 种参数调用组合**。上海字典的主板/科创板是同一函数的两个参数组合；ETF 字典和交易报价共用 `fund_etf_category_sina(symbol="ETF基金")`，不重复计数。一次函数调用可能先建会话、取页数或遍历多页，不能按一次 HTTP 请求估算耗时。
+本说明按项目固定 **AKShare 1.20.25** 的安装源码与当前 Provider 核对，包含 **13 个唯一函数、14 种参数调用组合**。上海字典的主板/科创板是同一函数的两个参数组合；ETF 字典和交易报价共用 `fund_etf_category_sina(symbol="ETF基金")`，不重复计数。一次函数调用可能先建会话、取页数或遍历多页，不能按一次 HTTP 请求估算耗时。
 
 本轮没有真实请求源站，所有源的验证状态均为 **NOT_CHECKED（未检查）**。静态说明保存在 `app/providers/catalog.py`，不参与业务路由或采集参数选择。查看说明不会读取 `.env.dev/.env.prod`、创建 Redis 客户端、导入 AKShare 或调用源接口：
 
@@ -319,7 +319,7 @@ print(json.dumps(record, ensure_ascii=False, indent=2))
 PY
 ```
 
-`python`是本次诊断解释器，`/proc/1/exe`和`/proc/1/cwd`是容器PID1的实际解释器/启动目录；若PID1是supervisor而非业务进程，应在已确认的业务PID核对同样两项，不打印完整命令行。当前Dockerfile/Compose使用`exec python -m app serve`。核对AKShare应为1.19.1，部署目录应与`appDirectory`一致。文件哈希可与准备部署的同版本文件对照；容器磁盘代码与长期运行进程的已加载代码也可能不同，不能只看宿主机仓库更新。
+`python`是本次诊断解释器，`/proc/1/exe`和`/proc/1/cwd`是容器PID1的实际解释器/启动目录；若PID1是supervisor而非业务进程，应在已确认的业务PID核对同样两项，不打印完整命令行。当前Dockerfile/Compose使用`exec python -m app serve`。核对AKShare应为1.20.25，部署目录应与`appDirectory`一致。文件哈希可与准备部署的同版本文件对照；容器磁盘代码与长期运行进程的已加载代码也可能不同，不能只看宿主机仓库更新。
 
 ### 2. 仅查看保护键TTL
 
@@ -396,11 +396,32 @@ Provider日志包含`phase=source/validate`、`combination`、`group`、`functio
 
 `app/demo.py`直接脚本入口在第三方导入前把app搜索目录调整为仓库根目录，避免业务包app/calendar遮蔽标准库calendar。后续建议使用`.venv/bin/python -m app.demo`；`.venv/bin/python app/demo.py`也保留支持。启动验证截取安全路径处理后，在全新子进程导入真实AKShare/pandas，确认calendar.day_abbr来自标准库；未执行演示中实际报价调用，不检查或输出演示Token。
 
-## AKShare 1.19.1 当前项目基线
+## AKShare 1.20.25 升级验证（2026-11-04）
 
-requirements沿用已升级的`akshare==1.19.1`，静态sources JSON及精确即时资金窗口也只接受此审计版本，其他版本在创建通道前拒绝。2026-10-09分页排序故障的1.18.97描述是历史基线，保留其日期和证据，不当作当前版本。
+当前 requirements 固定 `akshare==1.20.25`。本地已安装同版，`pip check` 无依赖冲突；当前 Provider、静态源清单与即时资金版本保护同步到此版本，仅支持这一审计版本。
 
-本轮在当前安装的1.19.1原函数上，以模拟HTTP输入执行全部13函数/14调用组合，逐项用真实签名绑定实际Provider参数。行业/概念/个股显式即时；新浪指数及日历无参；上海主板/科创分别调用、深圳显式A股列表、北京无参；雪球报价/资料显式公共symbol、Token及原timeout；ETF全表显式ETF基金；同花顺资料六位代码；资产配置显式六位基金代码/date/timeout且不传Token。Provider传参与静态清单分开核对，未依赖接口默认值。
+- 雪球 `stock_individual_spot_xq`、`stock_individual_basic_info_xq` 和蛋卷 `fund_individual_detail_hold_xq` 均已移除函数级 `timeout`，Provider 不再传入该参数。实际 HTTP 继续经过 `controlled_http`，新版统一 HTTP 默认 `(10, 60)` 仍被现有连接最多5秒、读取 `SOURCE_TIMEOUT_SECONDS` 与剩余预算收紧，更短限制保留。
+- 同花顺签名模块迁移到 `akshare.stock.flow.stock_fund_flow`。预取仍复用原 `ths.js` 和 MiniRacer，成功或失败均关闭自建签名上下文。精确路径、稳定代码倒序、两页窗口、两条线程独占Session、无额外配额串行及完整性校验保持。
+- 核查的13个函数及相关辅助请求使用新版 `akshare.utils.http` 的 requests 通道，继续进入 `requests.Session.send` 审计；未因依赖新增 `curl_cffi` 而切换本项目业务请求通道。雪球首页301到 `www.xueqiu.com`、逐跳审计与共享速率保护保持；不扩大域名白名单。
+- 修正源子进程对AKShare `NetworkError` 的分类：优先保留异常链已识别的 HTTP拒绝、超时或JSON格式错误，只有无具体分类时才回落 NETWORK，日志不输出Token、正文或异常原文。
+
+本轮临时离线验证结果 **75 passed**，包含14种真实函数签名、各Provider实际参数、原HTML/JSON/XLSX解析及领域转换；行业/概念亿元转元、同批市场汇总及个股资金点、核心指数、四组合股票字典、ETF字典与买卖价/资料/资产配置、日历年份边界与严格源时间收盘判断。资金部分验证两页窗口/独占Session/名额释放/串行降级、重复或逆序代码/变更页数/空页/行数缺失拒绝、取消停止HTTP、工作进程不返回部分结果及失败保留旧资金点。雪球部分复验真实函数HTTP控制、301/未知域名、401/403/429、JSON分类、日志脱敏、单股失败不取消其他股票及真实Redis控制失败取消回收。
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python -m pytest --rootdir=/tmp/akshare-12025-validation -q /tmp/akshare-12025-validation /tmp/xq-redirect-validation/test_redirect.py
+.venv/bin/python -m compileall -q app
+.venv/bin/python -m app sources --json
+.venv/bin/python -m pip check
+git diff --check
+```
+
+测试均使用模拟HTTP与Redis，不读取私有配置；日历压缩JS输入使用mock，原日期表转换执行真实函数；同花顺解析测试使用mock签名，另以真实JS引擎和包内 `ths.js` 验证签名生成。未访问真实源、未构建生产镜像、未核验Linux运行环境、未提交或部署。生产仍使用Python3.12，需核对新版mini-racer要求的glibc≥2.27，说明见[原生部署](native-systemd-deployment.md)。历史1.19.1验证记录保留如下，不作为当前版本验证结果。
+
+## 历史记录：2026-10-14 AKShare 1.19.1 基线
+
+当时requirements固定`akshare==1.19.1`，静态sources JSON及精确即时资金窗口也只接受此审计版本，其他版本在创建通道前拒绝。2026-10-09分页排序故障的1.18.97描述是历史基线，保留其日期和证据，不当作当前版本。
+
+该历史轮次在当时安装的1.19.1原函数上，以模拟HTTP输入执行全部13函数/14调用组合，逐项用真实签名绑定实际Provider参数。行业/概念/个股显式即时；新浪指数及日历无参；上海主板/科创分别调用、深圳显式A股列表、北京无参；雪球报价/资料显式公共symbol、Token及原timeout；ETF全表显式ETF基金；同花顺资料六位代码；资产配置显式六位基金代码/date/timeout且不传Token。Provider传参与静态清单分开核对，未依赖接口默认值。
 
 模拟验证了原HTML/JSON/XLSX返回列与既有转换：行业/概念纯金额亿元转元，个股纯金额元及显式万/亿，净额沿流入减流出；百分数、指数点位、ETF买卖价小数不改单位或补值；日历取当年日期、雪球原毫秒时间转换仍使用上海时区，源时间和采集时间保持区分。未发现需要修改业务映射的差异；实际代码阻塞是资金精确适配仍保护旧版本，现改为仅1.19.1，精确域名/路径/完整页数/代码排序/冲突/行数校验均保留。
 
@@ -418,7 +439,7 @@ requirements沿用已升级的`akshare==1.19.1`，静态sources JSON及精确即
 PYTHONPATH="$PWD" .venv/bin/python -m pytest --rootdir=/tmp/akshare-1191-validation -q /tmp/akshare-1191-validation /tmp/xq-diagnostics-validation /tmp/ths-signature-validation/test_signature.py /tmp/etf-bid-ask-validation/test_etf_prices.py
 ```
 
-覆盖：当前AKShare1.19.1全部14组合真实签名绑定与Provider参数、模拟HTTP下原函数表格/JSON/XLSX解析和业务映射、资金完整分页/滑动窗口/持久Session/无配额串行/限速/取消/回收及租约释放、同批资金点/版本连续/失败历史保护、雪球异常链与日志脱敏、ETF买卖价，以及demo两种入口的安全启动。日历编码和THS签名的JS上下文使用mock；真实数据源、生产Redis、生产部署和性能均未实测。用户确认相关SQL已执行，非本轮独立数据库核验。
+历史覆盖：AKShare1.19.1全部14组合真实签名绑定与Provider参数、模拟HTTP下原函数表格/JSON/XLSX解析和业务映射、资金完整分页/滑动窗口/持久Session/无配额串行/限速/取消/回收及租约释放、同批资金点/版本连续/失败历史保护、雪球异常链与日志脱敏、ETF买卖价，以及demo两种入口的安全启动。日历编码和THS签名的JS上下文使用mock；真实数据源、生产Redis、生产部署和性能均未实测。用户确认相关SQL已执行，非本轮独立数据库核验。
 
 实现证据入口：`app/market/collector.py`和`normalize.py`的四模块与映射、`snapshot.py`的WATCH合并/事务/资金点；`app/runtime/scheduler.py`及`workflows.py`的四周期与完整刷新；`source_execution.py`的6/3/2配额和独立源进程；`app/providers/ths_parallel.py`和`ths_paging.py`的两页窗口与精确审计；`app/stock_monitor/service.py`的源时间、收盘及历史规则；`app/api/jobs.py`的同步路由；`deploy/systemd/`的原生部署模板。这些路径用于实现核对，不构成生产验收记录。
 

@@ -2,7 +2,7 @@
 
 本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
 
-交易所代码名称清单独立取自上交所主板 A 股与科创板、深交所 A 股、北交所。雪球只用于已监控股票的基础资料和报价，通过固定版本 AKShare 的 `stock_individual_basic_info_xq` 与 `stock_individual_spot_xq` 读取。当前固定AKShare 1.19.1。跨端字段与公开大屏形状见[后端个股监控契约](../../be-data-stock/docs/development/stock-monitor-v1.md)。
+交易所代码名称清单独立取自上交所主板 A 股与科创板、深交所 A 股、北交所。雪球只用于已监控股票的基础资料和报价，通过固定版本 AKShare 的 `stock_individual_basic_info_xq` 与 `stock_individual_spot_xq` 读取。当前固定AKShare 1.20.25。跨端字段与公开大屏形状见[后端个股监控契约](../../be-data-stock/docs/development/stock-monitor-v1.md)。
 
 ## 配置与调用
 
