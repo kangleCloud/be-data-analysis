@@ -38,7 +38,7 @@ class SlidingIndividualPages:
                  guard: tuple[str, str] | None, deadline: float,
                  *, signature_factory=ths_signature) -> None:
         if call.group != 'ths' or importlib.metadata.version('akshare') != '1.20.25':
-            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.20.25')
+            raise SourceControlError('资金分页适配仅支持THS组AKShare 1.20.25', reason='THS_VERSION_OR_GROUP_UNSUPPORTED')
         self.paging, self.physical_send, self.control, self.call = paging, send, control, call
         self.keys, self.token, self.guard, self.deadline = keys, token, guard, deadline
         self.signature_factory = signature_factory

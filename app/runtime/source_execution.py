@@ -92,8 +92,10 @@ return {1,0,elapsed}
 class SourceControlError(RuntimeError):
     """配额、业务锁或 Redis 控制失效；停止整轮而不是继续源请求。"""
 
-    def __init__(self, message: str, *, metadata: dict[str, Any] | None = None) -> None:
+    def __init__(self, message: str, *, metadata: dict[str, Any] | None = None,
+                 reason: str | None = None) -> None:
         super().__init__(message)
+        self.control_reason = reason
         if metadata is not None:
             self.exception_type = metadata["exception_type"]
             self.root_type = metadata["root_type"]
@@ -188,7 +190,7 @@ class SourceControl:
 
     def renew(self, keys: tuple[str, str], token: str) -> None:
         if not self.client.eval(RENEW_SCRIPT, 2, *keys, token, LEASE_SECONDS):
-            raise SourceControlError("源调用配额已失效")
+            raise SourceControlError("源调用配额已失效", reason="QUOTA_LEASE_INVALID")
 
     def release(self, keys: tuple[str, str], token: str) -> None:
         self.client.eval(RELEASE_SCRIPT, 2, *keys, token)
@@ -198,9 +200,9 @@ class SourceControl:
         if keys is None:
             self.client.get(f"{PREFIX}health")
         elif any(self.client.get(key) != token for key in keys):
-            raise SourceControlError("源调用配额已失效")
+            raise SourceControlError("源调用配额已失效", reason="QUOTA_LEASE_INVALID")
         if guard is not None and self.client.get(guard[0]) != guard[1]:
-            raise SourceControlError("业务任务锁已失效")
+            raise SourceControlError("业务任务锁已失效", reason="ENTRY_LEASE_INVALID")
 
     def request_turn(self, call: SourceCall, keys: tuple[str, str] | None, token: str,
                      guard: tuple[str, str] | None, deadline: float, *, sampling_token: str | None = None,
@@ -225,7 +227,7 @@ class SourceControl:
                                                  guard[1] if guard else "", call.interval_seconds if call.interval_key and call.mode == "auto" and first_request else 0, call.mode, len(call.batch_interval_keys), sampling_token or token)
                 status, value = result[:2]
                 if status == -1:
-                    raise SourceControlError("源配额或业务锁已失效")
+                    raise SourceControlError("源配额或业务锁已失效", reason="REQUEST_LEASE_INVALID")
                 if status == -2:
                     raise SourceCoolingError(value)
                 if status == -3:
@@ -295,7 +297,7 @@ def controlled_http(control: SourceControl, call: SourceCall, keys: tuple[str, s
                                            "http_status": None, "category": "FORMAT",
                                            "reason": "DOMAIN_NOT_ALLOWED", "fields": ("host",),
                                            "code": None, "bad_rows": 0})
-                raise SourceControlError("源请求域名不在审计清单中")
+                raise SourceControlError("源请求域名不在审计清单中", reason="DOMAIN_NOT_ALLOWED")
             waits = control.request_turn(call, quota_keys, quota_token, guard, deadline,
                                  sampling_token=token, first_request=not first_started.is_set(), cancelled=cancelled)
             if waits is not None:
@@ -460,7 +462,7 @@ def _source_worker(queue: Any, url: str, call: SourceCall, keys: tuple[str, str]
         queue.put(("cooldown", exc.ttl))
     except (SourceControlError, redis.RedisError) as exc:
         metadata = error_metadata(exc)
-        metadata.update(reason="REDIS_CONTROL_ERROR" if isinstance(exc, redis.RedisError) else "SOURCE_CONTROL_INVALID",
+        metadata.update(reason="REDIS_CONTROL_ERROR" if isinstance(exc, redis.RedisError) else (exc.control_reason or "SOURCE_CONTROL_INVALID"),
                         source_pid=os.getpid())
         LOGGER.warning("源控制失败 function=%s symbol=%s sourcePid=%s diagnostic=%s",
                        call.function, _public_symbol(call), os.getpid(), metadata)
