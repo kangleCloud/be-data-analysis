@@ -144,6 +144,8 @@ class SlidingIndividualPages:
         self._check()
         if page not in self.pending:
             if self.pending:
+                LOGGER.warning('资金分页顺序异常 stage=window requestedPage=%d pendingPages=%s',
+                               page, sorted(self.pending))
                 self.paging.fail('MISSING_OR_OUT_OF_ORDER_PAGE')
             self._submit(page, 0, request, options, sign=False)
         # 消费前页后窗口空出一格；当前页即使尚未完成也可补下一页。

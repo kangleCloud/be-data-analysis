@@ -43,6 +43,8 @@ class IndividualPaging:
         if not match:
             self.fail('UNEXPECTED_PAGE_PATH')
         if int(match[2]) != self.next_page or self.total is None or int(match[2]) > self.total:
+            LOGGER.warning('资金分页顺序异常 stage=request requestedPage=%d expectedPage=%d totalPages=%s',
+                           int(match[2]), self.next_page, self.total)
             self.fail('MISSING_OR_OUT_OF_ORDER_PAGE')
         request.url = urlunsplit(url._replace(path=url.path.replace('/field/zdf/','/field/code/')))
         return int(match[2])
@@ -67,6 +69,8 @@ class IndividualPaging:
             self.total = count
             return
         if self.total is None or count != self.total or page != self.next_page or (match and int(match[1]) != page):
+            LOGGER.warning('资金分页顺序异常 stage=response requestedPage=%d expectedPage=%d responsePage=%s expectedTotal=%s responseTotal=%s',
+                           page, self.next_page, int(match[1]) if match else None, self.total, count)
             self.fail('MISSING_OR_OUT_OF_ORDER_PAGE')
         table = soup.find('table')
         codes = []
