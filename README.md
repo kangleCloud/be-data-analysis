@@ -10,13 +10,13 @@ AKShare 市场数据采集程序。每轮采集同花顺行业、概念与个股
 
 2026-10-14已交付155项临时离线模拟通过记录，覆盖13函数/14调用组合、当时原函数解析与映射、分页/连接/配额/回收、事务/历史保护、雪球诊断和demo安全启动；该归档轮次未重新运行这些业务测试。真实源健康、生产性能和生产部署未实测。相关SQL为“用户确认已执行，非本轮独立数据库核验”，不再列为未执行待办。
 
-详细契约、业务、运维和验证证据由[根归档](../docs/releases/v1.0.0.md)维护。本仓库现行说明入口：[市场快照](docs/market-snapshot-v1.md)、[个股监控](docs/stock-monitor-v1.md)、[交易日历与任务](docs/trading-calendar-jobs-v1.md)、[指数与ETF](docs/index-etf-sources-v1.md)、[调度与并发](docs/sampling-scheduling.md)、[原生部署](docs/native-systemd-deployment.md)、[源依赖与诊断](docs/source-health-check.md)。
+详细契约、业务、运维和验证证据由[根归档](../docs/releases/v1.0.0.md)维护。本仓库现行说明入口：[市场快照](docs/market/market-snapshot-v1.md)、[个股监控](docs/stock_monitor/stock-monitor-v1.md)、[交易日历与任务](docs/calendar/trading-calendar-jobs-v1.md)、[指数与ETF](docs/etf_monitor/index-etf-sources-v1.md)、[调度与并发](docs/runtime/sampling-scheduling.md)、[原生部署](docs/deployment/native-systemd-deployment.md)、[源依赖与诊断](docs/providers/source-health-check.md)。
 
-2026-11-04完成AKShare 1.20.25配套适配，75项离线回归通过，覆盖全部13函数/14调用组合及现有雪球回归；详情见[升级验证记录](docs/source-health-check.md#akshare-12025-升级验证2026-11-04)。当前结果不代表生产源站连通性或镜像构建已验收。
+2026-11-04完成AKShare 1.20.25配套适配，75项离线回归通过，覆盖全部13函数/14调用组合及现有雪球回归；详情见[升级验证记录](docs/providers/source-health-check.md#akshare-12025-升级验证2026-11-04)。当前结果不代表生产源站连通性或镜像构建已验收。
 
 ## 部署方式
 
-- Linux原生systemd：参见[安装、虚拟IP配置、日志与回退](docs/native-systemd-deployment.md)，默认`/data/content/be-data-analysis`，原生端口18801，使用目标主机已有Python3.12虚拟环境，仅安装生产依赖。
+- Linux原生systemd：参见[安装、虚拟IP配置、日志与回退](docs/deployment/native-systemd-deployment.md)，默认`/data/content/be-data-analysis`，原生端口18801，使用目标主机已有Python3.12虚拟环境，仅安装生产依赖。
 - Docker：使用Dockerfile、compose.yaml和`deploy/deploy.sh`。两种方式二选一，先停旧实例再启动新实例，防止重复调度。
 
 ## 环境
@@ -44,13 +44,13 @@ python -m app collect
 python -m app serve
 ```
 
-`serve` 启动健康接口与内置调度：个股、ETF、市场行情、资金各自独立120秒周期，同任务不重叠、不积压或补跑。AUTO全局最多6个源名额，THS/XQ各3个、SINA/交易所各2个；个股和市场行情各最多三项在途，ETF全表及资金分页按原业务复用。详见[采样调度与并发](docs/sampling-scheduling.md)。北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。CLI `collect` 使用 auto，可在采集窗口内主动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
+`serve` 启动健康接口与内置调度：个股、ETF、市场行情、资金各自独立120秒周期，同任务不重叠、不积压或补跑。AUTO全局最多6个源名额，THS/XQ各3个、SINA/交易所各2个；个股和市场行情各最多三项在途，ETF全表及资金分页按原业务复用。详见[采样调度与并发](docs/runtime/sampling-scheduling.md)。北京时间交易日上午 09:30–11:30、下午 13:00–15:10 每两分钟尝试采集一次。两次市场启动至少120秒；快轮按定点节奏，耗时>=120秒的慢轮完成回收后若仍在交易窗口立即接续；不补历史时段、不重叠，非交易日由交易日历跳过。locked/throttled等快速退出等待下一定点，不忙循环。CLI `collect` 使用 auto，可在采集窗口内主动触发，但仍受 Redis 锁、120 秒最小间隔和源冷却限制。
 
-交易日历通过 AKShare 新浪接口独立刷新后缓存在 Redis DB 2；启动时补建，每月 1 日北京时间 00:10 常规刷新，失败自动重试每天最多一次。缓存未覆盖当天时不会凭工作日推断交易日，市场快照降级、个股跳过。`python -m app calendar-refresh` 可手动触发受限频保护的自动刷新。受保护的同步手动任务接口见 [交易日历与内部任务 V1](docs/trading-calendar-jobs-v1.md)。
+交易日历通过 AKShare 新浪接口独立刷新后缓存在 Redis DB 2；启动时补建，每月 1 日北京时间 00:10 常规刷新，失败自动重试每天最多一次。缓存未覆盖当天时不会凭工作日推断交易日，市场快照降级、个股跳过。`python -m app calendar-refresh` 可手动触发受限频保护的自动刷新。受保护的同步手动任务接口见 [交易日历与内部任务 V1](docs/calendar/trading-calendar-jobs-v1.md)。
 
 本机 scheduler 使用 `/scheduler/api/local/market-data/v1` 下的八个固定 POST 业务入口，真实回环直连无需令牌；Java 调用 Python 内部接口仍需 `X-Internal-Token`。八项映射、同步结果与等待上限见上述文档。
 
-第三方接口说明可通过 `python -m app sources` 查看，`--json` 输出完整静态元数据；命令不读取配置、不连接 Redis、不请求源站。13 个唯一函数、14 种参数组合及只读源验证/完整刷新区别见 [数据源与手动健康验证](docs/source-health-check.md)。
+第三方接口说明可通过 `python -m app sources` 查看，`--json` 输出完整静态元数据；命令不读取配置、不连接 Redis、不请求源站。13 个唯一函数、14 种参数组合及只读源验证/完整刷新区别见 [数据源与手动健康验证](docs/providers/source-health-check.md)。
 
 ## 服务器容器部署
 
@@ -75,9 +75,9 @@ tail -f /data/logs/be-data-analysis/service.log
 
 四个采集入口为`stock:source-control:v1:entry:{monitor,etf,quotes,funds}`，日历使用calendar入口、交易所字典使用reference入口；股票资料与报价共用monitor，ETF资料/字典/资产配置共用etf。原完整market刷新原子获取quotes/funds，忙时立即locked/409。AUTO源调用共用全局6路/THS及XQ各3路/SINA及交易所各2路配额；租约30秒/每10秒续租，HTTP间隔、冷却、源超时不变。资金只读有效日历缓存，UNKNOWN时降级，由独立日历任务补建。
 
-每模块/每股完成立即发布。市场快照采用WATCH/MULTI/EXEC，只合并本次变化模块；首次尝试后最多3次冲突重试，每次重新读最新快照/版本。资金点、股票版本与通知仍在原监控锁及同一事务中，失败变化通知不造点。控制Redis或业务发布失败停止后续处理。详见[执行控制与源验证](docs/source-health-check.md)。
+每模块/每股完成立即发布。市场快照采用WATCH/MULTI/EXEC，只合并本次变化模块；首次尝试后最多3次冲突重试，每次重新读最新快照/版本。资金点、股票版本与通知仍在原监控锁及同一事务中，失败变化通知不造点。控制Redis或业务发布失败停止后续处理。详见[执行控制与源验证](docs/providers/source-health-check.md)。
 
-行情快照、曲线及个股/ETF行情`state-id`由Python独占写入；Java只维护启用清单并在原主题发布`{"resync":true}`，不改写行情版本。Python内部写入协调、增量版本链及同事务通知保持不变，手动与scheduler接口业务不变。职责、运行边界及本轮43项离线回归记录见[发布归属说明](docs/sampling-scheduling.md#行情版本与配置通知的归属)。
+行情快照、曲线及个股/ETF行情`state-id`由Python独占写入；Java只维护启用清单并在原主题发布`{"resync":true}`，不改写行情版本。Python内部写入协调、增量版本链及同事务通知保持不变，手动与scheduler接口业务不变。职责、运行边界及本轮43项离线回归记录见[发布归属说明](docs/runtime/sampling-scheduling.md#行情版本与配置通知的归属)。
 
 代码按`app/api`、`runtime`、`providers`、`calendar`、`market`、`stock_monitor`、`etf_monitor`分包；`main/cli/__main__`与`core`保留。Python只输出结构化JSON，不生成HTML或全局改写字符串；展示文本的转义、合法HTTP/HTTPS外链限制由实际渲染端处理，不把转义内容写入业务存储。
 
@@ -87,9 +87,9 @@ tail -f /data/logs/be-data-analysis/service.log
 
 健康接口为 `GET /health`，仅对 Redis 执行 PING（连接和读取各一秒，无重试），不可用时返回 HTTP 503，不调用行情源。调度业务在服务父进程内执行；每个实际源调用独立spawn子进程。个股和 ETF 内部同步接口需 `X-Internal-Token` 鉴权。
 
-个股监控 V1 使用独立的交易所股票字典和雪球资料/报价。`STOCK_MONITOR_XQ_ENABLED` 默认 `false`；关闭时自动调度和手动 `python -m app monitor-sample` 均不访问雪球，资料接口也拒绝调用。明确开启且配置 `XUEQIU_TOKEN` 后，服务在交易日盘中每两分钟对 Redis enabled 清单中的最多 10 只股票采样。配置、接口样例、Redis 键及频控见 [个股监控 V1](docs/stock-monitor-v1.md)。
+个股监控 V1 使用独立的交易所股票字典和雪球资料/报价。`STOCK_MONITOR_XQ_ENABLED` 默认 `false`；关闭时自动调度和手动 `python -m app monitor-sample` 均不访问雪球，资料接口也拒绝调用。明确开启且配置 `XUEQIU_TOKEN` 后，服务在交易日盘中每两分钟对 Redis enabled 清单中的最多 10 只股票采样。配置、接口样例、Redis 键及频控见 [个股监控 V1](docs/stock_monitor/stock-monitor-v1.md)。
 
-市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、同花顺基金基本资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。同花顺资料独立同步，不受雪球总闸限制，采用 30 分钟资料限频与 180 秒批次预算。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/index-etf-sources-v1.md)。
+市场快照另含新浪五只核心指数模块。ETF 监控独立使用新浪交易价格、同花顺基金基本资料，以及受总闸控制的雪球资产配置；盘中每两分钟对最多 10 只已启用 ETF 采样。同花顺资料独立同步，不受雪球总闸限制，采用 30 分钟资料限频与 180 秒批次预算。数据源、Redis 键、内部接口与不可用字段见 [核心指数与 ETF V1](docs/etf_monitor/index-etf-sources-v1.md)。
 
 同花顺三组即时接口没有可靠源交易日期或源时间；快照的 `tradeDate` 仅依据交易日历，`lastSuccessAt` 和市场曲线的 `collectedAt` 是采集时间。
 
@@ -112,11 +112,11 @@ curl -X POST http://127.0.0.1:8000/internal/jobs/v1/market/refresh \
   -H 'X-Collection-Mode: manual'
 ```
 
-生产端口映射沿用现有Compose，配置仍默认`.env.dev`、`APP_ENV=prod`选择`.env.prod`。手动模式接口说明见[源依赖与验证](docs/source-health-check.md)。
+生产端口映射沿用现有Compose，配置仍默认`.env.dev`、`APP_ENV=prod`选择`.env.prod`。手动模式接口说明见[源依赖与验证](docs/providers/source-health-check.md)。
 
 ## Redis 契约
 
-快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON 且不设 TTL；快照、同批已启用股票的资金点和更新通知在同一 Redis 事务中提交。市场与个股各有版本 ID，通知供读取方生成增量事件并在缺口时重同步。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market-snapshot-v1.md)。
+快照键是 `stock:market:v1:snapshot`，值为普通 UTF-8 JSON 且不设 TTL；快照、同批已启用股票的资金点和更新通知在同一 Redis 事务中提交。市场与个股各有版本 ID，通知供读取方生成增量事件并在缺口时重同步。锁键是 `stock:market:v1:lock`。字段、单位和状态说明见 [V1 快照契约](docs/market/market-snapshot-v1.md)。
 
 ## 验证
 
@@ -124,4 +124,4 @@ curl -X POST http://127.0.0.1:8000/internal/jobs/v1/market/refresh \
 python -m compileall app
 ```
 
-仓库不提供已删除的tests目录或默认pytest入口。2026-10-14的155项验证使用/tmp中的模拟HTTP、固定DataFrame和fake Redis；本轮未重跑，历史命令见[源验证记录](docs/source-health-check.md)。真实源健康、生产性能和生产部署仍未实测。
+仓库不提供已删除的tests目录或默认pytest入口。2026-10-14的155项验证使用/tmp中的模拟HTTP、固定DataFrame和fake Redis；本轮未重跑，历史命令见[源验证记录](docs/providers/source-health-check.md)。真实源健康、生产性能和生产部署仍未实测。

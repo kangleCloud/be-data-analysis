@@ -1,8 +1,8 @@
 # 个股监控 V1：Python 采集端
 
-本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+本说明纳入[v1.0.0工作树文档归档](../../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
 
-交易所代码名称清单独立取自上交所主板 A 股与科创板、深交所 A 股、北交所。雪球只用于已监控股票的基础资料和报价，通过固定版本 AKShare 的 `stock_individual_basic_info_xq` 与 `stock_individual_spot_xq` 读取。当前固定AKShare 1.20.25。跨端字段与公开大屏形状见[后端个股监控契约](../../be-data-stock/docs/development/stock-monitor-v1.md)。
+交易所代码名称清单独立取自上交所主板 A 股与科创板、深交所 A 股、北交所。雪球只用于已监控股票的基础资料和报价，通过固定版本 AKShare 的 `stock_individual_basic_info_xq` 与 `stock_individual_spot_xq` 读取。当前固定AKShare 1.20.25。跨端字段与公开大屏形状见[后端个股监控契约](../../../be-data-stock/docs/development/marketdata/market-data.md#个股缓存与管理接口)。
 
 ## 配置与调用
 
@@ -52,6 +52,6 @@ Python 只读 `stock:monitor:v1:enabled`（按排序的最多 10 只 `{symbol,co
 
 AUTO个股采样及资料共用`stock:source-control:v1:entry:monitor`入口和`stock:monitor:v1:sample:lock`业务锁；全局6、THS/XQ各3、其他来源各2个名额。明确401/403/429或认证/风控沿用`stock:source-control:v1:risk:xq`两小时保护，NX写入不续期；未知原因的旧`stock:monitor:v1:xq:cooldown`键等待自然到期。普通故障不扩大为共享认证冷却。首页与报价JSON每次实际HTTP均至少间隔一秒，这两次请求不是重试；同股首个HTTP用`stock:monitor:v1:sample:lastRequest:{symbol}`原子保证至少120秒，剩余<=5秒可在原预算内等待。父流程优先到期股，最多等本轮开始后60秒，计入300秒预算，不占源名额。延迟、跨日及重复的有效源报价只将最近有效报价标记 `STALE`，不追加采样点；字段无效仍记失败。收盘后仅源日期为当日且源时间严格晚于 15:00:00 才追加收盘点，该股确认后停止重试；未确认时保留有效历史并标 `STALE`，15:10 后停止请求。行情源时间取自雪球响应并按上海时区解析；金额和价格以元、涨跌幅以百分数传递，缺失数值用 `null`。
 
-MANUAL按显式请求隔离执行器，跳过AUTO入口/业务锁、配额、普通冷却及代码间隔；共享HTTP限速、风险/未知旧保护、授权总闸和事务写入保护仍生效。历史保留、严格源时间>15收盘及最近两有数据交易日不变，详见[源说明](source-health-check.md)。
+MANUAL按显式请求隔离执行器，跳过AUTO入口/业务锁、配额、普通冷却及代码间隔；共享HTTP限速、风险/未知旧保护、授权总闸和事务写入保护仍生效。历史保留、严格源时间>15收盘及最近两有数据交易日不变，详见[源说明](../providers/source-health-check.md)。
 
-仓库已删除tests目录，不提供默认`python -m pytest`测试入口。临时离线验证位于`/tmp`；2026-10-14已交付155项通过记录，本轮文档归档未重跑。历史命令、覆盖及未实测边界见[归档验证状态](../../docs/releases/v1.0.0.md)。语法检查使用`python -m compileall app`，本轮仅核对文档与代码，不执行业务采样。
+仓库已删除tests目录，不提供默认`python -m pytest`测试入口。临时离线验证位于`/tmp`；2026-10-14已交付155项通过记录，本轮文档归档未重跑。历史命令、覆盖及未实测边界见[归档验证状态](../../../docs/releases/v1.0.0.md)。语法检查使用`python -m compileall app`，本轮仅核对文档与代码，不执行业务采样。

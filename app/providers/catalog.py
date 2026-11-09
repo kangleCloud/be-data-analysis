@@ -312,5 +312,5 @@ def render_sources(*, as_json: bool = False) -> str:
         lines.append(f"\n[{source['id']}] {'；'.join(source['uses'])}\n"
                      f"  akshare.{source['function']}({parameters})\n  域名：{domains}")
     lines.append("\n完整参数/路径/授权/频率/超时/字段语义：python -m app sources --json\n"
-                 "仓库手动验证说明：docs/source-health-check.md")
+                 "仓库手动验证说明：docs/providers/source-health-check.md")
     return "\n".join(lines)

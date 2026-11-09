@@ -1,6 +1,6 @@
 # 监控采样调度与并发
 
-本说明纳入[v1.0.0工作树文档归档](../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
+本说明纳入[v1.0.0工作树文档归档](../../../docs/releases/v1.0.0.md)；公开V1及`schemaVersion=1`保持不变，归档不等同生产发布。
 
 ## 固定任务
 
@@ -49,7 +49,7 @@ AUTO每股每轮最多一次，先提交已到期项。父流程用Redis PTTL估
 
 ### 行情版本与配置通知的归属
 
-按[跨端 Redis 实施契约](../../docs/redis-risk-implementation-contract.md)约定，行情快照、曲线以及`stock:monitor:v1:state-id`、`stock:etf-monitor:v1:state-id`由Python父流程独占写入。Java维护两个原有`enabled`清单；配置更新原子写清单并向原主题发送`{"resync":true}`，资料更新只发该通知，不读取或改写行情版本。Java普通查询不增加CAS或锁。
+按[跨端 Redis 实施契约](../../../docs/redis-risk-implementation-contract.md)约定，行情快照、曲线以及`stock:monitor:v1:state-id`、`stock:etf-monitor:v1:state-id`由Python父流程独占写入。Java维护两个原有`enabled`清单；配置更新原子写清单并向原主题发送`{"resync":true}`，资料更新只发该通知，不读取或改写行情版本。Java普通查询不增加CAS或锁。
 
 Python增量通知继续为`{baseStateId,stateId,changedSymbols}`，数据、版本及通知同事务提交。Java的纯重同步通知不参与该版本链，也不生成价格或资金点；订阅端收到后重新读取公开快照。个股报价与同批资金点继续共用原事件短写锁，ETF继续使用原快照短写锁；本次不因Java退出版本写入而删除Python内部并行任务仍需要的写入协调。
 
