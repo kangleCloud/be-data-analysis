@@ -20,7 +20,7 @@ def protected_keys(keys, group, mode):
 def risk_rejection(metadata):
     return (metadata.get("http_status") in {401, 403, 429}
             or metadata.get("category") in {"SOURCE_REJECTED", "AUTH_REJECTED"}
-            or metadata.get("exception_type") == "RateLimitError")
+            or metadata.get("exception_type") in {"RateLimitError", "Push2RateLimitError"})
 
 
 def remaining(client, keys, group, mode):

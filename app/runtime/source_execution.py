@@ -29,11 +29,11 @@ from app.providers.http import bounded_timeout, error_metadata, quiet_progress
 LOGGER = logging.getLogger(__name__)
 PREFIX = "stock:source-control:v1:"
 GLOBAL_LIMIT = 6
-SOURCE_LIMITS = {"ths": 3, "xq": 3, "sina": 2, "sse": 2, "szse": 2, "bse": 2}
+SOURCE_LIMITS = {"ths": 3, "xq": 3, "sina": 2, "sse": 2, "szse": 2, "bse": 2, "eastmoney": 2}
 LEASE_SECONDS = 30
 RENEW_SECONDS = 10
 CLEANUP_SECONDS = 2
-GROUPS = {"ths", "sina", "xq", "sse", "szse", "bse"}
+GROUPS = {"ths", "sina", "xq", "sse", "szse", "bse", "eastmoney"}
 ACQUIRE_SCRIPT = """
 local g, s = nil, nil
 for i=1,tonumber(ARGV[3]) do if redis.call('exists', KEYS[i]) == 0 then g=i; break end end

@@ -20,6 +20,7 @@ from app.api.jobs import create_jobs_router
 from app.runtime.scheduler import run_scheduler, TASKS
 from app.calendar.scheduler import run_calendar_scheduler
 from app.api.stock_monitor import create_monitor_router
+from app.api.quant import create_quant_router
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ def create_app(
     application.include_router(create_jobs_router(
         configured, redis_factory=redis_factory, runner=job_runner,
     ))
+    application.include_router(create_quant_router(configured))
 
     @application.get("/health", tags=["系统接口"], summary="服务健康检查")
     def health():
